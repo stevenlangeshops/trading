@@ -1,0 +1,10 @@
+data/raw/
+data/crypto/
+features/processed/
+checkpoints/
+logs/
+__pycache__/
+*.pyc
+*.pt
+*.parquet
+*.db

@@ -1,0 +1,31 @@
+# US Tech & Growth
+AAPL
+MSFT
+NVDA
+AMZN
+GOOGL
+META
+TSLA
+AMD
+
+# US Finanzen & Industrie
+JPM
+V
+UNH
+XOM
+
+# ETFs (breit & sektoral)
+SPY
+QQQ
+IWM
+GLD
+TLT
+XLK
+XLF
+XLE
+
+# Europa (XETRA)
+ASML.AS
+SAP.DE
+SIE.DE
+AIR.PA

@@ -1,0 +1,32 @@
+# Core
+numpy>=1.26,<3
+pandas==2.2.2
+scipy==1.13.1
+
+# Data Fetch
+ccxt==4.3.24
+yfinance==0.2.54
+
+# Technical Analysis
+ta==0.11.0
+
+# ML / Deep Learning
+torch==2.3.1
+scikit-learn==1.5.0
+
+# Hyperparameter-Optimierung
+optuna==3.6.1
+
+# Backtesting
+plotly==5.22.0
+
+# Utilities
+python-dotenv==1.0.1
+loguru==0.7.2
+tqdm==4.66.4
+joblib==1.4.2
+pyarrow==16.1.0
+
+# Jupyter (optional)
+jupyterlab==4.2.2
+ipywidgets==8.1.3

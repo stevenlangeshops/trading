@@ -1,0 +1,26 @@
+services:
+  trading_bot:
+    build:
+      context: .
+      target: app
+    image: trading_v2:latest
+    container_name: trading_v2
+    volumes:
+      # Daten und Modell-Checkpoints persistent halten
+      - ./data/raw:/app/data/raw
+      - ./features/processed:/app/features/processed
+      - ./checkpoints:/app/checkpoints
+      - ./logs:/app/logs
+    environment:
+      - PYTHONUNBUFFERED=1
+    # Einzelne Schritte überschreiben:
+    # command: ["download", "--symbol", "BTC/USDT", "--timeframe", "1h"]
+    # command: ["train",    "--symbol", "BTC/USDT", "--mode", "cls"]
+    # command: ["backtest", "--symbol", "BTC/USDT", "--mode", "cls"]
+
+  # GPU-Variante (auskommentiert, falls nvidia-docker installiert)
+  # trading_bot_gpu:
+  #   extends: trading_bot
+  #   runtime: nvidia
+  #   environment:
+  #     - NVIDIA_VISIBLE_DEVICES=all
