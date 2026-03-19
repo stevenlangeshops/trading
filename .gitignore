@@ -1,10 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+dist/
+build/
+
+# Daten & Modelle (nicht ins Repo)
 data/raw/
-data/crypto/
 features/processed/
 checkpoints/
 logs/
-__pycache__/
-*.pyc
-*.pt
-*.parquet
-*.db
+
+# Secrets
+.env
+
+# IDE
+.vscode/
+.idea/
+
+# Jupyter
+.ipynb_checkpoints/
+notebooks/*.ipynb

@@ -33,7 +33,7 @@ DEFAULTS = {
     "bidirectional": False,
     "use_attention": True,
     "lr":            1e-3,
-    "weight_decay":  1e-5,
+    "weight_decay":  1e-3,   # erhöht: stärkere L2-Regularisierung gegen Overfitting
     "batch_size":    256,
     "epochs":        100,
     "patience":      10,
@@ -146,8 +146,9 @@ def train(
     criterion = nn.BCELoss() if mode == "cls" else nn.HuberLoss(delta=0.01)
     optimizer = torch.optim.AdamW(model.parameters(),
                                    lr=cfg["lr"], weight_decay=cfg["weight_decay"])
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode="min", factor=0.5, patience=5
+    # CosineAnnealingLR: LR sinkt sanft von lr bis lr/100 über alle Epochen
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=cfg["epochs"], eta_min=cfg["lr"] / 100
     )
 
     best_val_loss  = float("inf")
@@ -161,11 +162,15 @@ def train(
     for epoch in range(1, cfg["epochs"] + 1):
         train_loss         = train_epoch(model, train_loader, optimizer, criterion, device, cfg["grad_clip"])
         val_loss, val_acc  = eval_epoch(model, val_loader,   criterion, device, mode)
-        scheduler.step(val_loss)
+        scheduler.step()
         current_lr = optimizer.param_groups[0]["lr"]
 
+        # Overfitting-Warnung: Val-Loss > 1.5x Train-Loss
+        overfit_ratio = val_loss / train_loss if train_loss > 0 else 1.0
+        overfit_warn  = "  ⚠ overfit" if overfit_ratio > 1.5 else ""
+
         logger.info(f"{epoch:4d} {train_loss:10.5f} {val_loss:10.5f} "
-                    f"{val_acc:8.4f} {current_lr:10.7f}")
+                    f"{val_acc:8.4f} {current_lr:10.7f}{overfit_warn}")
 
         if val_loss < best_val_loss:
             best_val_loss  = val_loss

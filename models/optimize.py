@@ -262,6 +262,9 @@ def make_objective(
     multi:     bool,
 ):
     def objective(trial: optuna.Trial) -> float:
+        import time
+        t_start = time.time()
+
         # ── Hyperparameter vorschlagen ─────────────────────────────────────
         threshold       = trial.suggest_float("threshold",       0.001, 0.005, step=0.0005)
         horizon         = trial.suggest_int  ("horizon",         3,     24)
@@ -272,16 +275,26 @@ def make_objective(
         dropout         = trial.suggest_float("dropout",         0.1,   0.5,   step=0.05)
         lr              = trial.suggest_float("lr",              1e-4,  1e-2,  log=True)
 
+        logger.info(
+            f"Trial {trial.number + 1:>3}  "
+            f"hidden={hidden_dim} layers={num_layers} lr={lr:.5f} "
+            f"horizon={horizon} seq={seq_len} thr={threshold:.4f}"
+        )
+
         # ── Daten laden ────────────────────────────────────────────────────
         result = load_data_for_trial(
             ticker, timeframe, horizon, threshold, seq_len, "cls", multi
         )
         if result is None:
+            logger.warning(f"  Trial {trial.number + 1}: Keine Daten — übersprungen")
             raise optuna.exceptions.TrialPruned()
 
         train_ds, val_ds = result
         if len(train_ds) < 64:
+            logger.warning(f"  Trial {trial.number + 1}: Zu wenig Daten ({len(train_ds)}) — übersprungen")
             raise optuna.exceptions.TrialPruned()
+
+        logger.debug(f"  Daten geladen: {len(train_ds)} Train / {len(val_ds)} Val Sequenzen")
 
         # ── Training ───────────────────────────────────────────────────────
         try:
@@ -296,8 +309,20 @@ def make_objective(
                 patience=5,
             )
         except Exception as e:
-            logger.warning(f"Trial {trial.number} Fehler: {e}")
+            logger.warning(f"  Trial {trial.number + 1} Fehler: {e}")
             raise optuna.exceptions.TrialPruned()
+
+        elapsed = time.time() - t_start
+
+        # Bestes bisher?
+        completed = [t for t in trial.study.trials if t.value is not None]
+        best_so_far = min((t.value for t in completed), default=float("inf"))
+        is_best = val_loss <= best_so_far
+        marker = " <-- BEST" if is_best else ""
+
+        logger.info(
+            f"  => Val-Loss={val_loss:.5f}  ({elapsed:.0f}s){marker}"
+        )
 
         # ── Zielgröße: Val-Loss (minimieren) ───────────────────────────────
         return val_loss
