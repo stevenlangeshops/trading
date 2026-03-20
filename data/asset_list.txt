@@ -1,4 +1,4 @@
-# US Tech & Growth
+# === USA: Large Cap ===
 AAPL
 MSFT
 NVDA
@@ -7,14 +7,29 @@ GOOGL
 META
 TSLA
 AMD
-
-# US Finanzen & Industrie
 JPM
 V
 UNH
 XOM
-
-# ETFs (breit & sektoral)
+BRK-B
+LLY
+AVGO
+WMT
+COST
+HD
+BAC
+MA
+PG
+JNJ
+ABBV
+MRK
+KO
+PEP
+NFLX
+CRM
+ORCL
+MU
+# === USA: ETFs ===
 SPY
 QQQ
 IWM
@@ -23,9 +38,51 @@ TLT
 XLK
 XLF
 XLE
-
-# Europa (XETRA)
-ASML.AS
+XLV
+XLI
+EEM
+EFA
+# === Europa: Deutschland ===
 SAP.DE
 SIE.DE
+ALV.DE
+MBG.DE
+BMW.DE
+BAS.DE
+DTE.DE
+DBK.DE
+VOW3.DE
+# === Europa: Frankreich ===
 AIR.PA
+MC.PA
+OR.PA
+TTE.PA
+BNP.PA
+SAN.PA
+# === Europa: Niederlande/Schweiz ===
+ASML.AS
+HEIA.AS
+NESN.SW
+NOVN.SW
+ROG.SW
+# === Europa: UK ===
+SHEL.L
+AZN.L
+HSBA.L
+BP.L
+GSK.L
+# === Asien: Japan ===
+7203.T
+6758.T
+9984.T
+7974.T
+# === Asien: China (NYSE-listed) ===
+BABA
+BIDU
+JD
+PDD
+TSM
+# === Asien: ETFs ===
+EWJ
+MCHI
+EWY

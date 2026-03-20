@@ -149,7 +149,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--timeframe", default="1h",
                         choices=["1m","5m","15m","30m","1h","1d","1wk"])
-    parser.add_argument("--years",     type=int, default=2)
+    parser.add_argument("--years",     type=int, default=10)
     parser.add_argument("--ticker",    default=None,
                         help="Einzelner Ticker statt asset_list.txt")
     args = parser.parse_args()

@@ -95,8 +95,9 @@ class TradingLSTM(nn.Module):
         if use_attention:
             self.attention = TemporalAttention(lstm_out_dim)
 
-        # Batch-Norm + Head
-        self.bn = nn.BatchNorm1d(lstm_out_dim)
+        # LayerNorm statt BatchNorm: funktioniert bei beliebiger Batch-Größe
+        # (BatchNorm kollabiert bei einzelnen Assets mit abweichender Verteilung)
+        self.bn = nn.LayerNorm(lstm_out_dim)
         self.head = nn.Sequential(
             nn.Linear(lstm_out_dim, 64),
             nn.ReLU(),
