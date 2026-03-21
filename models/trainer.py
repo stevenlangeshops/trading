@@ -27,13 +27,13 @@ CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
 FEATURE_DIR    = Path("features/processed")
 
 DEFAULTS = {
-    "hidden_dim":    128,
+    "hidden_dim":    64,
     "num_layers":    2,
-    "dropout":       0.3,
+    "dropout":       0.5,   # erhöht: stärkere Regularisierung gegen Overfitting
     "bidirectional": False,
     "use_attention": True,
     "lr":            1e-3,
-    "weight_decay":  1e-3,   # erhöht: stärkere L2-Regularisierung gegen Overfitting
+    "weight_decay":  1e-2,   # erhöht: 0.01 statt 0.001
     "batch_size":    256,
     "epochs":        100,
     "patience":      10,
