@@ -273,7 +273,7 @@ def make_objective(
         hidden_dim      = trial.suggest_categorical("hidden_dim",  [64, 128, 256])
         num_layers      = trial.suggest_int  ("num_layers",      1,     3)
         dropout         = trial.suggest_float("dropout",         0.1,   0.5,   step=0.05)
-        lr              = trial.suggest_float("lr",              1e-4,  1e-2,  log=True)
+        lr              = trial.suggest_float("lr",              1e-4,  3e-3,  log=True)  # max 0.003: höhere LR kollabiert bei layers>=2
 
         logger.info(
             f"Trial {trial.number + 1:>3}  "

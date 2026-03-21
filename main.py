@@ -88,16 +88,17 @@ def cmd_features(args):
 def cmd_train(args):
     from models.trainer import train
     train(
-        symbol     = args.symbol,
-        timeframe  = args.timeframe,
-        mode       = args.mode,
-        ticker     = getattr(args, "ticker", None),
-        epochs     = args.epochs,
-        patience   = args.patience,
-        hidden_dim = args.hidden_dim,
-        num_layers = getattr(args, "num_layers", 2),
-        batch_size = args.batch_size,
-        lr         = args.lr,
+        symbol       = args.symbol,
+        timeframe    = args.timeframe,
+        mode         = args.mode,
+        ticker       = getattr(args, "ticker", None),
+        epochs       = args.epochs,
+        patience     = args.patience,
+        hidden_dim   = args.hidden_dim,
+        num_layers   = getattr(args, "num_layers", 2),
+        batch_size   = args.batch_size,
+        lr           = args.lr,
+        weight_decay = getattr(args, "weight_decay", 1e-3),
     )
 
 
@@ -193,9 +194,10 @@ def build_parser():
     p.add_argument("--epochs",     type=int,   default=100)
     p.add_argument("--patience",   type=int,   default=10)
     p.add_argument("--hidden_dim", type=int,   default=128)
-    p.add_argument("--num_layers", type=int,   default=2)
-    p.add_argument("--batch_size", type=int,   default=256)
-    p.add_argument("--lr",         type=float, default=1e-3)
+    p.add_argument("--num_layers",   type=int,   default=2)
+    p.add_argument("--batch_size",   type=int,   default=256)
+    p.add_argument("--lr",           type=float, default=1e-3)
+    p.add_argument("--weight_decay", type=float, default=1e-3, help="L2-Regularisierung (default 0.001)")
 
     # backtest
     p = sub.add_parser("backtest", parents=[common])
