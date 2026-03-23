@@ -34,6 +34,38 @@ CHECKPOINT_DIR = Path("checkpoints")
 RAW_DIR        = Path("data/raw")
 
 
+# ── Price-Cache ───────────────────────────────────────────────────────────────
+
+def build_price_cache(
+    assets:  list[str],
+    raw_dir: Path = RAW_DIR,
+) -> dict[str, pd.Series]:
+    """
+    Lädt alle Close-Preis-Serien einmalig in einen Dict.
+
+    Statt bei jedem Trade die Parquet-Datei von Disk zu lesen, wird dieser
+    Cache einmalig beim Backtest-Start aufgebaut und danach nur noch im
+    Speicher nachgeschlagen.
+
+    Returns:
+        Dict: asset-Name → pd.Series(index=DatetimeIndex, values=close)
+    """
+    cache: dict[str, pd.Series] = {}
+    for asset in assets:
+        fpath = raw_dir / f"{asset.replace('.', '_')}_1d.parquet"
+        if not fpath.exists():
+            logger.warning(f"price_cache: {asset} nicht gefunden, wird übersprungen")
+            continue
+        try:
+            df = pd.read_parquet(fpath, columns=['close'])
+            df.index = pd.to_datetime(df.index)
+            cache[asset] = df['close']
+        except Exception as exc:
+            logger.warning(f"price_cache: {asset} Ladefehler ({exc})")
+    logger.info(f"price_cache: {len(cache)}/{len(assets)} Assets geladen")
+    return cache
+
+
 # ── Modell laden ──────────────────────────────────────────────────────────────
 
 def load_fold_model(ckpt_path: str, device: str) -> tuple[CrossSectionalLSTM, dict]:
@@ -158,6 +190,8 @@ def run_backtest(
     # Regime-Filter
     use_regime:  bool  = True,  # Adaptives N aktivieren
     spy_ticker:  str   = "SPY", # Referenz-Asset für Regime
+    # Optionaler Pre-built Price-Cache (vermeidet wiederholtes Disk-IO)
+    price_cache: Optional[dict] = None,
 ) -> dict:
     """
     Führt den Cross-Sectional Backtest über alle Folds durch.
@@ -171,16 +205,19 @@ def run_backtest(
     """
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    # SPY Preisreihe für Regime-Filter laden
+    # Price-Cache einmalig aufbauen (falls nicht von außen übergeben)
+    if price_cache is None:
+        all_assets = list(asset_map.keys())
+        if use_regime and spy_ticker not in all_assets:
+            all_assets.append(spy_ticker)
+        price_cache = build_price_cache(all_assets)
+
+    # SPY Preisreihe für Regime-Filter aus Cache
     spy_prices = None
     if use_regime:
-        spy_file = RAW_DIR / f"{spy_ticker}_1d.parquet"
-        if spy_file.exists():
-            spy_df    = pd.read_parquet(spy_file)
-            spy_df.index = pd.to_datetime(spy_df.index)
-            spy_prices = spy_df["close"]
-        else:
-            logger.warning(f"SPY nicht gefunden, Regime-Filter deaktiviert")
+        spy_prices = price_cache.get(spy_ticker)
+        if spy_prices is None:
+            logger.warning(f"{spy_ticker} nicht im price_cache, Regime-Filter deaktiviert")
             use_regime = False
 
     all_dates = features.index.get_level_values('date').unique().sort_values()
@@ -226,13 +263,13 @@ def run_backtest(
                 model, features, asset_map, date, seq_len, device
             )
             if len(preds) < 2:
-                equity.append(cash + _position_value(positions, features, date))
+                equity.append(cash + _position_value(positions, price_cache, date))
                 equity_dates.append(date)
                 continue
 
             # ── Bestehende Positionen auflösen ────────────────────────────
             for asset, pos in list(positions.items()):
-                price = _get_price(features, asset, date)
+                price = _get_price(price_cache, asset, date)
                 if price is None:
                     continue
                 proceeds = pos['shares'] * price * (1 - fees) * pos['direction']
@@ -266,7 +303,7 @@ def run_backtest(
             per_position = cash / total_positions
 
             for asset in top_assets:
-                price = _get_price(features, asset, date)
+                price = _get_price(price_cache, asset, date)
                 if price is None or price <= 0:
                     continue
                 shares = (per_position * (1 - fees)) / price
@@ -274,7 +311,7 @@ def run_backtest(
                 cash -= per_position
 
             for asset in short_assets:
-                price = _get_price(features, asset, date)
+                price = _get_price(price_cache, asset, date)
                 if price is None or price <= 0:
                     continue
                 # Short: wir erhalten den Erlös sofort
@@ -283,7 +320,7 @@ def run_backtest(
                 cash += per_position * (1 - fees)  # Short-Erlös
 
             # ── Equity berechnen ──────────────────────────────────────────
-            portfolio_value = cash + _position_value(positions, features, date)
+            portfolio_value = cash + _position_value(positions, price_cache, date)
             equity.append(portfolio_value)
             equity_dates.append(date)
 
@@ -291,7 +328,7 @@ def run_backtest(
     if positions and equity_dates:
         last_date = equity_dates[-1]
         for asset, pos in positions.items():
-            price = _get_price(features, asset, last_date)
+            price = _get_price(price_cache, asset, last_date)
             if price:
                 cash += pos['shares'] * price * (1 - fees) * pos['direction']
         positions = {}
@@ -396,32 +433,34 @@ def plot_equity(
 
 # ── Hilfsfunktionen ───────────────────────────────────────────────────────────
 
-def _get_price(features: pd.DataFrame, asset: str, date: pd.Timestamp) -> Optional[float]:
-    """Gibt den Close-Preis eines Assets an einem Tag zurück (aus raw parquet)."""
-    # Wir nutzen ret_1d aus Features um Preis zu rekonstruieren — nicht ideal.
-    # Besser: direkt aus raw parquet lesen.
-    try:
-        fpath = RAW_DIR / f"{asset.replace('.', '_')}_1d.parquet"
-        if not fpath.exists():
-            return None
-        df    = pd.read_parquet(fpath, columns=['close'])
-        df.index = pd.to_datetime(df.index)
-        idx   = df.index.searchsorted(date)
-        idx   = min(idx, len(df) - 1)
-        return float(df.iloc[idx]['close'])
-    except Exception:
+def _get_price(
+    cache: dict[str, pd.Series],
+    asset: str,
+    date:  pd.Timestamp,
+) -> Optional[float]:
+    """
+    Gibt den Close-Preis eines Assets an einem Tag aus dem Price-Cache zurück.
+
+    Nutzt binäre Suche (searchsorted) — O(log n) statt O(n).
+    Gibt None zurück wenn das Asset nicht im Cache ist.
+    """
+    series = cache.get(asset)
+    if series is None or len(series) == 0:
         return None
+    idx = series.index.searchsorted(date)
+    idx = min(idx, len(series) - 1)
+    return float(series.iloc[idx])
 
 
 def _position_value(
-    positions: dict,
-    features:  pd.DataFrame,
-    date:      pd.Timestamp,
+    positions:   dict,
+    price_cache: dict[str, pd.Series],
+    date:        pd.Timestamp,
 ) -> float:
-    """Berechnet den aktuellen Marktwert aller offenen Positionen."""
+    """Berechnet den aktuellen Marktwert aller offenen Positionen aus dem Cache."""
     total = 0.0
     for asset, pos in positions.items():
-        price = _get_price(features, asset, date)
+        price = _get_price(price_cache, asset, date)
         if price:
             total += pos['shares'] * price * pos['direction']
     return total

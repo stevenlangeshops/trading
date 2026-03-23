@@ -23,3 +23,7 @@ logs/
 # Jupyter
 .ipynb_checkpoints/
 notebooks/*.ipynb
+
+# Kaggle Kernels (lokales Staging + Downloads)
+.kaggle_kernel_upload/
+kaggle_kernel_runs/
