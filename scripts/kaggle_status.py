@@ -98,6 +98,21 @@ def state_color(state: str) -> str:
     return state
 
 
+LOG_TAIL = 40   # Zeilen aus pipeline.log anzeigen
+
+
+def find_pipeline_log(n: int = LOG_TAIL) -> list[str] | None:
+    """Sucht pipeline.log in den zuletzt heruntergeladenen Artefakten."""
+    run_dir = REPO_ROOT / "kaggle_kernel_runs"
+    if not run_dir.exists():
+        return None
+    logs = sorted(run_dir.rglob("pipeline.log"), key=lambda p: p.stat().st_mtime, reverse=True)
+    if not logs:
+        return None
+    lines = logs[0].read_text(encoding="utf-8", errors="replace").splitlines()
+    return lines[-n:]
+
+
 def display() -> None:
     status  = read_status()
     term_f  = find_watcher_terminal()
@@ -142,6 +157,22 @@ def display() -> None:
     else:
         print("  (Watcher-Terminal nicht gefunden)")
 
+    # pipeline.log aus letztem Artefakt-Download
+    pipe_lines = find_pipeline_log()
+    if pipe_lines:
+        print(color(LINE, "2"))
+        print(f"  pipeline.log (letzte {LOG_TAIL} Zeilen aus letztem Download):")
+        print()
+        for line in pipe_lines:
+            if "[ERROR]" in line or "Traceback" in line or "Error" in line:
+                print("  " + color(line, "31"))
+            elif "[DONE]" in line or "erfolgreich" in line.lower():
+                print("  " + color(line, "32"))
+            elif "SCHRITT" in line:
+                print("  " + color(line, "33"))
+            else:
+                print("  " + line)
+
     last_log = status.get("last_log", "")
     if last_log:
         print(color(LINE, "2"))
@@ -149,6 +180,14 @@ def display() -> None:
         print()
         for line in last_log.strip().splitlines()[-15:]:
             print("  " + color(line, "31"))
+
+    # Hinweis auf Live-URL
+    kernel_id = status.get("kernel_id", "")
+    if kernel_id and "RUNNING" in status.get("state", "").upper():
+        print(color(LINE, "2"))
+        user, slug = (kernel_id.split("/") + [""])[:2]
+        print(f"  Live-Output im Browser: https://www.kaggle.com/code/{user}/{slug}")
+        print(f"  (Kaggle-API unterstuetzt kein Live-Log-Streaming)")
 
     print(color(SEP, "1"))
     print()

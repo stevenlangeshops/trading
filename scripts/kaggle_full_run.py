@@ -45,16 +45,36 @@ INPUT_DIRS = [
 ]
 t0 = time.time()
 
+# Zentrales Log-File das ALLES mitschreibt (stdout wird zusaetzlich gespiegelt)
+LOG_FILE = WORKING / "pipeline.log"
+_log_fh  = None   # wird in main() geoeffnet
+
+
+def _init_log() -> None:
+    global _log_fh
+    _log_fh = open(LOG_FILE, "w", encoding="utf-8", buffering=1)
+
+
+def log_write(msg: str) -> None:
+    """Schreibt in pipeline.log UND auf stdout."""
+    ts = time.strftime("%H:%M:%S")
+    line = f"[{ts}] {msg}"
+    log_write(line)
+    if _log_fh:
+        _log_fh.write(line + "\n")
+        _log_fh.flush()
+
 
 def run(cmd: list, cwd: Path = WORKING, check: bool = True) -> str:
-    print(f"\n$ {' '.join(str(c) for c in cmd)}", flush=True)
+    log_write(f"$ {' '.join(str(c) for c in cmd)}")
     result = subprocess.run(
         cmd, cwd=str(cwd),
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
         text=True, encoding="utf-8", errors="replace",
     )
     out = result.stdout or ""
-    print(out, flush=True)
+    for line in out.splitlines():
+        log_write(f"  {line}")
     if check and result.returncode != 0:
         raise RuntimeError(f"rc={result.returncode}: {cmd[0]}")
     return out
@@ -67,13 +87,13 @@ def elapsed() -> str:
 # ── Schritt 1: Repo klonen ────────────────────────────────────────────────────
 
 def step_clone():
-    print(f"\n{'='*60}\nSCHRITT 1: Repo klonen [{elapsed()}]\n{'='*60}", flush=True)
+    log_write(f"\n{'='*60}\nSCHRITT 1: Repo klonen [{elapsed()}]\n{'='*60}")
     if REPO_DIR.exists():
         shutil.rmtree(REPO_DIR)
     run(["git", "clone", "--depth=1",
          "https://github.com/stevenlangeshops/trading.git",
          str(REPO_DIR)])
-    print(f"Repo-Inhalt: {[f.name for f in REPO_DIR.iterdir()]}", flush=True)
+    log_write(f"Repo-Inhalt: {[f.name for f in REPO_DIR.iterdir()]}")
 
 
 # ── Schritt 1b: CUDA Health-Check ────────────────────────────────────────────
@@ -89,7 +109,7 @@ def step_check_cuda():
       2. Nochmal testen
       3. Falls immer noch defekt -> CUDA_VISIBLE_DEVICES='' -> CPU-Fallback
     """
-    print(f"\n{'='*60}\nSCHRITT 1b: CUDA Health-Check [{elapsed()}]\n{'='*60}", flush=True)
+    log_write(f"\n{'='*60}\nSCHRITT 1b: CUDA Health-Check [{elapsed()}]\n{'='*60}")
 
     cuda_test_code = (
         "import torch, sys; "
@@ -109,15 +129,15 @@ def step_check_cuda():
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             text=True, encoding="utf-8", errors="replace",
         )
-        print(r.stdout or "", flush=True)
+        log_write(r.stdout or "")
         return r.returncode == 0
 
     if _cuda_ok():
-        print("  CUDA : OK", flush=True)
+        log_write("  CUDA : OK")
         return
 
     # CUDA defekt -> PyTorch cu124 nachinstallieren
-    print("  CUDA defekt. Installiere torch cu124 ...", flush=True)
+    log_write("  CUDA defekt. Installiere torch cu124 ...")
     run([
         sys.executable, "-m", "pip", "install", "-q",
         "torch", "torchvision",
@@ -126,18 +146,18 @@ def step_check_cuda():
     ])
 
     if _cuda_ok():
-        print("  CUDA nach Reinstall : OK", flush=True)
+        log_write("  CUDA nach Reinstall : OK")
         return
 
     # Letzter Ausweg: CPU-Modus erzwingen
-    print("  CUDA auch nach Reinstall defekt -> CPU-Modus (CUDA_VISIBLE_DEVICES='')", flush=True)
+    log_write("  CUDA auch nach Reinstall defekt -> CPU-Modus (CUDA_VISIBLE_DEVICES='')")
     os.environ["CUDA_VISIBLE_DEVICES"] = ""
 
 
 # ── Schritt 2: Abhaengigkeiten ────────────────────────────────────────────────
 
 def step_install():
-    print(f"\n{'='*60}\nSCHRITT 2: Abhaengigkeiten [{elapsed()}]\n{'='*60}", flush=True)
+    log_write(f"\n{'='*60}\nSCHRITT 2: Abhaengigkeiten [{elapsed()}]\n{'='*60}")
     # Kaggle hat PyTorch vorinstalliert, wir brauchen nur ta + loguru + scipy
     run([sys.executable, "-m", "pip", "install",
          "ta==0.11.0", "loguru==0.7.2", "scipy",
@@ -147,33 +167,33 @@ def step_install():
 # ── Schritt 3: Parquet-Daten kopieren ────────────────────────────────────────
 
 def step_copy_data():
-    print(f"\n{'='*60}\nSCHRITT 3: Parquet-Daten kopieren [{elapsed()}]\n{'='*60}", flush=True)
+    log_write(f"\n{'='*60}\nSCHRITT 3: Parquet-Daten kopieren [{elapsed()}]\n{'='*60}")
     raw_dst = REPO_DIR / "data" / "raw"
     raw_dst.mkdir(parents=True, exist_ok=True)
 
     copied = 0
     for src_dir in INPUT_DIRS:
         if not src_dir.exists():
-            print(f"  [SKIP] {src_dir}", flush=True)
+            log_write(f"  [SKIP] {src_dir}")
             continue
         files = list(src_dir.glob("*.parquet"))
-        print(f"  [FOUND] {src_dir}: {len(files)} Parquet-Dateien", flush=True)
+        log_write(f"  [FOUND] {src_dir}: {len(files)} Parquet-Dateien")
         for f in files:
             shutil.copy2(f, raw_dst / f.name)
             copied += 1
         break  # erste vorhandene Quelle reicht
 
-    print(f"  {copied} Dateien nach {raw_dst} kopiert", flush=True)
+    log_write(f"  {copied} Dateien nach {raw_dst} kopiert")
     if copied == 0:
         # Fallback: raw.zip im Repo entpacken (falls vorhanden)
         raw_zip = REPO_DIR / "data" / "raw.zip"
         if raw_zip.exists():
             import zipfile
-            print(f"  Fallback: {raw_zip} entpacken", flush=True)
+            log_write(f"  Fallback: {raw_zip} entpacken")
             with zipfile.ZipFile(raw_zip) as zf:
                 zf.extractall(raw_dst)
             copied = len(list(raw_dst.glob("*.parquet")))
-            print(f"  {copied} Dateien aus raw.zip entpackt", flush=True)
+            log_write(f"  {copied} Dateien aus raw.zip entpackt")
 
     if copied == 0:
         raise RuntimeError(
@@ -187,15 +207,15 @@ def step_copy_data():
 # ── Schritt 4: Features bauen ────────────────────────────────────────────────
 
 def step_build_panel():
-    print(f"\n{'='*60}\nSCHRITT 4: build_panel() [{elapsed()}]\n{'='*60}", flush=True)
+    log_write(f"\n{'='*60}\nSCHRITT 4: build_panel() [{elapsed()}]\n{'='*60}")
     sys.path.insert(0, str(REPO_DIR))
     os.chdir(str(REPO_DIR))
 
     from features.engineer import build_panel
     features, targets = build_panel(timeframe="1d", horizon=11, min_rows=300)
-    print(f"  features: {features.shape}", flush=True)
-    print(f"  targets:  {targets.shape}", flush=True)
-    print(f"  Assets:   {features.index.get_level_values('asset').nunique()}", flush=True)
+    log_write(f"  features: {features.shape}")
+    log_write(f"  targets:  {targets.shape}")
+    log_write(f"  Assets:   {features.index.get_level_values('asset').nunique()}")
     print(f"  Zeitraum: {features.index.get_level_values('date').min().date()} "
           f"bis {features.index.get_level_values('date').max().date()}", flush=True)
     return features, targets
@@ -204,22 +224,22 @@ def step_build_panel():
 # ── Schritt 5: Asset-Map ──────────────────────────────────────────────────────
 
 def step_build_asset_map(features):
-    print(f"\n{'='*60}\nSCHRITT 5: Asset-Map [{elapsed()}]\n{'='*60}", flush=True)
+    log_write(f"\n{'='*60}\nSCHRITT 5: Asset-Map [{elapsed()}]\n{'='*60}")
     assets    = sorted(features.index.get_level_values("asset").unique().tolist())
     asset_map = {a: i + 1 for i, a in enumerate(assets)}  # IDs bei 1 starten
-    print(f"  {len(asset_map)} Assets, IDs 1..{max(asset_map.values())}", flush=True)
+    log_write(f"  {len(asset_map)} Assets, IDs 1..{max(asset_map.values())}")
 
     asset_map_path = WORKING / "asset_map.json"
     with open(asset_map_path, "w") as f:
         json.dump(asset_map, f, indent=2)
-    print(f"  Gespeichert: {asset_map_path}", flush=True)
+    log_write(f"  Gespeichert: {asset_map_path}")
     return asset_map
 
 
 # ── Schritt 6: Training ───────────────────────────────────────────────────────
 
 def step_train(features, targets, asset_map):
-    print(f"\n{'='*60}\nSCHRITT 6: train_walk_forward() [{elapsed()}]\n{'='*60}", flush=True)
+    log_write(f"\n{'='*60}\nSCHRITT 6: train_walk_forward() [{elapsed()}]\n{'='*60}")
 
     from models.trainer import train_walk_forward
 
@@ -253,17 +273,17 @@ def step_train(features, targets, asset_map):
     wf_path = WORKING / "walk_forward_results.json"
     with open(wf_path, "w") as f:
         json.dump(fold_results, f, indent=2, default=str)
-    print(f"  Gespeichert: {wf_path}", flush=True)
+    log_write(f"  Gespeichert: {wf_path}")
 
     mean_ic = sum(r.get("best_val_ic", 0) for r in fold_results) / max(len(fold_results), 1)
-    print(f"  Mean IC ueber {len(fold_results)} Folds: {mean_ic:.4f}", flush=True)
+    log_write(f"  Mean IC ueber {len(fold_results)} Folds: {mean_ic:.4f}")
     return fold_results
 
 
 # ── Schritt 7: Backtest ───────────────────────────────────────────────────────
 
 def step_backtest(features, targets, asset_map, fold_results):
-    print(f"\n{'='*60}\nSCHRITT 7: Backtest [{elapsed()}]\n{'='*60}", flush=True)
+    log_write(f"\n{'='*60}\nSCHRITT 7: Backtest [{elapsed()}]\n{'='*60}")
 
     from strategy.backtest import run_backtest, build_price_cache, plot_equity
 
@@ -300,7 +320,7 @@ def step_backtest(features, targets, asset_map, fold_results):
     try:
         plot_equity(result_a, result_b, save_path=str(WORKING / "equity_curve.png"))
     except Exception as e:
-        print(f"  [WARN] plot_equity: {e}", flush=True)
+        log_write(f"  [WARN] plot_equity: {e}")
 
     return result_a, result_b
 
@@ -308,7 +328,7 @@ def step_backtest(features, targets, asset_map, fold_results):
 # ── Schritt 8: Tar-Archiv ─────────────────────────────────────────────────────
 
 def step_pack_artifacts(result_a: dict, result_b: dict):
-    print(f"\n{'='*60}\nSCHRITT 8: Artefakte packen [{elapsed()}]\n{'='*60}", flush=True)
+    log_write(f"\n{'='*60}\nSCHRITT 8: Artefakte packen [{elapsed()}]\n{'='*60}")
 
     collect = [
         WORKING / "asset_map.json",
@@ -336,7 +356,7 @@ def step_pack_artifacts(result_a: dict, result_b: dict):
                 tf.add(str(p), arcname=p.name)
 
     sz = tar_path.stat().st_size // 1024
-    print(f"  {tar_path.name}: {sz} KB, {len(seen)} Dateien", flush=True)
+    log_write(f"  {tar_path.name}: {sz} KB, {len(seen)} Dateien")
 
     summary = {
         "return_code":  0,
@@ -353,13 +373,15 @@ def step_pack_artifacts(result_a: dict, result_b: dict):
         f"Long-Only  Total Return: {result_a.get('total_return', '?')}%\n"
         f"Long-Short Total Return: {result_b.get('total_return', '?')}%\n"
     )
-    print("\n" + json.dumps(summary, indent=2), flush=True)
+    log_write("\n" + json.dumps(summary, indent=2))
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main() -> int:
-    print(f"Trading Bot Full Pipeline | {time.strftime('%Y-%m-%d %H:%M:%S UTC')}", flush=True)
+    _init_log()
+    log_write(f"Trading Bot Full Pipeline | {time.strftime('%Y-%m-%d %H:%M:%S UTC')}")
+    log_write(f"Log-Datei: {LOG_FILE}")
     try:
         step_clone()
         step_check_cuda()
@@ -370,21 +392,25 @@ def main() -> int:
         fold_results      = step_train(features, targets, asset_map)
         result_a, result_b = step_backtest(features, targets, asset_map, fold_results)
         step_pack_artifacts(result_a, result_b)
-        print(f"\n[DONE] Gesamtdauer: {elapsed()}", flush=True)
+        log_write(f"\n[DONE] Gesamtdauer: {elapsed()}")
         return 0
     except Exception as exc:
         import traceback
         tb = traceback.format_exc()
-        print(f"\n[ERROR]\n{tb}", flush=True)
+        log_write(f"\n[ERROR]\n{tb}")
         (WORKING / "kaggle_cmd_stdout_stderr.txt").write_text(tb)
         (WORKING / "kaggle_cmd_exit_code.txt").write_text("1")
         (WORKING / "kernel_summary.json").write_text(
             json.dumps({"return_code": 1, "error": str(exc)})
         )
+        # Log-File schliessen bevor tar
+        if _log_fh:
+            _log_fh.flush()
         # Minimal-Tar damit Download-Wrapper immer etwas findet
         tar_path = WORKING / "kaggle_artifacts.tar.gz"
         with tarfile.open(str(tar_path), "w:gz") as tf:
-            for fname in ("kaggle_cmd_stdout_stderr.txt", "kaggle_cmd_exit_code.txt", "kernel_summary.json"):
+            for fname in ("kaggle_cmd_stdout_stderr.txt", "kaggle_cmd_exit_code.txt",
+                          "kernel_summary.json", "pipeline.log"):
                 p = WORKING / fname
                 if p.exists():
                     tf.add(str(p), arcname=fname)
