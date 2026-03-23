@@ -100,58 +100,91 @@ def step_clone():
 
 def step_check_cuda():
     """
-    Prueft ob CUDA wirklich nutzbar ist — via Subprocess, BEVOR torch im
-    Hauptprozess importiert wird (importlib.reload() funktioniert nicht
-    bei C-Extensions wie torch).
+    Prueft ob CUDA nutzbar ist — via Subprocess, bevor torch im Hauptprozess
+    importiert wird.
 
-    Falls CUDA kaputt ist (z.B. SM-Versions-Mismatch H100 + altes PyTorch):
-      1. PyTorch cu124-Wheels nachinstallieren
-      2. Nochmal testen
-      3. Falls immer noch defekt -> CUDA_VISIBLE_DEVICES='' -> CPU-Fallback
+    Entscheidungsbaum:
+      SM >= 7.0  und matmul OK  →  GPU-Modus (PyTorch 2.x unterstuetzt SM_70+)
+      SM >= 7.0  aber defekt    →  cu124-Reinstall, danach nochmal testen
+      SM <  7.0  (z.B. P100)   →  sofort CPU-Modus, kein Reinstall
+                                   (PyTorch 2.x + Python 3.12 unterstuetzt SM_60
+                                    grundsaetzlich nicht mehr)
+      Kein CUDA                 →  CPU-Modus
     """
     log_write(f"\n{'='*60}\nSCHRITT 1b: CUDA Health-Check [{elapsed()}]\n{'='*60}")
 
-    cuda_test_code = (
-        "import torch, sys; "
+    # Schritt 1: SM-Version und matmul-Test in Subprocess
+    probe_code = (
+        "import torch, sys, warnings; warnings.filterwarnings('ignore'); "
         "print(f'torch={torch.__version__}'); "
-        "print(f'cuda_avail={torch.cuda.is_available()}'); "
-        "dev = torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'N/A'; "
-        "cap = torch.cuda.get_device_capability(0) if torch.cuda.is_available() else (0,0); "
-        "print(f'gpu={dev}  SM={cap[0]}{cap[1]}'); "
+        "avail = torch.cuda.is_available(); "
+        "print(f'cuda_avail={avail}'); "
+        "cap = torch.cuda.get_device_capability(0) if avail else (0,0); "
+        "dev = torch.cuda.get_device_name(0) if avail else 'N/A'; "
+        "print(f'gpu={dev}'); "
+        "print(f'sm={cap[0]}.{cap[1]}'); "
+        "sys.exit(0) if not avail else None; "
         "t = torch.zeros(4,4,device='cuda') @ torch.ones(4,4,device='cuda'); "
-        "print('matmul=OK'); "
-        "sys.exit(0)"
+        "print('matmul=OK'); sys.exit(0)"
     )
 
-    def _cuda_ok() -> bool:
-        r = subprocess.run(
-            [sys.executable, "-c", cuda_test_code],
+    r = subprocess.run(
+        [sys.executable, "-c", probe_code],
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        text=True, encoding="utf-8", errors="replace",
+    )
+    probe_out = r.stdout or ""
+    for line in probe_out.splitlines():
+        log_write(f"  {line}")
+
+    # SM-Version aus Ausgabe lesen
+    sm_major = 0
+    for line in probe_out.splitlines():
+        if line.startswith("sm="):
+            try:
+                sm_major = int(line.split("=")[1].split(".")[0])
+            except Exception:
+                pass
+
+    cuda_ok = r.returncode == 0 and "matmul=OK" in probe_out
+
+    if cuda_ok:
+        log_write("  CUDA : OK -> GPU-Training aktiv")
+        return
+
+    if sm_major > 0 and sm_major < 7:
+        # P100 (SM_60) oder aeltere GPUs: PyTorch 2.x + Python 3.12 unterstuetzt
+        # diese Architektur grundsaetzlich nicht. Reinstall waere zwecklos.
+        log_write(f"  GPU SM_{sm_major}.x < 7.0: inkompatibel mit PyTorch 2.x / Python 3.12.")
+        log_write("  Kein Reinstall moeglich -> direkt CPU-Modus.")
+        os.environ["CUDA_VISIBLE_DEVICES"] = ""
+        os.environ["KAGGLE_GPU_INCOMPATIBLE"] = "1"  # Merker fuer step_train
+        return
+
+    if sm_major >= 7:
+        # SM OK, aber matmul schlug fehl -> cu124 nachinstallieren
+        log_write(f"  SM_{sm_major}.x kompatibel, aber matmul fehlgeschlagen -> cu124 installieren ...")
+        run([
+            sys.executable, "-m", "pip", "install", "-q",
+            "torch", "torchvision",
+            "--index-url", "https://download.pytorch.org/whl/cu124",
+            "--upgrade",
+        ])
+        r2 = subprocess.run(
+            [sys.executable, "-c", probe_code],
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             text=True, encoding="utf-8", errors="replace",
         )
-        log_write(r.stdout or "")
-        return r.returncode == 0
+        for line in (r2.stdout or "").splitlines():
+            log_write(f"  {line}")
+        if r2.returncode == 0 and "matmul=OK" in (r2.stdout or ""):
+            log_write("  CUDA nach Reinstall : OK")
+            return
 
-    if _cuda_ok():
-        log_write("  CUDA : OK")
-        return
-
-    # CUDA defekt -> PyTorch cu124 nachinstallieren
-    log_write("  CUDA defekt. Installiere torch cu124 ...")
-    run([
-        sys.executable, "-m", "pip", "install", "-q",
-        "torch", "torchvision",
-        "--index-url", "https://download.pytorch.org/whl/cu124",
-        "--upgrade",
-    ])
-
-    if _cuda_ok():
-        log_write("  CUDA nach Reinstall : OK")
-        return
-
-    # Letzter Ausweg: CPU-Modus erzwingen
-    log_write("  CUDA auch nach Reinstall defekt -> CPU-Modus (CUDA_VISIBLE_DEVICES='')")
+    # Letzter Ausweg
+    log_write("  CUDA nicht nutzbar -> CPU-Modus (CUDA_VISIBLE_DEVICES='')")
     os.environ["CUDA_VISIBLE_DEVICES"] = ""
+    os.environ["KAGGLE_GPU_INCOMPATIBLE"] = "1"
 
 
 # ── Schritt 2: Abhaengigkeiten ────────────────────────────────────────────────
@@ -243,25 +276,35 @@ def step_train(features, targets, asset_map):
 
     from models.trainer import train_walk_forward
 
+    # GPU inkompatibel (z.B. P100 SM_60) -> CPU-Modus mit reduzierter Komplexitaet
+    # damit das Training innerhalb des Kaggle-Zeitlimits (12h) bleibt
+    gpu_ok = os.environ.get("KAGGLE_GPU_INCOMPATIBLE", "0") != "1"
+    if gpu_ok:
+        log_write("  Modus: GPU")
+        _epochs, _patience, _hidden, _layers, _step_months = 50, 7,  128, 2, 6.0
+    else:
+        log_write("  Modus: CPU (reduzierte Parameter fuer Zeitlimit)")
+        _epochs, _patience, _hidden, _layers, _step_months = 15, 4,  64,  1, 12.0
+
     results = train_walk_forward(
         features     = features,
         targets      = targets,
         asset_map    = asset_map,
-        # Walk-Forward (Doku Abschnitt 8)
+        # Walk-Forward
         train_years  = 3.0,
         val_months   = 6.0,
-        step_months  = 6.0,
+        step_months  = _step_months,   # CPU: 12 Monate -> ~6 Folds statt 12
         # Modell
-        hidden_dim   = 128,
-        num_layers   = 2,
+        hidden_dim   = _hidden,
+        num_layers   = _layers,
         embed_dim    = 16,
         dropout      = 0.3,
         seq_len      = 64,
         # Training
         lr           = 5e-4,
         weight_decay = 1e-3,
-        epochs       = 50,
-        patience     = 7,
+        epochs       = _epochs,
+        patience     = _patience,
         batch_size   = 512,
         rank_weight  = 0.5,
     )
