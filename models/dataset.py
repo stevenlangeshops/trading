@@ -174,8 +174,12 @@ class CrossSectionalDataset(Dataset):
         self.samples = []
         assets = features.index.get_level_values("asset").unique()
 
+        # Maximale gültige ID = max(asset_map.values())
+        max_valid_id = max(asset_map.values()) if asset_map else 0
+
         for asset in assets:
-            asset_id = asset_map.get(asset, 0)
+            raw_id   = asset_map.get(asset, 0)
+            asset_id = raw_id if raw_id <= max_valid_id else 0  # Fallback auf padding
 
             # Features und Targets für dieses Asset
             try:

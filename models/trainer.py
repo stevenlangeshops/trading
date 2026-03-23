@@ -185,7 +185,9 @@ def train_walk_forward(
     """
     device     = "cuda" if torch.cuda.is_available() else "cpu"
     n_features = len(features.columns)
-    n_assets   = len(asset_map)
+    # +1 weil IDs bei 1 starten (0 = padding), max ID = len(asset_map)
+    # Embedding-Größe muss > max(asset_id) sein
+    n_assets   = max(asset_map.values()) + 1
 
     logger.info(f"Walk-Forward Training: Device={device}")
     logger.info(f"  Assets={n_assets}  Features={n_features}  seq_len={seq_len}")
