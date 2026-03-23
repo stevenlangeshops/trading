@@ -28,6 +28,7 @@ class SubmitConfig:
     enable_internet: bool
     install_deps: bool
     exclude_upload_files: tuple[str, ...]
+    custom_entrypoint: Path | None = None  # falls gesetzt: dieses Script als Entrypoint hochladen
 
 
 def _run(cmd: list[str], cwd: Path | None = None, env: dict[str, str] | None = None) -> subprocess.CompletedProcess:
@@ -35,10 +36,11 @@ def _run(cmd: list[str], cwd: Path | None = None, env: dict[str, str] | None = N
         cmd,
         cwd=str(cwd) if cwd else None,
         env=env,
-        text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         check=False,
+        encoding="utf-8",
+        errors="replace",   # ungültige Bytes durch ? ersetzen statt crashen
     )
 
 
@@ -121,8 +123,11 @@ def build_kaggle_env() -> dict[str, str]:
     """
     Erstellt ein os.environ-Dict mit den korrekten Kaggle-Credentials,
     damit Subprocess-Calls (kaggle kernels push/status/output) authentifiziert sind.
+    Setzt PYTHONIOENCODING=utf-8 damit Windows-charmap-Probleme vermieden werden.
     """
     env = os.environ.copy()
+    env["PYTHONIOENCODING"] = "utf-8"
+    env["PYTHONUTF8"] = "1"
 
     # Neues Format: KGAT-Token hat Vorrang
     token = load_kaggle_token()
@@ -211,6 +216,11 @@ def write_kernel_metadata(staging_dir: Path, cfg: SubmitConfig) -> None:
 
 
 def write_task_and_entrypoint(staging_dir: Path, cfg: SubmitConfig) -> None:
+    # Falls ein custom Entrypoint-Script angegeben ist, direkt als kaggle_entrypoint.py kopieren.
+    if cfg.custom_entrypoint is not None:
+        shutil.copy2(cfg.custom_entrypoint, staging_dir / "kaggle_entrypoint.py")
+        return
+
     # Task direkt als Python-Dict in den Entrypoint einbetten – keine externe JSON-Datei nötig.
     task = {
         "cmd_tokens": cfg.cmd_tokens,
@@ -440,6 +450,8 @@ def cmd_run(args: argparse.Namespace) -> int:
     _owner, kernel_slug = args.kernel_id.split("/", 1)
     kernel_title = args.kernel_title or kernel_slug
 
+    custom_ep = Path(args.custom_entrypoint) if args.custom_entrypoint else None
+
     cfg = SubmitConfig(
         kernel_id=args.kernel_id,
         kernel_title=kernel_title,
@@ -452,9 +464,10 @@ def cmd_run(args: argparse.Namespace) -> int:
         enable_internet=bool(args.enable_internet),
         install_deps=bool(args.install_deps),
         exclude_upload_files=(
-            "raw.zip",  # large local data artifacts
+            "raw.zip",
             "*.zip",
         ),
+        custom_entrypoint=custom_ep,
     )
 
     ensure_kaggle_cli()
@@ -514,6 +527,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_run.add_argument("--runs-root", default=str(REPO_ROOT / "kaggle_kernel_runs"))
     p_run.add_argument("--enable-internet", action="store_true", help="Internet im Kernel erlauben (für pip install).")
     p_run.add_argument("--install-deps", action="store_true", help="requirements.txt im Kernel installieren.")
+    p_run.add_argument("--custom-entrypoint", default=None, help="Pfad zu einem eigenen Python-Script das als kaggle_entrypoint.py hochgeladen wird.")
     return p
 
 
