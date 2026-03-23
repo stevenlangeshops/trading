@@ -1,328 +1,242 @@
 """
 features/engineer.py
 ─────────────────────
-Feature-Engineering-Pipeline für einzelne Assets UND Multi-Asset-Training.
+Cross-Sectional Feature Engineering für Multi-Asset LSTM.
 
-Aufruf (einzeln):
-    python features/engineer.py --ticker AAPL --timeframe 1h
+Kernidee:
+  1. Pro Asset: technische Indikatoren berechnen (zeitreihen-intern)
+  2. Pro Tag: alle Features über alle Assets hinweg z-Score normalisieren
+             (Cross-Sectional Normalization)
+  3. Target: 11-Tage Forward Return (Regression, nicht binäre Klassifikation)
 
-Aufruf (alle Assets aus asset_list.txt):
-    python features/engineer.py --all --timeframe 1h --threshold 0.002
+Warum Cross-Sectional Normalization?
+  - Ein SMA-Ratio von 1.05 bedeutet bei Apple etwas anderes als bei Nestlé
+  - Nach CS-Norm bedeutet +1.0 "dieses Asset hat den höchsten Wert heute"
+  - Das Modell lernt relative Stärke, nicht absolute Werte
 """
 
 from __future__ import annotations
 
-import argparse
+import warnings
 from pathlib import Path
+from typing import Optional
 
 import numpy as np
 import pandas as pd
 import ta
-import torch
-from loguru import logger
-from sklearn.preprocessing import RobustScaler
 
-FEATURE_DIR = Path(__file__).parent / "processed"
-RAW_DIR     = Path(__file__).parent.parent / "data" / "raw"
-ASSET_LIST  = Path(__file__).parent.parent / "data" / "asset_list.txt"
+warnings.filterwarnings("ignore")
 
-# Defaults
-HORIZON   : int   = 6
-THRESHOLD : float = 0.002
-SEQ_LEN   : int   = 48
-SPLIT               = (0.70, 0.15, 0.15)
+RAW_DIR     = Path("data/raw")
+FEATURE_DIR = Path("features/processed")
 
 
-# ── Indikatoren ───────────────────────────────────────────────────────────────
-
-def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    df    = df.copy()
-    close = df["close"]
-    high  = df["high"]
-    low   = df["low"]
-    vol   = df["volume"]
-
-    df["rsi_14"]      = ta.momentum.RSIIndicator(close, window=14).rsi()
-    macd              = ta.trend.MACD(close, window_fast=12, window_slow=26, window_sign=9)
-    df["macd"]        = macd.macd()
-    df["macd_signal"] = macd.macd_signal()
-    df["macd_hist"]   = macd.macd_diff()
-    bb                = ta.volatility.BollingerBands(close, window=20, window_dev=2)
-    df["bb_width"]    = bb.bollinger_wband()
-    df["bb_pct"]      = bb.bollinger_pband()
-    for p in [9, 21, 50, 200]:
-        df[f"ema_{p}"] = ta.trend.EMAIndicator(close, window=p).ema_indicator()
-    df["atr_14"]       = ta.volatility.AverageTrueRange(high, low, close, window=14).average_true_range()
-    df["volume_ema_20"]= ta.trend.EMAIndicator(vol, window=20).ema_indicator()
-    df["log_return"]   = np.log(close / close.shift(1))
-    df["body"]         = (df["close"] - df["open"]) / df["open"]
-    df["upper_wick"]   = (df["high"] - df[["open","close"]].max(axis=1)) / df["open"]
-    df["lower_wick"]   = (df[["open","close"]].min(axis=1) - df["low"]) / df["open"]
-    return df
-
-
-# ── Labels ────────────────────────────────────────────────────────────────────
-
-def add_labels(df: pd.DataFrame, horizon: int, threshold: float) -> pd.DataFrame:
-    df = df.copy()
-    future          = df["close"].shift(-horizon)
-    df["label_reg"] = (future - df["close"]) / df["close"]
-    df["label_cls"] = (df["label_reg"] >= threshold).astype(int)
-    return df
-
+# ── Technische Indikatoren (pro Asset, zeitreihen-intern) ─────────────────────
 
 FEATURE_COLS = [
-    "open","high","low","close","volume",
-    "rsi_14","macd","macd_signal","macd_hist",
-    "bb_width","bb_pct",
-    "ema_9","ema_21","ema_50","ema_200",
-    "atr_14","volume_ema_20",
-    "log_return","body","upper_wick","lower_wick",
+    # Trend
+    "sma_ratio_20",    # Close / SMA20
+    "sma_ratio_50",    # Close / SMA50
+    "sma_ratio_200",   # Close / SMA200
+    "ema_ratio_12",    # Close / EMA12
+    "macd_diff",       # MACD Histogramm
+    # Momentum
+    "rsi_14",          # RSI 14
+    "roc_5",           # Rate of Change 5T
+    "roc_21",          # Rate of Change 21T
+    "stoch_k",         # Stochastic %K
+    # Volatilität
+    "atr_ratio",       # ATR14 / Close (normiert)
+    "bb_width",        # Bollinger Band Width
+    "bb_pos",          # Position innerhalb Bollinger Bands
+    # Volumen
+    "volume_ratio_20", # Volume / SMA-Volume-20
+    "obv_diff",        # OBV tägliche Änderung (normiert)
+    # Preis-Struktur
+    "high_low_ratio",  # (High-Low) / Close
+    "ret_1d",          # 1-Tage Return
+    "ret_5d",          # 5-Tage Return
+    "ret_21d",         # 21-Tage Return
 ]
 
 
-# ── Skalierung ────────────────────────────────────────────────────────────────
-
-def scale_features(df, fit_scaler=True, scaler=None):
-    if scaler is None:
-        scaler = RobustScaler()
-    data   = df[FEATURE_COLS].values
-    scaled = scaler.fit_transform(data) if fit_scaler else scaler.transform(data)
-    df_s   = pd.DataFrame(scaled, index=df.index, columns=FEATURE_COLS)
-    df_s["label_cls"] = df["label_cls"].values
-    df_s["label_reg"] = df["label_reg"].values
-    return df_s, scaler
-
-
-# ── Sequenzen ─────────────────────────────────────────────────────────────────
-
-def make_sequences(df, seq_len, label_col="label_cls"):
-    feat, label = df[FEATURE_COLS].values, df[label_col].values
-    X, y = [], []
-    for i in range(seq_len, len(df)):
-        X.append(feat[i - seq_len : i])
-        y.append(label[i])
-    return np.array(X, dtype=np.float32), np.array(y, dtype=np.float32)
-
-
-# ── Split ─────────────────────────────────────────────────────────────────────
-
-def temporal_split(X, y, ratios=SPLIT):
-    n  = len(X)
-    i1 = int(n * ratios[0])
-    i2 = int(n * (ratios[0] + ratios[1]))
-    return {
-        "train": (X[:i1],   y[:i1]),
-        "val":   (X[i1:i2], y[i1:i2]),
-        "test":  (X[i2:],   y[i2:]),
-    }
-
-
-# ── Einzelner Asset ───────────────────────────────────────────────────────────
-
-def process_single(
-    ticker:     str,
-    timeframe:  str   = "1h",
-    horizon:    int   = HORIZON,
-    threshold:  float = THRESHOLD,
-    seq_len:    int   = SEQ_LEN,
-    label_mode: str   = "cls",
-    save:       bool  = True,
-) -> dict | None:
-    """Verarbeitet einen einzelnen Asset. Gibt splits-Dict zurück."""
-    fname = RAW_DIR / f"{ticker.replace('.','_')}_{timeframe}.parquet"
-    if not fname.exists():
-        logger.warning(f"  {ticker}: Datei nicht gefunden ({fname})")
-        return None
-
-    df = pd.read_parquet(fname)
-    if len(df) < seq_len + 50:
-        logger.warning(f"  {ticker}: Zu wenig Daten ({len(df)} Zeilen)")
-        return None
-
-    df = add_indicators(df)
-    df = add_labels(df, horizon, threshold)
-    df.dropna(inplace=True)
-
-    if len(df) < seq_len + 20:
-        logger.warning(f"  {ticker}: Nach dropna zu wenig Daten")
-        return None
-
-    label_col = "label_cls" if label_mode == "cls" else "label_reg"
-
-    # Scaler nur auf Train-Daten fitten
-    n_train = int(len(df) * SPLIT[0])
-    df_train_s, scaler = scale_features(df.iloc[:n_train], fit_scaler=True)
-    df_rest_s,  _      = scale_features(df.iloc[n_train:], fit_scaler=False, scaler=scaler)
-    df_s = pd.concat([df_train_s, df_rest_s])
-
-    X, y    = make_sequences(df_s, seq_len, label_col)
-    splits  = temporal_split(X, y)
-
-    if save:
-        out_dir = FEATURE_DIR / f"{ticker.replace('.','_')}_{timeframe}"
-        out_dir.mkdir(parents=True, exist_ok=True)
-        prefix  = f"{ticker.replace('.','_')}_{timeframe}_{label_mode}_"
-        for name, (Xs, ys) in splits.items():
-            torch.save(
-                {"X": torch.from_numpy(Xs), "y": torch.from_numpy(ys)},
-                out_dir / f"{prefix}{name}.pt",
-            )
-        import joblib
-        joblib.dump(scaler, out_dir / f"{prefix}scaler.pkl")
-        logger.success(f"  {ticker:<12} Train={splits['train'][0].shape[0]:5d}  "
-                       f"Val={splits['val'][0].shape[0]:4d}  "
-                       f"Test={splits['test'][0].shape[0]:4d}")
-
-    return splits
-
-
-# ── Multi-Asset: kombinierter Datensatz ───────────────────────────────────────
-
-def build_combined_dataset(
-    timeframe:  str   = "1h",
-    horizon:    int   = HORIZON,
-    threshold:  float = THRESHOLD,
-    seq_len:    int   = SEQ_LEN,
-    label_mode: str   = "cls",
-    tickers:    list[str] | None = None,
-) -> dict[str, tuple[np.ndarray, np.ndarray]]:
+def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Verarbeitet alle Assets und kombiniert sie zu einem gemeinsamen Datensatz.
-    Jeder Asset trägt seinen eigenen Train/Val/Test-Split bei.
-    Der kombinierte Split wird als combined_<timeframe>_<mode>_*.pt gespeichert.
+    Berechnet technische Indikatoren für ein einzelnes Asset.
+    Input:  OHLCV DataFrame (index=Date)
+    Output: DataFrame mit FEATURE_COLS Spalten
     """
-    if tickers is None:
-        tickers = _load_asset_list()
+    c = df["close"]
+    h = df["high"]
+    lo = df["low"]
+    v  = df["volume"]
 
-    all_splits: dict[str, list] = {"train": [], "val": [], "test": []}
-    ok, fail = 0, 0
+    out = pd.DataFrame(index=df.index)
 
-    logger.info(f"Multi-Asset Feature-Engineering: {len(tickers)} Assets")
-    logger.info("─" * 55)
+    # ── Trend ────────────────────────────────────────────────────────────────
+    out["sma_ratio_20"]  = c / c.rolling(20).mean()
+    out["sma_ratio_50"]  = c / c.rolling(50).mean()
+    out["sma_ratio_200"] = c / c.rolling(200).mean()
+    out["ema_ratio_12"]  = c / ta.trend.EMAIndicator(c, window=12).ema_indicator()
 
-    for ticker in tickers:
-        result = process_single(
-            ticker, timeframe, horizon, threshold, seq_len, label_mode, save=True
-        )
-        if result is None:
-            fail += 1
+    macd = ta.trend.MACD(c)
+    out["macd_diff"] = macd.macd_diff()
+
+    # ── Momentum ─────────────────────────────────────────────────────────────
+    out["rsi_14"]  = ta.momentum.RSIIndicator(c, window=14).rsi() / 100.0
+    out["roc_5"]   = c.pct_change(5)
+    out["roc_21"]  = c.pct_change(21)
+    out["stoch_k"] = ta.momentum.StochasticOscillator(
+        h, lo, c, window=14).stoch() / 100.0
+
+    # ── Volatilität ───────────────────────────────────────────────────────────
+    atr = ta.volatility.AverageTrueRange(h, lo, c, window=14).average_true_range()
+    out["atr_ratio"] = atr / c
+
+    bb = ta.volatility.BollingerBands(c, window=20)
+    bb_w = bb.bollinger_hband() - bb.bollinger_lband()
+    out["bb_width"] = bb_w / c
+    out["bb_pos"]   = (c - bb.bollinger_lband()) / (bb_w + 1e-9)
+
+    # ── Volumen ───────────────────────────────────────────────────────────────
+    vol_sma = v.rolling(20).mean()
+    out["volume_ratio_20"] = v / (vol_sma + 1e-9)
+
+    obv = ta.volume.OnBalanceVolumeIndicator(c, v).on_balance_volume()
+    out["obv_diff"] = obv.pct_change().clip(-1, 1)
+
+    # ── Preis-Struktur ────────────────────────────────────────────────────────
+    out["high_low_ratio"] = (h - lo) / (c + 1e-9)
+    out["ret_1d"]  = c.pct_change(1)
+    out["ret_5d"]  = c.pct_change(5)
+    out["ret_21d"] = c.pct_change(21)
+
+    return out[FEATURE_COLS]
+
+
+def compute_forward_return(df: pd.DataFrame, horizon: int = 11) -> pd.Series:
+    """
+    Berechnet den Forward Return für jede Zeile.
+    ret[t] = (close[t+horizon] / close[t]) - 1
+    """
+    return df["close"].pct_change(horizon).shift(-horizon)
+
+
+# ── Cross-Sectional Normalization ─────────────────────────────────────────────
+
+def cross_sectional_zscore(
+    panel: pd.DataFrame,
+    min_assets: int = 5,
+) -> pd.DataFrame:
+    """
+    Normalisiert Features täglich über alle Assets (Cross-Sectional z-Score).
+
+    Input:  MultiIndex DataFrame  (Date, Asset) × Features
+    Output: Gleiche Struktur, aber pro Tag z-Score normalisiert
+
+    Warum:
+      - SMA-Ratio 1.05 bedeutet bei AAPL etwas anderes als bei DBK.DE
+      - Nach CS-Norm bedeutet +1.5 = "heute 1.5 Std-Abw. über Durchschnitt aller Assets"
+      - Modell lernt relative Stärke statt absolute Niveaus
+    """
+    result = panel.copy()
+
+    for date, group in panel.groupby(level="date"):
+        if len(group) < min_assets:
             continue
-        for split_name in ["train", "val", "test"]:
-            all_splits[split_name].append(result[split_name][0])   # X
-            # y auch sammeln (separate Liste)
-        ok += 1
+        mu    = group.mean()
+        sigma = group.std().replace(0, 1)  # Division durch 0 verhindern
+        result.loc[date] = (group - mu) / sigma
 
-    if ok == 0:
-        raise RuntimeError("Kein einziger Asset konnte verarbeitet werden.")
+    # Extreme Ausreißer cappen (±4 Std-Abw.)
+    result = result.clip(-4, 4)
+    return result
 
-    # Neu aufbauen mit X und y getrennt
-    combined: dict[str, tuple[np.ndarray, np.ndarray]] = {}
-    for split_name in ["train", "val", "test"]:
-        Xs, ys = [], []
-        for ticker in tickers:
-            fname = RAW_DIR / f"{ticker.replace('.','_')}_{timeframe}.parquet"
-            if not fname.exists():
-                continue
-            out_dir = FEATURE_DIR / f"{ticker.replace('.','_')}_{timeframe}"
-            prefix  = f"{ticker.replace('.','_')}_{timeframe}_{label_mode}_"
-            pt_path = out_dir / f"{prefix}{split_name}.pt"
-            if not pt_path.exists():
-                continue
-            data = torch.load(pt_path, map_location="cpu")
-            Xs.append(data["X"].numpy())
-            ys.append(data["y"].numpy())
 
-        if not Xs:
+# ── Haupt-Pipeline ────────────────────────────────────────────────────────────
+
+def build_panel(
+    timeframe:  str   = "1d",
+    horizon:    int   = 11,
+    min_rows:   int   = 300,
+    asset_list: Optional[list] = None,
+) -> tuple[pd.DataFrame, pd.Series]:
+    """
+    Baut den kompletten Panel-Datensatz:
+      1. Lädt alle Parquet-Dateien
+      2. Berechnet Indikatoren pro Asset
+      3. Cross-Sectional z-Score Normalisierung
+      4. Forward Returns als Target
+
+    Returns:
+        features : MultiIndex DataFrame (date, asset) × FEATURE_COLS
+        targets  : MultiIndex Series    (date, asset) → forward_return
+    """
+    from loguru import logger
+
+    raw_files = sorted(RAW_DIR.glob(f"*_{timeframe}.parquet"))
+    if not raw_files:
+        raise FileNotFoundError(f"Keine Parquet-Dateien in {RAW_DIR}")
+
+    all_features = {}
+    all_targets  = {}
+    skipped      = []
+
+    tickers = asset_list or [f.stem.replace(f"_{timeframe}", "") for f in raw_files]
+
+    for fpath in raw_files:
+        ticker = fpath.stem.replace(f"_{timeframe}", "")
+        if asset_list and ticker not in asset_list:
             continue
-        X_combined = np.concatenate(Xs, axis=0)
-        y_combined = np.concatenate(ys, axis=0)
 
-        # Shufflen (nur Train) damit Modell nicht Asset-Reihenfolge lernt
-        if split_name == "train":
-            idx = np.random.permutation(len(X_combined))
-            X_combined = X_combined[idx]
-            y_combined = y_combined[idx]
+        df = pd.read_parquet(fpath)
+        df.index = pd.to_datetime(df.index)
+        df.columns = [c.lower() for c in df.columns]
 
-        combined[split_name] = (X_combined, y_combined)
+        if len(df) < min_rows:
+            skipped.append(ticker)
+            continue
 
-        # Speichern
-        out_dir = FEATURE_DIR / "combined"
-        out_dir.mkdir(parents=True, exist_ok=True)
-        prefix  = f"combined_{timeframe}_{label_mode}_"
-        torch.save(
-            {"X": torch.from_numpy(X_combined), "y": torch.from_numpy(y_combined)},
-            out_dir / f"{prefix}{split_name}.pt",
-        )
-        logger.info(f"  combined/{split_name}: X={X_combined.shape}  "
-                    f"pos={y_combined.mean()*100:.1f}%")
+        try:
+            feats  = compute_indicators(df)
+            target = compute_forward_return(df, horizon)
 
-    logger.success(f"Kombinierter Datensatz: {ok} Assets, {fail} fehlgeschlagen")
-    return combined
+            # Gemeinsamen Index (beide ohne NaN)
+            valid = feats.notna().all(axis=1) & target.notna()
+            feats  = feats[valid]
+            target = target[valid]
 
+            if len(feats) < 200:
+                skipped.append(ticker)
+                continue
 
-def _load_asset_list() -> list[str]:
-    tickers = []
-    with open(ASSET_LIST) as f:
-        for line in f:
-            line = line.strip()
-            if line and not line.startswith("#"):
-                tickers.append(line)
-    return tickers
+            all_features[ticker] = feats
+            all_targets[ticker]  = target
 
+        except Exception as e:
+            logger.warning(f"  {ticker}: Fehler — {e}")
+            skipped.append(ticker)
+            continue
 
-# ── Pipeline-Einstieg ─────────────────────────────────────────────────────────
+    if skipped:
+        logger.warning(f"Übersprungen ({len(skipped)}): {', '.join(skipped[:10])}")
 
-def run_pipeline(
-    symbol:     str   = "BTC/USDT",
-    timeframe:  str   = "1h",
-    horizon:    int   = HORIZON,
-    threshold:  float = THRESHOLD,
-    seq_len:    int   = SEQ_LEN,
-    label_mode: str   = "cls",
-    multi:      bool  = False,
-) -> dict:
-    if multi:
-        combined = build_combined_dataset(timeframe, horizon, threshold, seq_len, label_mode)
-        # Für Kompatibilität mit trainer.py: combined als splits zurückgeben
-        return {
-            "splits":     combined,
-            "n_features": len(FEATURE_COLS),
-            "seq_len":    seq_len,
-            "ticker":     "combined",
-        }
-    else:
-        ticker = symbol.replace("/", "_")
-        result = process_single(ticker, timeframe, horizon, threshold, seq_len, label_mode, save=True)
-        if result is None:
-            raise FileNotFoundError(f"Keine Daten für {ticker}")
-        return {
-            "splits":     result,
-            "n_features": len(FEATURE_COLS),
-            "seq_len":    seq_len,
-            "ticker":     ticker,
-        }
+    logger.info(f"Assets geladen: {len(all_features)}")
 
+    # ── MultiIndex Panel aufbauen ─────────────────────────────────────────────
+    features_panel = pd.concat(all_features, names=["asset", "date"])
+    features_panel = features_panel.swaplevel().sort_index()
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--symbol",     default="BTC/USDT")
-    parser.add_argument("--ticker",     default=None,       help="Direkter Ticker z.B. AAPL")
-    parser.add_argument("--all",        action="store_true",help="Alle Assets aus asset_list.txt")
-    parser.add_argument("--timeframe",  default="1h")
-    parser.add_argument("--horizon",    type=int,   default=HORIZON)
-    parser.add_argument("--threshold",  type=float, default=THRESHOLD)
-    parser.add_argument("--seq_len",    type=int,   default=SEQ_LEN)
-    parser.add_argument("--label_mode", choices=["cls","reg"], default="cls")
-    args = parser.parse_args()
+    targets_panel  = pd.concat(all_targets,  names=["asset", "date"])
+    targets_panel  = targets_panel.swaplevel().sort_index()
+    targets_panel.name = "forward_return"
 
-    if args.all:
-        build_combined_dataset(args.timeframe, args.horizon, args.threshold,
-                               args.seq_len, args.label_mode)
-    elif args.ticker:
-        process_single(args.ticker, args.timeframe, args.horizon,
-                       args.threshold, args.seq_len, args.label_mode, save=True)
-    else:
-        run_pipeline(args.symbol, args.timeframe, args.horizon,
-                     args.threshold, args.seq_len, args.label_mode)
-    logger.success("Feature-Pipeline abgeschlossen.")
+    # ── Cross-Sectional z-Score ───────────────────────────────────────────────
+    logger.info("Cross-Sectional z-Score Normalisierung...")
+    features_panel = cross_sectional_zscore(features_panel)
+
+    logger.info(f"Panel: {len(features_panel)} Zeilen  "
+                f"{features_panel.index.get_level_values('date').nunique()} Tage  "
+                f"{features_panel.index.get_level_values('asset').nunique()} Assets")
+
+    return features_panel, targets_panel
