@@ -1,294 +1,427 @@
 """
 strategy/backtest.py
 ─────────────────────
-Backtesting der Modell-Signale.
-Unterstützt einzelne Assets und kombinierte Modelle.
+Cross-Sectional Backtest für Walk-Forward LSTM.
 
-Aufruf:
-    python strategy/backtest.py --ticker AAPL --timeframe 1h
-    python strategy/backtest.py --ticker combined --timeframe 1h --test_on AAPL
+Zwei Varianten:
+  A) Long-Only:     Kaufe täglich die Top-N Assets nach predicted return
+  B) Long-Short:    Kaufe Top-N, leerverkaufe Bottom-N
+
+Adaptives N:
+  N ist nicht fest sondern hängt vom Marktregime ab:
+  - Trending (SPY > SMA50): N = n_max (z.B. 5)
+  - Seitwärts (SPY < SMA50): N = n_min (z.B. 2)
+  - Bär (SPY < SMA200):  N = 0 (kein Trade / nur Shorts)
+
+Täglich wird das Portfolio neu gewichtet (equal weight).
+Transaktionskosten werden bei jedem Kauf/Verkauf abgezogen.
 """
 
 from __future__ import annotations
 
-import argparse
+import json
 from pathlib import Path
+from typing import Optional
 
 import numpy as np
 import pandas as pd
 import torch
 from loguru import logger
 
-from models.lstm_model import TradingLSTM
+from models.lstm_model import CrossSectionalLSTM
 
-CHECKPOINT_DIR  = Path("checkpoints")
-FEATURE_DIR     = Path("features/processed")
-RAW_DIR         = Path("data/raw")
-REPORT_DIR      = Path("logs")
-REPORT_DIR.mkdir(parents=True, exist_ok=True)
-
-ENTRY_THRESHOLD = 0.55   # Default – via --entry_threshold überschreibbar
-EXIT_THRESHOLD  = 0.45   # Default – via --exit_threshold überschreibbar
+CHECKPOINT_DIR = Path("checkpoints")
+RAW_DIR        = Path("data/raw")
 
 
-@torch.no_grad()
-def run_inference(model, X_test, device, batch_size=512):
-    model.eval()
-    out = []
-    for i in range(0, len(X_test), batch_size):
-        out.append(model(X_test[i:i+batch_size].to(device)).cpu().numpy())
-    return np.concatenate(out)
+# ── Modell laden ──────────────────────────────────────────────────────────────
 
-
-def manual_backtest(
-    prices,
-    preds,
-    entry_thresh,
-    exit_thresh,
-    init_cash   = 10_000.0,
-    fee         = 0.001,
-    hold_days   = 24,     # Maximale Haltedauer (entspricht horizon aus Training)
-    stop_loss   = 0.05,   # 5% Stop-Loss
-):
-    """
-    Backtesting mit drei Exit-Bedingungen:
-      1. Konfidenz fällt unter exit_thresh
-      2. Position wurde hold_days Tage gehalten (horizon-basiert)
-      3. Stop-Loss bei -stop_loss% Verlust
-    """
-    cash, position, entry_price = init_cash, 0.0, 0.0
-    in_trade   = False
-    hold_count = 0
-    equity, trades = [], []
-
-    for i, (price, pred) in enumerate(zip(prices, preds)):
-        last = (i == len(prices) - 1)
-
-        # ── Exit-Prüfung ────────────────────────────────────────────────
-        if in_trade:
-            hold_count += 1
-            pnl_pct     = (price - entry_price) / entry_price
-
-            should_exit = (
-                pred  <= exit_thresh          # Signal schwach
-                or hold_count >= hold_days    # Maximale Haltedauer erreicht
-                or pnl_pct    <= -stop_loss   # Stop-Loss
-                or last                       # Letzter Datenpunkt
-            )
-
-            if should_exit:
-                proceeds = position * price * (1 - fee)
-                pnl      = proceeds - entry_price * position
-                reason   = (
-                    "stop_loss"   if pnl_pct <= -stop_loss else
-                    "horizon"     if hold_count >= hold_days else
-                    "signal_exit" if pred <= exit_thresh else
-                    "end"
-                )
-                trades.append({
-                    "entry":      entry_price,
-                    "exit":       price,
-                    "pnl":        pnl,
-                    "ret":        pnl / (entry_price * position),
-                    "hold_days":  hold_count,
-                    "reason":     reason,
-                })
-                cash       = proceeds
-                position   = 0.0
-                in_trade   = False
-                hold_count = 0
-
-        # ── Entry-Prüfung (nur wenn nicht in Position) ─────────────────
-        if not in_trade and pred >= entry_thresh and not last:
-            position    = (cash * (1 - fee)) / price
-            entry_price = price
-            cash        = 0.0
-            in_trade    = True
-            hold_count  = 0
-
-        equity.append(cash + position * price)
-
-    equity = np.array(equity)
-    total  = (equity[-1] / init_cash - 1) * 100 if len(equity) else 0
-    peak   = np.maximum.accumulate(equity)
-    max_dd = ((equity - peak) / peak * 100).min() if len(equity) > 1 else 0
-    # Tagesbasierter Sharpe (252 Handelstage/Jahr)
-    rets   = np.diff(equity) / (equity[:-1] + 1e-9)
-    sharpe = (rets.mean() / (rets.std() + 1e-9)) * np.sqrt(252) if len(rets) > 1 else 0
-    n      = len(trades)
-    win_r  = len([t for t in trades if t["pnl"] > 0]) / n * 100 if n else 0
-    avg_r  = np.mean([t["ret"] for t in trades]) * 100 if n else 0
-
-    # Exit-Gründe ausgeben
-    if trades:
-        from collections import Counter
-        reasons = Counter(t["reason"] for t in trades)
-        logger.info(f"Exit-Gründe: " + "  ".join(f"{k}={v}" for k, v in reasons.items()))
-        avg_hold = np.mean([t["hold_days"] for t in trades])
-        logger.info(f"Ø Haltedauer: {avg_hold:.1f} Tage")
-
-    return {
-        "Startkapital [USDT]":  init_cash,
-        "Endkapital [USDT]":    round(equity[-1], 2) if len(equity) else init_cash,
-        "Total Return [%]":     round(total, 2),
-        "Max Drawdown [%]":     round(max_dd, 2),
-        "Sharpe Ratio":         round(sharpe, 3),
-        "Anzahl Trades":        n,
-        "Win Rate [%]":         round(win_r, 2),
-        "Ø Return/Trade [%]":   round(avg_r, 2),
-    }, trades
-
-
-def load_model(ticker_key: str, timeframe: str, mode: str, device: str,
-               n_features: int, seq_len: int) -> tuple[TradingLSTM, dict]:
-    ckpt_path = CHECKPOINT_DIR / f"{ticker_key}_{timeframe}_{mode}_best.pt"
-    if not ckpt_path.exists():
-        raise FileNotFoundError(f"Kein Checkpoint: {ckpt_path}")
+def load_fold_model(ckpt_path: str, device: str) -> tuple[CrossSectionalLSTM, dict]:
     ckpt = torch.load(ckpt_path, map_location=device)
     cfg  = ckpt["config"]
-    model = TradingLSTM(
-        n_features=n_features, seq_len=seq_len,
-        hidden_dim=cfg.get("hidden_dim", 128),
-        num_layers=cfg.get("num_layers", 2),
-        dropout=0.0,
-        bidirectional=cfg.get("bidirectional", False),
-        use_attention=cfg.get("use_attention", True),
-        mode=mode,
+    model = CrossSectionalLSTM(
+        n_features = cfg["n_features"],
+        n_assets   = cfg["n_assets"],
+        embed_dim  = cfg["embed_dim"],
+        hidden_dim = cfg["hidden_dim"],
+        num_layers = cfg["num_layers"],
+        dropout    = 0.0,   # kein Dropout bei Inference
+        seq_len    = cfg["seq_len"],
     ).to(device)
     model.load_state_dict(ckpt["model_state"])
-    logger.success(f"Modell geladen: {ckpt_path.name}  "
-                   f"(Epoche {ckpt['epoch']}, Val-Loss={ckpt['val_loss']:.5f})")
+    model.eval()
     return model, ckpt
 
 
-def run_backtest(
-    ticker:          str   = "BTC_USDT",
-    timeframe:       str   = "1h",
-    mode:            str   = "cls",
-    init_cash:       float = 10_000.0,
-    fees:            float = 0.001,
-    test_on:         str | None = None,
-    symbol:          str | None = None,
-    entry_threshold: float = ENTRY_THRESHOLD,
-    exit_threshold:  float = EXIT_THRESHOLD,
-    hold_days:       int   = 24,
-    stop_loss:       float = 0.05,
-) -> dict:
+# ── Marktregime bestimmen ─────────────────────────────────────────────────────
 
+def get_market_regime(
+    spy_prices: pd.Series,
+    date:       pd.Timestamp,
+    window_fast: int = 50,
+    window_slow: int = 200,
+) -> str:
+    """
+    Bestimmt das Marktregime anhand von SPY SMAs.
+
+    Returns:
+        'bull'    — SPY > SMA50 > SMA200  → volle Position
+        'neutral' — SPY > SMA200 aber < SMA50 → reduzierte Position
+        'bear'    — SPY < SMA200  → Long-Only: kein Trade, Short bleibt
+    """
+    past = spy_prices[spy_prices.index <= date]
+    if len(past) < window_slow:
+        return 'neutral'
+
+    price    = float(past.iloc[-1])
+    sma_fast = float(past.iloc[-window_fast:].mean())
+    sma_slow = float(past.iloc[-window_slow:].mean())
+
+    if price > sma_fast and sma_fast > sma_slow:
+        return 'bull'
+    elif price > sma_slow:
+        return 'neutral'
+    else:
+        return 'bear'
+
+
+def adaptive_n(
+    regime:  str,
+    n_max:   int = 5,
+    n_mid:   int = 3,
+    n_min:   int = 1,
+) -> int:
+    """Gibt N in Abhängigkeit vom Marktregime zurück."""
+    return {'bull': n_max, 'neutral': n_mid, 'bear': n_min}[regime]
+
+
+# ── Tages-Signale generieren ──────────────────────────────────────────────────
+
+@torch.no_grad()
+def predict_cross_section(
+    model:     CrossSectionalLSTM,
+    features:  pd.DataFrame,   # MultiIndex (date, asset)
+    asset_map: dict[str, int],
+    date:      pd.Timestamp,
+    seq_len:   int,
+    device:    str,
+) -> pd.Series:
+    """
+    Generiert für einen Tag t Vorhersagen für alle verfügbaren Assets.
+    Returns: pd.Series  asset → predicted_return (sortiert absteigend)
+    """
+    # Alle Assets die an diesem Tag verfügbar sind
+    try:
+        assets_today = features.xs(date, level='date').index.tolist()
+    except KeyError:
+        return pd.Series(dtype=float)
+
+    preds = {}
+    all_dates = features.index.get_level_values('date').unique().sort_values()
+    date_idx  = all_dates.searchsorted(date)
+
+    for asset in assets_today:
+        asset_id = asset_map.get(asset, 0)
+        try:
+            asset_feat = features.xs(asset, level='asset').sort_index()
+        except KeyError:
+            continue
+
+        # Letzte seq_len Tage bis inkl. date
+        past = asset_feat[asset_feat.index <= date].iloc[-seq_len:]
+        if len(past) < seq_len:
+            continue
+
+        x = torch.from_numpy(past.values.astype(np.float32)).unsqueeze(0).to(device)
+        a = torch.tensor([asset_id], dtype=torch.long).to(device)
+        pred = model(x, a).item()
+        preds[asset] = pred
+
+    return pd.Series(preds).sort_values(ascending=False)
+
+
+# ── Backtest Engine ───────────────────────────────────────────────────────────
+
+def run_backtest(
+    features:    pd.DataFrame,
+    targets:     pd.Series,
+    fold_results: list[dict],
+    asset_map:   dict[str, int],
+    # Strategie-Parameter
+    n_max:       int   = 5,     # Max Positionen bei Bull-Markt
+    n_mid:       int   = 3,     # Positionen bei neutralem Markt
+    n_min:       int   = 1,     # Min Positionen bei Bär-Markt
+    long_short:  bool  = False, # True = Long-Short, False = Long-Only
+    fees:        float = 0.001, # 0.1% Transaktionskosten
+    init_cash:   float = 10_000.0,
+    seq_len:     int   = 64,
+    # Regime-Filter
+    use_regime:  bool  = True,  # Adaptives N aktivieren
+    spy_ticker:  str   = "SPY", # Referenz-Asset für Regime
+) -> dict:
+    """
+    Führt den Cross-Sectional Backtest über alle Folds durch.
+
+    Pro Handelstag:
+      1. Regime bestimmen (adaptives N)
+      2. Modell-Vorhersagen für alle Assets
+      3. Top-N kaufen (Long), Bottom-N leerverkaufen (Short, nur Variante B)
+      4. Nach horizon Tagen glattstellen
+      5. Performance berechnen
+    """
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    # Ticker normalisieren
-    if symbol and not ticker:
-        ticker = symbol.replace("/", "_")
-    ticker = ticker.replace("/", "_")
+    # SPY Preisreihe für Regime-Filter laden
+    spy_prices = None
+    if use_regime:
+        spy_file = RAW_DIR / f"{spy_ticker}_1d.parquet"
+        if spy_file.exists():
+            spy_df    = pd.read_parquet(spy_file)
+            spy_df.index = pd.to_datetime(spy_df.index)
+            spy_prices = spy_df["close"]
+        else:
+            logger.warning(f"SPY nicht gefunden, Regime-Filter deaktiviert")
+            use_regime = False
 
-    # Bei combined Modell: test_on muss angegeben sein, sonst default auf AAPL
-    if ticker == "combined" and not test_on:
-        test_on = "AAPL"
-        logger.info("Combined Modell erkannt — teste auf AAPL (Standard). "
-                    "Anderes Asset: --test_on MSFT")
+    all_dates = features.index.get_level_values('date').unique().sort_values()
 
-    # Daten-Ticker: wenn test_on angegeben, auf diesem testen
-    data_ticker = (test_on or ticker).replace("/", "_").replace(".", "_")
+    # Equity-Kurve und Trade-Log
+    equity    = [init_cash]
+    cash      = init_cash
+    positions = {}   # asset → {'shares': float, 'entry': float, 'direction': +1/-1}
+    trade_log = []
+    equity_dates = []
 
-    # Test-Daten laden
-    # Engineer speichert unter: features/processed/<ticker>_<timeframe>/<ticker>_<timeframe>_<mode>_<split>.pt
-    # Fallback: features/processed/<ticker>/<ticker>_<timeframe>_<mode>_<split>.pt (altes Format)
-    prefix   = f"{data_ticker}_{timeframe}_{mode}_"
-    out_dir_new = FEATURE_DIR / f"{data_ticker}_{timeframe}"
-    out_dir_old = FEATURE_DIR / data_ticker
-    if (out_dir_new / f"{prefix}test.pt").exists():
-        out_dir = out_dir_new
-    elif (out_dir_old / f"{prefix}test.pt").exists():
-        out_dir = out_dir_old
-    else:
-        out_dir = out_dir_new   # für klare Fehlermeldung
-    pt_path  = out_dir / f"{prefix}test.pt"
-    if not pt_path.exists():
-        raise FileNotFoundError(f"Test-Daten nicht gefunden: {pt_path}")
+    strategy_name = "Long-Short" if long_short else "Long-Only"
+    logger.info(f"Backtest: {strategy_name}  n_max={n_max}  fees={fees:.3f}")
 
-    test_data  = torch.load(pt_path, map_location="cpu")
-    X_test     = test_data["X"]
-    n_features = X_test.shape[-1]
-    seq_len    = X_test.shape[1]
+    for fold in fold_results:
+        ckpt_path = fold['ckpt_path']
+        if not Path(ckpt_path).exists():
+            logger.warning(f"Checkpoint nicht gefunden: {ckpt_path}")
+            continue
 
-    # Modell laden (ggf. kombiniertes Modell)
-    model, ckpt = load_model(ticker, timeframe, mode, device, n_features, seq_len)
+        model, ckpt_meta = load_fold_model(ckpt_path, device)
+        val_start = pd.Timestamp(fold['val_start'])
+        val_end   = pd.Timestamp(fold['val_end'])
 
-    # Inference
-    preds = run_inference(model, X_test, device)
-    logger.info(f"Vorhersagen: min={preds.min():.4f}  max={preds.max():.4f}  "
-                f"mean={preds.mean():.4f}  std={preds.std():.4f}")
+        logger.info(f"  Fold {fold['fold_id']}: [{val_start.date()} → {val_end.date()}]")
 
-    # Adaptiver Threshold: wenn entry_threshold > max(preds), automatisch anpassen
-    # Setze entry auf 75. Perzentil, exit auf 40. Perzentil der Vorhersagen
-    p75 = float(np.percentile(preds, 75))
-    p40 = float(np.percentile(preds, 40))
-    if entry_threshold > preds.max():
-        logger.warning(
-            f"entry_threshold={entry_threshold:.3f} übersteigt max(preds)={preds.max():.4f}. "
-            f"Setze automatisch auf 75. Perzentil: {p75:.4f}"
-        )
-        entry_threshold = p75
-    if exit_threshold < preds.min() or exit_threshold >= entry_threshold:
-        adj_exit = max(p40, preds.min() + 0.01)
-        logger.warning(
-            f"exit_threshold={exit_threshold:.3f} ungültig. "
-            f"Setze automatisch auf 40. Perzentil: {adj_exit:.4f}"
-        )
-        exit_threshold = adj_exit
+        # Handelstage in diesem Val-Zeitraum
+        fold_dates = all_dates[(all_dates >= val_start) & (all_dates <= val_end)]
 
-    logger.info(f"Aktive Thresholds — Entry: {entry_threshold:.4f}  Exit: {exit_threshold:.4f}")
-    logger.info(f"Signale >= {entry_threshold:.4f}: {(preds >= entry_threshold).sum()} / {len(preds)}")
+        for date in fold_dates:
+            # ── Regime bestimmen ──────────────────────────────────────────
+            if use_regime and spy_prices is not None:
+                regime = get_market_regime(spy_prices, date)
+                n_long = adaptive_n(regime, n_max, n_mid, n_min)
+                if regime == 'bear' and long_short:
+                    n_long = 0   # Im Bärenmarkt: nur Shorts
+            else:
+                regime = 'neutral'
+                n_long = n_mid
 
-    # Rohpreise laden
-    raw_candidates = [
-        RAW_DIR / f"{data_ticker}_{timeframe}.parquet",
-        RAW_DIR / f"{data_ticker.replace('_','.')}_{ timeframe}.parquet",
-    ]
-    price_file = next((p for p in raw_candidates if p.exists()), None)
-    if price_file is None:
-        raise FileNotFoundError(f"Rohpreise nicht gefunden für {data_ticker}")
+            # ── Vorhersagen generieren ────────────────────────────────────
+            preds = predict_cross_section(
+                model, features, asset_map, date, seq_len, device
+            )
+            if len(preds) < 2:
+                equity.append(cash + _position_value(positions, features, date))
+                equity_dates.append(date)
+                continue
 
-    price_df   = pd.read_parquet(price_file)["close"]
-    n_total    = len(price_df)
-    test_start = int(n_total * 0.70) + int(n_total * 0.15) + seq_len
-    price_test = price_df.iloc[test_start : test_start + len(preds)].values
-    min_len    = min(len(price_test), len(preds))
-    price_test = price_test[:min_len]
-    preds      = preds[:min_len]
+            # ── Bestehende Positionen auflösen ────────────────────────────
+            for asset, pos in list(positions.items()):
+                price = _get_price(features, asset, date)
+                if price is None:
+                    continue
+                proceeds = pos['shares'] * price * (1 - fees) * pos['direction']
+                cash    += proceeds
+                pnl      = (price - pos['entry']) / pos['entry'] * pos['direction']
+                trade_log.append({
+                    'date':      str(date.date()),
+                    'asset':     asset,
+                    'direction': 'long' if pos['direction'] == 1 else 'short',
+                    'pnl_pct':   round(pnl * 100, 3),
+                    'regime':    regime,
+                })
+            positions = {}
 
-    bh = (price_test[-1] / price_test[0] - 1) * 100 if len(price_test) > 1 else 0
+            # ── Neue Positionen aufbauen ──────────────────────────────────
+            n_actual   = min(n_long, len(preds))
+            top_assets = preds.index[:n_actual].tolist()
 
-    results, trades = manual_backtest(
-        price_test, preds, entry_threshold, exit_threshold,
-        init_cash, fees, hold_days, stop_loss
-    )
+            # Short-Seite: Bottom-N (nur Variante B)
+            short_assets = []
+            if long_short and n_actual > 0:
+                n_short      = min(n_actual, len(preds) - n_actual)
+                short_assets = preds.index[-n_short:].tolist()
 
-    logger.info("\n" + "=" * 55)
-    logger.info(f"BACKTEST: {data_ticker} [{timeframe}]  "
-                f"{'(Modell: ' + ticker + ')' if test_on else ''}")
-    logger.info("=" * 55)
-    for k, v in results.items():
-        logger.info(f"  {k:<35}: {v}")
-    logger.info(f"  {'Buy & Hold Return [%]':<35}: {round(bh, 2)}")
-    logger.info("=" * 55)
+            total_positions = len(top_assets) + len(short_assets)
+            if total_positions == 0:
+                equity.append(cash)
+                equity_dates.append(date)
+                continue
 
-    results["Buy & Hold Return [%]"] = round(bh, 2)
-    csv_path = REPORT_DIR / f"backtest_{data_ticker}_{timeframe}_{mode}.csv"
-    pd.DataFrame({k: [v] for k, v in results.items()}).to_csv(csv_path, index=False)
-    logger.success(f"Report: {csv_path}")
-    return results
+            per_position = cash / total_positions
+
+            for asset in top_assets:
+                price = _get_price(features, asset, date)
+                if price is None or price <= 0:
+                    continue
+                shares = (per_position * (1 - fees)) / price
+                positions[asset] = {'shares': shares, 'entry': price, 'direction': 1}
+                cash -= per_position
+
+            for asset in short_assets:
+                price = _get_price(features, asset, date)
+                if price is None or price <= 0:
+                    continue
+                # Short: wir erhalten den Erlös sofort
+                shares = (per_position * (1 - fees)) / price
+                positions[asset] = {'shares': shares, 'entry': price, 'direction': -1}
+                cash += per_position * (1 - fees)  # Short-Erlös
+
+            # ── Equity berechnen ──────────────────────────────────────────
+            portfolio_value = cash + _position_value(positions, features, date)
+            equity.append(portfolio_value)
+            equity_dates.append(date)
+
+    # Letzte Positionen auflösen
+    if positions and equity_dates:
+        last_date = equity_dates[-1]
+        for asset, pos in positions.items():
+            price = _get_price(features, asset, last_date)
+            if price:
+                cash += pos['shares'] * price * (1 - fees) * pos['direction']
+        positions = {}
+
+    # ── Metriken berechnen ────────────────────────────────────────────────────
+    equity_arr = np.array(equity[1:], dtype=float)
+    if len(equity_arr) == 0:
+        return {}
+
+    total_return = (equity_arr[-1] / init_cash - 1) * 100
+    peak         = np.maximum.accumulate(equity_arr)
+    max_dd       = ((equity_arr - peak) / (peak + 1e-9) * 100).min()
+    daily_rets   = np.diff(equity_arr) / (equity_arr[:-1] + 1e-9)
+    sharpe       = (daily_rets.mean() / (daily_rets.std() + 1e-9)) * np.sqrt(252)
+
+    wins  = [t for t in trade_log if t['pnl_pct'] > 0]
+    win_r = len(wins) / len(trade_log) * 100 if trade_log else 0
+
+    logger.success("═" * 55)
+    logger.success(f"BACKTEST: {strategy_name}")
+    logger.success("═" * 55)
+    logger.success(f"  Total Return  : {total_return:+.2f}%")
+    logger.success(f"  Max Drawdown  : {max_dd:.2f}%")
+    logger.success(f"  Sharpe Ratio  : {sharpe:.3f}")
+    logger.success(f"  Trades        : {len(trade_log)}")
+    logger.success(f"  Win Rate      : {win_r:.1f}%")
+    logger.success("═" * 55)
+
+    return {
+        'strategy':     strategy_name,
+        'total_return': round(total_return, 2),
+        'max_drawdown': round(max_dd, 2),
+        'sharpe':       round(sharpe, 3),
+        'n_trades':     len(trade_log),
+        'win_rate':     round(win_r, 1),
+        'equity':       equity_arr.tolist(),
+        'equity_dates': [str(d.date()) for d in equity_dates],
+        'trade_log':    trade_log,
+    }
 
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--ticker",    default="BTC_USDT")
-    parser.add_argument("--timeframe", default="1h")
-    parser.add_argument("--mode",      choices=["cls","reg"], default="cls")
-    parser.add_argument("--cash",      type=float, default=10_000.0)
-    parser.add_argument("--fees",      type=float, default=0.001)
-    parser.add_argument("--test_on",   default=None,
-                        help="Anderen Asset zum Testen (Out-of-Sample)")
-    args = parser.parse_args()
-    run_backtest(args.ticker, args.timeframe, args.mode, args.cash, args.fees, args.test_on)
+# ── Equity-Kurve plotten ──────────────────────────────────────────────────────
+
+def plot_equity(
+    result_a: dict,
+    result_b: dict,
+    bh_return: Optional[float] = None,
+    save_path: str = '/kaggle/working/equity_curve.png',
+):
+    """Vergleichs-Plot: Long-Only vs Long-Short vs Buy & Hold."""
+    try:
+        import matplotlib.pyplot as plt
+        import matplotlib.dates as mdates
+
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 10))
+
+        # ── Equity Kurven ─────────────────────────────────────────────────
+        dates_a = pd.to_datetime(result_a['equity_dates'])
+        dates_b = pd.to_datetime(result_b['equity_dates'])
+        eq_a    = np.array(result_a['equity'])
+        eq_b    = np.array(result_b['equity'])
+
+        ax1.plot(dates_a, eq_a / eq_a[0] * 100 - 100,
+                 label=f"Long-Only  (Return: {result_a['total_return']:+.1f}%)",
+                 color='#2196F3', linewidth=2)
+        ax1.plot(dates_b, eq_b / eq_b[0] * 100 - 100,
+                 label=f"Long-Short (Return: {result_b['total_return']:+.1f}%)",
+                 color='#4CAF50', linewidth=2)
+        if bh_return is not None:
+            ax1.axhline(bh_return, color='#FF9800', linestyle='--',
+                        linewidth=1.5, label=f"SPY Buy & Hold ({bh_return:+.1f}%)")
+        ax1.axhline(0, color='gray', linewidth=0.8, alpha=0.5)
+        ax1.set_title('Equity-Kurve: Long-Only vs Long-Short', fontsize=14, fontweight='bold')
+        ax1.set_ylabel('Kumulativer Return (%)')
+        ax1.legend()
+        ax1.grid(True, alpha=0.3)
+        ax1.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m'))
+
+        # ── Drawdown ──────────────────────────────────────────────────────
+        def drawdown(eq):
+            peak = np.maximum.accumulate(eq)
+            return (eq - peak) / (peak + 1e-9) * 100
+
+        ax2.fill_between(dates_a, drawdown(eq_a), 0, alpha=0.4, color='#2196F3',
+                         label=f"Long-Only  (MaxDD: {result_a['max_drawdown']:.1f}%)")
+        ax2.fill_between(dates_b, drawdown(eq_b), 0, alpha=0.4, color='#4CAF50',
+                         label=f"Long-Short (MaxDD: {result_b['max_drawdown']:.1f}%)")
+        ax2.set_title('Drawdown', fontsize=12)
+        ax2.set_ylabel('Drawdown (%)')
+        ax2.legend()
+        ax2.grid(True, alpha=0.3)
+        ax2.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m'))
+
+        plt.tight_layout()
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        plt.show()
+        logger.success(f"Plot gespeichert: {save_path}")
+
+    except Exception as e:
+        logger.warning(f"Plot-Fehler: {e}")
+
+
+# ── Hilfsfunktionen ───────────────────────────────────────────────────────────
+
+def _get_price(features: pd.DataFrame, asset: str, date: pd.Timestamp) -> Optional[float]:
+    """Gibt den Close-Preis eines Assets an einem Tag zurück (aus raw parquet)."""
+    # Wir nutzen ret_1d aus Features um Preis zu rekonstruieren — nicht ideal.
+    # Besser: direkt aus raw parquet lesen.
+    try:
+        fpath = RAW_DIR / f"{asset.replace('.', '_')}_1d.parquet"
+        if not fpath.exists():
+            return None
+        df    = pd.read_parquet(fpath, columns=['close'])
+        df.index = pd.to_datetime(df.index)
+        idx   = df.index.searchsorted(date)
+        idx   = min(idx, len(df) - 1)
+        return float(df.iloc[idx]['close'])
+    except Exception:
+        return None
+
+
+def _position_value(
+    positions: dict,
+    features:  pd.DataFrame,
+    date:      pd.Timestamp,
+) -> float:
+    """Berechnet den aktuellen Marktwert aller offenen Positionen."""
+    total = 0.0
+    for asset, pos in positions.items():
+        price = _get_price(features, asset, date)
+        if price:
+            total += pos['shares'] * price * pos['direction']
+    return total
