@@ -34,11 +34,14 @@ from pathlib import Path
 
 WORKING  = Path("/kaggle/working")
 REPO_DIR = WORKING / "repo"
-# Kaggle-Dataset-Pfade (probiert alle Varianten)
+# Kaggle-Dataset-Pfade — probiert alle bekannten Varianten.
+# raw.zip enthaelt: raw/AAPL_1d.parquet, raw/SPY_1d.parquet, ...
+# Daher: sowohl /kaggle/input/trading-raw-data/ als auch .../raw/ pruefen.
 INPUT_DIRS = [
-    Path("/kaggle/input/trading-raw-data"),
+    Path("/kaggle/input/trading-raw-data/raw"),   # aus ZIP: Unterordner raw/
+    Path("/kaggle/input/trading-raw-data"),        # flach (falls direkt hochgeladen)
+    Path("/kaggle/input/trading-raw-data-v2/raw"),
     Path("/kaggle/input/trading-raw-data-v2"),
-    Path("/kaggle/input/tradingrawdata"),
 ]
 t0 = time.time()
 

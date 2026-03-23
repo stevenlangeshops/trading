@@ -28,7 +28,8 @@ class SubmitConfig:
     enable_internet: bool
     install_deps: bool
     exclude_upload_files: tuple[str, ...]
-    custom_entrypoint: Path | None = None  # falls gesetzt: dieses Script als Entrypoint hochladen
+    custom_entrypoint: Path | None = None       # falls gesetzt: dieses Script als Entrypoint hochladen
+    dataset_sources: tuple[str, ...] = ()       # z.B. ("busersteven/trading-raw-data",)
 
 
 def _run(cmd: list[str], cwd: Path | None = None, env: dict[str, str] | None = None) -> subprocess.CompletedProcess:
@@ -206,7 +207,7 @@ def write_kernel_metadata(staging_dir: Path, cfg: SubmitConfig) -> None:
         "is_private": "false",
         "enable_gpu": "true",
         "enable_internet": "true" if cfg.enable_internet else "false",
-        "dataset_sources": [],
+        "dataset_sources": list(cfg.dataset_sources),
         "competition_sources": [],
         "kernel_sources": [],
         "model_sources": [],
@@ -451,6 +452,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     kernel_title = args.kernel_title or kernel_slug
 
     custom_ep = Path(args.custom_entrypoint) if args.custom_entrypoint else None
+    ds_sources = tuple(s.strip() for s in (args.dataset_sources or "").split(",") if s.strip())
 
     cfg = SubmitConfig(
         kernel_id=args.kernel_id,
@@ -468,6 +470,7 @@ def cmd_run(args: argparse.Namespace) -> int:
             "*.zip",
         ),
         custom_entrypoint=custom_ep,
+        dataset_sources=ds_sources,
     )
 
     ensure_kaggle_cli()
@@ -528,6 +531,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_run.add_argument("--enable-internet", action="store_true", help="Internet im Kernel erlauben (für pip install).")
     p_run.add_argument("--install-deps", action="store_true", help="requirements.txt im Kernel installieren.")
     p_run.add_argument("--custom-entrypoint", default=None, help="Pfad zu einem eigenen Python-Script das als kaggle_entrypoint.py hochgeladen wird.")
+    p_run.add_argument("--dataset-sources", default="", help="Kommagetrennte Kaggle-Dataset-Slugs, z.B. 'busersteven/trading-raw-data'.")
     return p
 
 
