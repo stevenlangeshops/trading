@@ -1,5 +1,0 @@
-[33mf8d95a5[m[33m ([m[1;36mHEAD[m[33m -> [m[1;32mmain[m[33m, [m[1;31morigin/main[m[33m, [m[1;31morigin/HEAD[m[33m)[m add: cross-sectional backtest strategy
-[33m09ec64b[m neujustierung des ziels
-[33meda8bcd[m fix: dropout 0.5, weight_decay 0.01, LayerNorm, LR max 0.003
-[33m584ee7f[m fix: weight_decay CLI arg, LR max 0.003 in Optuna, LayerNorm
-[33m28637cc[m fix: LayerNorm statt BatchNorm, LR 0.003
