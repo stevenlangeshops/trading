@@ -80,41 +80,58 @@ def step_clone():
 
 def step_check_cuda():
     """
-    Prueft ob CUDA wirklich nutzbar ist.
-    Falls nicht (z.B. SM-Versions-Mismatch bei H100 + altem PyTorch),
-    wird PyTorch mit CUDA-12.4 Wheels neu installiert.
+    Prueft ob CUDA wirklich nutzbar ist — via Subprocess, BEVOR torch im
+    Hauptprozess importiert wird (importlib.reload() funktioniert nicht
+    bei C-Extensions wie torch).
+
+    Falls CUDA kaputt ist (z.B. SM-Versions-Mismatch H100 + altes PyTorch):
+      1. PyTorch cu124-Wheels nachinstallieren
+      2. Nochmal testen
+      3. Falls immer noch defekt -> CUDA_VISIBLE_DEVICES='' -> CPU-Fallback
     """
     print(f"\n{'='*60}\nSCHRITT 1b: CUDA Health-Check [{elapsed()}]\n{'='*60}", flush=True)
-    import torch
-    print(f"  torch version : {torch.__version__}", flush=True)
 
-    if not torch.cuda.is_available():
-        print("  Kein CUDA verfuegbar — nutze CPU.", flush=True)
+    cuda_test_code = (
+        "import torch, sys; "
+        "print(f'torch={torch.__version__}'); "
+        "print(f'cuda_avail={torch.cuda.is_available()}'); "
+        "dev = torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'N/A'; "
+        "cap = torch.cuda.get_device_capability(0) if torch.cuda.is_available() else (0,0); "
+        "print(f'gpu={dev}  SM={cap[0]}{cap[1]}'); "
+        "t = torch.zeros(4,4,device='cuda') @ torch.ones(4,4,device='cuda'); "
+        "print('matmul=OK'); "
+        "sys.exit(0)"
+    )
+
+    def _cuda_ok() -> bool:
+        r = subprocess.run(
+            [sys.executable, "-c", cuda_test_code],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, encoding="utf-8", errors="replace",
+        )
+        print(r.stdout or "", flush=True)
+        return r.returncode == 0
+
+    if _cuda_ok():
+        print("  CUDA : OK", flush=True)
         return
 
-    try:
-        dev_name = torch.cuda.get_device_name(0)
-        cap      = torch.cuda.get_device_capability(0)
-        print(f"  GPU           : {dev_name}  SM={cap[0]}{cap[1]}", flush=True)
-        # Kleiner Funktionstest
-        _ = torch.zeros(4, 4, device="cuda") @ torch.ones(4, 4, device="cuda")
-        print("  CUDA matmul   : OK", flush=True)
-    except Exception as exc:
-        print(f"  CUDA Test fehlgeschlagen: {exc}", flush=True)
-        print("  Installiere kompatibles PyTorch (cu124) ...", flush=True)
-        run([
-            sys.executable, "-m", "pip", "install", "-q",
-            "torch", "torchvision",
-            "--index-url", "https://download.pytorch.org/whl/cu124",
-        ])
-        import importlib, torch as _torch
-        importlib.reload(_torch)
-        try:
-            _ = _torch.zeros(4, 4, device="cuda") @ _torch.ones(4, 4, device="cuda")
-            print("  CUDA nach Reinstall : OK", flush=True)
-        except Exception as exc2:
-            print(f"  CUDA auch nach Reinstall defekt ({exc2}), setze CUDA_VISIBLE_DEVICES=''", flush=True)
-            os.environ["CUDA_VISIBLE_DEVICES"] = ""
+    # CUDA defekt -> PyTorch cu124 nachinstallieren
+    print("  CUDA defekt. Installiere torch cu124 ...", flush=True)
+    run([
+        sys.executable, "-m", "pip", "install", "-q",
+        "torch", "torchvision",
+        "--index-url", "https://download.pytorch.org/whl/cu124",
+        "--upgrade",
+    ])
+
+    if _cuda_ok():
+        print("  CUDA nach Reinstall : OK", flush=True)
+        return
+
+    # Letzter Ausweg: CPU-Modus erzwingen
+    print("  CUDA auch nach Reinstall defekt -> CPU-Modus (CUDA_VISIBLE_DEVICES='')", flush=True)
+    os.environ["CUDA_VISIBLE_DEVICES"] = ""
 
 
 # ── Schritt 2: Abhaengigkeiten ────────────────────────────────────────────────
