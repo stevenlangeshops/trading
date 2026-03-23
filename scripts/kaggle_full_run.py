@@ -76,6 +76,47 @@ def step_clone():
     print(f"Repo-Inhalt: {[f.name for f in REPO_DIR.iterdir()]}", flush=True)
 
 
+# ── Schritt 1b: CUDA Health-Check ────────────────────────────────────────────
+
+def step_check_cuda():
+    """
+    Prueft ob CUDA wirklich nutzbar ist.
+    Falls nicht (z.B. SM-Versions-Mismatch bei H100 + altem PyTorch),
+    wird PyTorch mit CUDA-12.4 Wheels neu installiert.
+    """
+    print(f"\n{'='*60}\nSCHRITT 1b: CUDA Health-Check [{elapsed()}]\n{'='*60}", flush=True)
+    import torch
+    print(f"  torch version : {torch.__version__}", flush=True)
+
+    if not torch.cuda.is_available():
+        print("  Kein CUDA verfuegbar — nutze CPU.", flush=True)
+        return
+
+    try:
+        dev_name = torch.cuda.get_device_name(0)
+        cap      = torch.cuda.get_device_capability(0)
+        print(f"  GPU           : {dev_name}  SM={cap[0]}{cap[1]}", flush=True)
+        # Kleiner Funktionstest
+        _ = torch.zeros(4, 4, device="cuda") @ torch.ones(4, 4, device="cuda")
+        print("  CUDA matmul   : OK", flush=True)
+    except Exception as exc:
+        print(f"  CUDA Test fehlgeschlagen: {exc}", flush=True)
+        print("  Installiere kompatibles PyTorch (cu124) ...", flush=True)
+        run([
+            sys.executable, "-m", "pip", "install", "-q",
+            "torch", "torchvision",
+            "--index-url", "https://download.pytorch.org/whl/cu124",
+        ])
+        import importlib, torch as _torch
+        importlib.reload(_torch)
+        try:
+            _ = _torch.zeros(4, 4, device="cuda") @ _torch.ones(4, 4, device="cuda")
+            print("  CUDA nach Reinstall : OK", flush=True)
+        except Exception as exc2:
+            print(f"  CUDA auch nach Reinstall defekt ({exc2}), setze CUDA_VISIBLE_DEVICES=''", flush=True)
+            os.environ["CUDA_VISIBLE_DEVICES"] = ""
+
+
 # ── Schritt 2: Abhaengigkeiten ────────────────────────────────────────────────
 
 def step_install():
@@ -304,6 +345,7 @@ def main() -> int:
     print(f"Trading Bot Full Pipeline | {time.strftime('%Y-%m-%d %H:%M:%S UTC')}", flush=True)
     try:
         step_clone()
+        step_check_cuda()
         step_install()
         step_copy_data()
         features, targets = step_build_panel()
