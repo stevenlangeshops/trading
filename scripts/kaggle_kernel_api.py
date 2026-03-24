@@ -503,6 +503,11 @@ def cmd_run(args: argparse.Namespace) -> int:
     if push_proc.returncode != 0:
         raise RuntimeError(f"kaggle kernels push fehlgeschlagen:\n{push_proc.stdout}")
 
+    # timeout_seconds=0 bedeutet: nur pushen, kein Polling (z.B. wenn Watcher die Kontrolle hat)
+    if cfg.timeout_seconds == 0:
+        print("[kaggle] Push-only Modus (timeout=0) — kein Polling.", file=sys.stderr)
+        return 0
+
     print(f"[kaggle] Kernel gestartet. Polling alle {cfg.poll_seconds}s ...", file=sys.stderr)
     poll_kernel_until_done(cfg.kernel_id, cfg.poll_seconds, cfg.timeout_seconds, runs_dir, kaggle_env)
 

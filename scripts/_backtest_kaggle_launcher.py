@@ -11,13 +11,19 @@ from scripts.kaggle_kernel_api import (
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
+import os
+
+# Wenn vom Watcher aufgerufen (WATCHER_MODE=1): nur pushen, kein polling.
+# Wenn direkt aufgerufen: pushen + pollen bis COMPLETE/ERROR.
+watcher_mode = os.environ.get("WATCHER_MODE", "0") == "1"
+
 args = argparse.Namespace(
     kernel_id="busersteven/trading-bot-v5-fullrun",
     kernel_title="trading-bot-v5-fullrun",
-    cmd="placeholder",           # wird nicht genutzt (custom_entrypoint)
-    timeout_seconds=12000,       # 3.3h max (Kaggle Limit = 12h)
+    cmd="placeholder",
+    timeout_seconds=0 if watcher_mode else 12000,  # 0 = nur push, kein poll
     accelerator="gpu",
-    poll_seconds=120,            # alle 2 Minuten Status abfragen
+    poll_seconds=120,
     staging_root=str(REPO_ROOT / ".kaggle_kernel_upload"),
     runs_root=str(REPO_ROOT / "kaggle_kernel_runs"),
     enable_internet=True,

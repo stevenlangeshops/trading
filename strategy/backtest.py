@@ -244,8 +244,14 @@ def run_backtest(
 
         logger.info(f"  Fold {fold['fold_id']}: [{val_start.date()} → {val_end.date()}]")
 
+        # Timezone-Normalisierung: all_dates koennte UTC-aware sein (datetime64[ms, UTC])
+        # waehrend val_start/val_end tz-naive sind → strip tz fuer Vergleich.
+        cmp_dates = all_dates.tz_localize(None) if getattr(all_dates, 'tz', None) is not None else all_dates
+        vs = val_start.tz_localize(None) if val_start.tzinfo is not None else val_start
+        ve = val_end.tz_localize(None)   if val_end.tzinfo   is not None else val_end
+
         # Handelstage in diesem Val-Zeitraum
-        fold_dates = all_dates[(all_dates >= val_start) & (all_dates <= val_end)]
+        fold_dates = all_dates[(cmp_dates >= vs) & (cmp_dates <= ve)]
 
         for date in fold_dates:
             # ── Regime bestimmen ──────────────────────────────────────────

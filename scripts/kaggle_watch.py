@@ -126,42 +126,30 @@ def diagnose(error_log: str) -> str:
 
 
 def resubmit(kernel_id: str) -> bool:
-    """Startet den Launcher neu. Gibt True zurück wenn Push erfolgreich."""
-    log("  Starte Launcher neu ...")
+    """
+    Pusht den Kernel NEU und kehrt sofort zurueck (non-blocking).
+    WATCHER_MODE=1 sorgt dafuer dass der Launcher nur pushed, nicht pollt.
+    Das Polling laeuft danach in der Watcher-Hauptschleife weiter.
+    """
+    log("  Pushe neuen Kernel (non-blocking) ...")
+    env = build_env()
+    env["WATCHER_MODE"] = "1"   # Launcher: nur push, kein poll
     r = subprocess.run(
         [sys.executable, str(LAUNCHER_SCRIPT)],
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
         text=True, encoding="utf-8", errors="replace",
+        timeout=180,
+        env=env,
     )
     output = r.stdout or ""
-    log(f"  Launcher-Output (letzte 5 Zeilen):")
-    for line in output.strip().splitlines()[-5:]:
+    for line in output.strip().splitlines()[-8:]:
         log(f"    {line}")
-    return "successfully pushed" in output
+    success = "successfully pushed" in output
+    log(f"  Push {'OK' if success else 'FEHLGESCHLAGEN'}")
+    return success
 
 
 # ── Haupt-Watch-Schleife ───────────────────────────────────────────────────────
-
-GPU_INCOMPATIBLE_EXIT = 42   # step_check_cuda() wirft SystemExit(42) bei SM<7.0
-MAX_GPU_RETRIES       = 5   # Nach N P100-Versuchen CPU-Fallback erzwingen
-
-
-def _patch_cpu_fallback() -> None:
-    """Ersetzt SystemExit(42) in kaggle_full_run.py durch CPU-Fallback."""
-    src = FULL_RUN_SCRIPT.read_text(encoding="utf-8")
-    if "FORCE_CPU_FALLBACK" in src:
-        return   # bereits gepatcht
-    patched = src.replace(
-        'raise SystemExit(42)  # Exit-Code 42 = GPU_INCOMPATIBLE_RETRY',
-        '# FORCE_CPU_FALLBACK: alle GPU-Versuche aufgebraucht\n'
-        '        os.environ["CUDA_VISIBLE_DEVICES"] = ""\n'
-        '        os.environ["KAGGLE_GPU_INCOMPATIBLE"] = "1"\n'
-        '        log_write("  MAX GPU-Retries erreicht -> CPU-Fallback erzwungen.")\n'
-        '        return'
-    )
-    FULL_RUN_SCRIPT.write_text(patched, encoding="utf-8")
-    log("  CPU-Fallback-Patch in kaggle_full_run.py angewendet.")
-
 
 def watch(kernel_id: str) -> int:
     env              = build_env()
