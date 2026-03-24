@@ -88,11 +88,14 @@ def fetch_ticker(
     if df is None or df.empty:
         return None
 
-    # MultiIndex-Spalten flachen (yfinance >= 0.2.x gibt (Price, Ticker) zurück)
+    # MultiIndex-Spalten flachen.
+    # yfinance 0.2.x: (Price, Ticker), yfinance 1.x: ebenfalls oder anders.
+    # Nach dem Flattening können Duplikate entstehen → deduplizieren.
     if isinstance(df.columns, pd.MultiIndex):
-        df.columns = [c[0].lower() for c in df.columns]
+        df.columns = df.columns.get_level_values(0).str.lower()
     else:
         df.columns = [c.lower() for c in df.columns]
+    df = df.loc[:, ~df.columns.duplicated(keep="first")]
     df = df.rename(columns={"adj close": "close"})
 
     required = {"open", "high", "low", "close", "volume"}

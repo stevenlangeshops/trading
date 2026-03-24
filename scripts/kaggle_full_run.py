@@ -14,7 +14,7 @@ Vollstaendige Trading-Bot Pipeline fuer Kaggle GPU:
  10. Ergebnisse in permanentes Kaggle Dataset hochladen (busersteven/trading-results)
 
 Erwartet:
-  /kaggle/input/trading-raw-data/*.parquet  (79 Parquet-Dateien)
+  /kaggle/input/trading-raw-data/*.parquet  (260 S&P-500 Parquet-Dateien)
 
 Output nach /kaggle/working/:
   best_model.pt, fold_*_best.pt, asset_map.json,
@@ -640,24 +640,24 @@ def step_persist_results():
 
 # ── Schritt 6b: Checkpoints aus Dataset laden (Backtest-Only-Modus) ───────────
 
-def step_load_checkpoints() -> list[dict] | None:
+def step_load_checkpoints(asset_map: dict) -> list[dict] | None:
     """
     Lädt vorhandene Fold-Checkpoints aus dem Kaggle Dataset 'trading-results'.
 
-    Gibt fold_results zurück wenn alle Checkpoints vorhanden sind,
-    sonst None → Training wird normal ausgeführt.
+    Prüft zusätzlich, ob die gespeicherten Checkpoints mit der aktuellen
+    Asset-Anzahl kompatibel sind (n_assets muss übereinstimmen).
+    Bei Inkompatibilität (z.B. nach Asset-Expansion) → Training erzwungen.
 
-    Aktivierung: Umgebungsvariable BACKTEST_ONLY=1 setzen, oder
-    automatisch wenn training-results Dataset eingebunden ist und
-    alle Checkpoint-Dateien vorhanden sind.
+    Gibt fold_results zurück wenn alle Checkpoints vorhanden und kompatibel sind,
+    sonst None → Training wird normal ausgeführt.
     """
+    import torch as _torch
+    import json  as _json
+
     backtest_only = os.environ.get("BACKTEST_ONLY", "0") == "1"
+    n_assets_current = len(asset_map) + 1   # +1 wegen 1-basiertem Embedding-Index
 
     # Mögliche Quellen für vorhandene Checkpoints.
-    # Kaggle-Notebooks legen Datasets je nach Einbindungsart unter verschiedenen
-    # Pfaden ab:
-    #   - Via "Add Data" im Notebook-UI: /kaggle/input/datasets/<user>/<name>/
-    #   - Via API kernel-metadata datasets_sources: /kaggle/input/<name>/
     candidate_dirs = [
         WORKING / "checkpoints",
         Path("/kaggle/input/trading-results"),
@@ -666,7 +666,7 @@ def step_load_checkpoints() -> list[dict] | None:
         Path("/kaggle/input/datasets/busersteven/trading-results/checkpoints"),
     ]
 
-    wf_json = None
+    wf_json  = None
     ckpt_src = None
     for d in candidate_dirs:
         wf_candidate = d / "walk_forward_results.json"
@@ -684,7 +684,21 @@ def step_load_checkpoints() -> list[dict] | None:
             log_write("  Keine vorhandenen Checkpoints -> Training wird ausgefuehrt.")
         return None
 
-    import json as _json
+    # Kompatibilitaets-Check: erstes .pt laden und n_assets vergleichen
+    first_pt = next(ckpt_src.glob("fold_*_best.pt"))
+    try:
+        ckpt_meta = _torch.load(str(first_pt), map_location="cpu", weights_only=False)
+        n_assets_saved = ckpt_meta.get("config", {}).get("n_assets", None)
+        if n_assets_saved is not None and n_assets_saved != n_assets_current:
+            log_write(
+                f"  [INFO] Checkpoint-Assets={n_assets_saved} != aktuell={n_assets_current}"
+                f" (Asset-Expansion erkannt) -> Neutraining erforderlich."
+            )
+            return None
+        log_write(f"  Checkpoint-Assets={n_assets_saved} kompatibel mit aktuell={n_assets_current}")
+    except Exception as e:
+        log_write(f"  [WARN] Checkpoint-Kompatibilitaets-Check fehlgeschlagen: {e}")
+
     fold_results = _json.loads(wf_json.read_text())
 
     # Checkpoint-Pfade auf aktuellen Speicherort zeigen lassen
@@ -709,7 +723,7 @@ def step_load_checkpoints() -> list[dict] | None:
         return updated
 
     missing = len(fold_results) - len(updated)
-    log_write(f"  [WARN] {missing} Checkpoints fehlen → Training wird ausgefuehrt.")
+    log_write(f"  [WARN] {missing} Checkpoints fehlen -> Training wird ausgefuehrt.")
     return None
 
 
@@ -727,8 +741,8 @@ def main() -> int:
         features, targets = step_build_panel()
         asset_map         = step_build_asset_map(features)
 
-        # Vorhandene Checkpoints nutzen wenn verfügbar (spart ~25-30 Min Training)
-        fold_results = step_load_checkpoints()
+        # Vorhandene Checkpoints nutzen wenn verfügbar und asset-kompatibel
+        fold_results = step_load_checkpoints(asset_map)
         if fold_results is None:
             fold_results = step_train(features, targets, asset_map)
 
