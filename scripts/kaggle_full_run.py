@@ -156,16 +156,28 @@ def step_check_cuda():
     if sm_major > 0 and sm_major < 7:
         # P100 (SM_60): das vorinstallierte PyTorch+cu128 unterstuetzt SM_60 nicht.
         # Loesung: PyTorch+cu118 installieren — CUDA 11.8 unterstuetzt SM_60 explizit.
-        # (CUDA 12.x hat SM_60-Support komplett gestrichen, daher cu124 nutzlos war.)
+        # WICHTIG: --force-reinstall noetig, weil pip --upgrade cu118 nicht
+        # installiert wenn die aktuelle Version (z.B. 2.10.0+cu128) > max-cu118-Version.
         log_write(f"  SM_{sm_major}.x (P100) erkannt.")
         log_write("  Vorinstalliertes torch+cu128 unterstuetzt SM_60 nicht.")
-        log_write("  Installiere torch+cu118 (CUDA 11.8, unterstuetzt SM_60/P100) ...")
-        run([
-            sys.executable, "-m", "pip", "install", "-q",
-            "torch", "torchvision",
-            "--index-url", "https://download.pytorch.org/whl/cu118",
-            "--upgrade",
-        ])
+        log_write("  Installiere torch==2.5.1+cu118 (force-reinstall) ...")
+        pip_r = subprocess.run(
+            [
+                sys.executable, "-m", "pip", "install",
+                "torch==2.5.1+cu118", "torchvision==0.20.1+cu118",
+                "--index-url", "https://download.pytorch.org/whl/cu118",
+                "--force-reinstall", "--no-deps",
+            ],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, encoding="utf-8", errors="replace",
+        )
+        for line in (pip_r.stdout or "").splitlines()[-10:]:
+            log_write(f"  pip> {line}")
+        if pip_r.returncode != 0:
+            log_write("  pip install cu118 fehlgeschlagen -> CPU-Fallback.")
+            os.environ["CUDA_VISIBLE_DEVICES"] = ""
+            os.environ["KAGGLE_GPU_INCOMPATIBLE"] = "1"
+            return
         r2 = subprocess.run(
             [sys.executable, "-c", probe_code],
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
