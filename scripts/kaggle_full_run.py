@@ -38,8 +38,9 @@ REPO_DIR = WORKING / "repo"
 # raw.zip enthaelt: raw/AAPL_1d.parquet, raw/SPY_1d.parquet, ...
 # Daher: sowohl /kaggle/input/trading-raw-data/ als auch .../raw/ pruefen.
 INPUT_DIRS = [
-    Path("/kaggle/input/trading-raw-data/raw"),   # aus ZIP: Unterordner raw/
-    Path("/kaggle/input/trading-raw-data"),        # flach (falls direkt hochgeladen)
+    Path("/kaggle/input/datasets/busersteven/trading-raw-data/raw"),  # Notebook-Modus (web UI)
+    Path("/kaggle/input/trading-raw-data/raw"),   # API-Modus (kernels push)
+    Path("/kaggle/input/trading-raw-data"),
     Path("/kaggle/input/trading-raw-data-v2/raw"),
     Path("/kaggle/input/trading-raw-data-v2"),
 ]
@@ -494,3 +495,7 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
+else:
+    # Wird via exec() aus einem Jupyter-Notebook aufgerufen.
+    # sys.exit() wuerde Jupyter abwuergen — stattdessen direkt main() aufrufen.
+    main()
