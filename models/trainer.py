@@ -240,6 +240,7 @@ def train_walk_forward(
 
         best_val_loss  = float("inf")
         patience_count = 0
+        CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
         ckpt_path      = CHECKPOINT_DIR / f"fold_{fold.fold_id}_best.pt"
 
         logger.info(f"  {'Ep':>4}  {'TrainLoss':>10}  {'ValLoss':>10}  {'RankIC':>8}  {'LR':>10}")
