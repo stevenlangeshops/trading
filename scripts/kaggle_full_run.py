@@ -154,41 +154,14 @@ def step_check_cuda():
         return
 
     if sm_major > 0 and sm_major < 7:
-        # P100 (SM_60): das vorinstallierte PyTorch+cu128 unterstuetzt SM_60 nicht.
-        # Loesung: PyTorch+cu118 installieren — CUDA 11.8 unterstuetzt SM_60 explizit.
-        # WICHTIG: --force-reinstall noetig, weil pip --upgrade cu118 nicht
-        # installiert wenn die aktuelle Version (z.B. 2.10.0+cu128) > max-cu118-Version.
+        # P100 (SM_60): fundamental inkompatibel mit Python 3.12 + PyTorch 2.x.
+        # - CUDA 12.x hat SM_60-Unterstuetzung komplett entfernt
+        # - torch+cu118 vom whl-Index linkt gegen System-libcudart.so.11 (nicht vorhanden)
+        # - Python-3.12-Wheels fuer altes torch (1.x mit SM_60) existieren nicht
+        # => Kein GPU-Training moeglich. Sofort CPU-Modus.
         log_write(f"  SM_{sm_major}.x (P100) erkannt.")
-        log_write("  Vorinstalliertes torch+cu128 unterstuetzt SM_60 nicht.")
-        log_write("  Installiere torch==2.5.1+cu118 (force-reinstall) ...")
-        pip_r = subprocess.run(
-            [
-                sys.executable, "-m", "pip", "install",
-                "torch==2.5.1+cu118", "torchvision==0.20.1+cu118",
-                "--index-url", "https://download.pytorch.org/whl/cu118",
-                "--force-reinstall", "--no-deps",
-            ],
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            text=True, encoding="utf-8", errors="replace",
-        )
-        for line in (pip_r.stdout or "").splitlines()[-10:]:
-            log_write(f"  pip> {line}")
-        if pip_r.returncode != 0:
-            log_write("  pip install cu118 fehlgeschlagen -> CPU-Fallback.")
-            os.environ["CUDA_VISIBLE_DEVICES"] = ""
-            os.environ["KAGGLE_GPU_INCOMPATIBLE"] = "1"
-            return
-        r2 = subprocess.run(
-            [sys.executable, "-c", probe_code],
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            text=True, encoding="utf-8", errors="replace",
-        )
-        for line in (r2.stdout or "").splitlines():
-            log_write(f"  {line}")
-        if r2.returncode == 0 and "matmul=OK" in (r2.stdout or ""):
-            log_write("  CUDA cu118 + SM_60 : OK -> GPU-Training aktiv!")
-            return
-        log_write("  cu118 fehlgeschlagen -> CPU-Fallback.")
+        log_write("  P100/SM_60 + Python 3.12 + PyTorch 2.x: fundamental inkompatibel.")
+        log_write("  Kein GPU-Training moeglich -> CPU-Modus.")
         os.environ["CUDA_VISIBLE_DEVICES"] = ""
         os.environ["KAGGLE_GPU_INCOMPATIBLE"] = "1"
         return
@@ -313,9 +286,11 @@ def step_train(features, targets, asset_map):
         log_write("  Modus: GPU — volle Parameter (12 Folds, 50 Epochs, hidden=128)")
         _epochs, _patience, _hidden, _layers, _step_months = 50, 7, 128, 2, 6.0
     else:
-        # Echter CPU-Fallback (sollte nicht mehr vorkommen da cu118 P100 unterstuetzt)
-        log_write("  Modus: CPU — reduzierte Parameter (6 Folds, 15 Epochs, hidden=64)")
-        _epochs, _patience, _hidden, _layers, _step_months = 15, 4,  64, 1, 12.0
+        # CPU-Modus (P100 oder kein CUDA): gute Parameter die in ~2h fertig sind.
+        # Basis Run-12 (6 Folds, 15 Ep, hidden=64): 29min.
+        # 9 Folds, 30 Ep, hidden=96, 2 Layers: ca. 120-150 min — gut innerhalb 9h.
+        log_write("  Modus: CPU (P100 inkompatibel) — 9 Folds, 30 Ep, hidden=96")
+        _epochs, _patience, _hidden, _layers, _step_months = 30, 6, 96, 2, 8.0
 
     results = train_walk_forward(
         features     = features,
