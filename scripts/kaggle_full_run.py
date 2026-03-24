@@ -154,17 +154,35 @@ def step_check_cuda():
         return
 
     if sm_major > 0 and sm_major < 7:
-        # P100 (SM_60): PyTorch 2.x + Python 3.12 unterstuetzt SM_60 nicht.
-        # Kaggle-API-Bug (seit 2023, GitHub #589) verhindert T4-Auswahl via API.
-        # -> CPU-Fallback, Training laeuft in ~2h durch (6 Folds, 15 Epochs).
-        log_write(f"  GPU SM_{sm_major}.x < 7.0: inkompatibel mit PyTorch 2.x / Python 3.12.")
-        log_write("  Kaggle API-Bug: T4 nicht per API waehlbar -> CPU-Modus.")
+        # P100 (SM_60): das vorinstallierte PyTorch+cu128 unterstuetzt SM_60 nicht.
+        # Loesung: PyTorch+cu118 installieren — CUDA 11.8 unterstuetzt SM_60 explizit.
+        # (CUDA 12.x hat SM_60-Support komplett gestrichen, daher cu124 nutzlos war.)
+        log_write(f"  SM_{sm_major}.x (P100) erkannt.")
+        log_write("  Vorinstalliertes torch+cu128 unterstuetzt SM_60 nicht.")
+        log_write("  Installiere torch+cu118 (CUDA 11.8, unterstuetzt SM_60/P100) ...")
+        run([
+            sys.executable, "-m", "pip", "install", "-q",
+            "torch", "torchvision",
+            "--index-url", "https://download.pytorch.org/whl/cu118",
+            "--upgrade",
+        ])
+        r2 = subprocess.run(
+            [sys.executable, "-c", probe_code],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, encoding="utf-8", errors="replace",
+        )
+        for line in (r2.stdout or "").splitlines():
+            log_write(f"  {line}")
+        if r2.returncode == 0 and "matmul=OK" in (r2.stdout or ""):
+            log_write("  CUDA cu118 + SM_60 : OK -> GPU-Training aktiv!")
+            return
+        log_write("  cu118 fehlgeschlagen -> CPU-Fallback.")
         os.environ["CUDA_VISIBLE_DEVICES"] = ""
         os.environ["KAGGLE_GPU_INCOMPATIBLE"] = "1"
         return
 
     if sm_major >= 7:
-        # SM OK, aber matmul schlug fehl -> cu124 nachinstallieren
+        # SM >= 7.0 kompatibel, aber matmul schlug fehl -> cu124 nachinstallieren
         log_write(f"  SM_{sm_major}.x kompatibel, aber matmul fehlgeschlagen -> cu124 installieren ...")
         run([
             sys.executable, "-m", "pip", "install", "-q",
@@ -278,15 +296,14 @@ def step_train(features, targets, asset_map):
 
     from models.trainer import train_walk_forward
 
-    # GPU inkompatibel (z.B. P100 SM_60) -> CPU-Modus mit reduzierter Komplexitaet
-    # damit das Training innerhalb des Kaggle-Zeitlimits (12h) bleibt
     gpu_ok = os.environ.get("KAGGLE_GPU_INCOMPATIBLE", "0") != "1"
     if gpu_ok:
-        log_write("  Modus: GPU")
-        _epochs, _patience, _hidden, _layers, _step_months = 50, 7,  128, 2, 6.0
+        log_write("  Modus: GPU — volle Parameter (12 Folds, 50 Epochs, hidden=128)")
+        _epochs, _patience, _hidden, _layers, _step_months = 50, 7, 128, 2, 6.0
     else:
-        log_write("  Modus: CPU (reduzierte Parameter fuer Zeitlimit)")
-        _epochs, _patience, _hidden, _layers, _step_months = 15, 4,  64,  1, 12.0
+        # Echter CPU-Fallback (sollte nicht mehr vorkommen da cu118 P100 unterstuetzt)
+        log_write("  Modus: CPU — reduzierte Parameter (6 Folds, 15 Epochs, hidden=64)")
+        _epochs, _patience, _hidden, _layers, _step_months = 15, 4,  64, 1, 12.0
 
     results = train_walk_forward(
         features     = features,
