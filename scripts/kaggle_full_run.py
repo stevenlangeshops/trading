@@ -306,6 +306,15 @@ def step_build_asset_map(features):
 def step_train(features, targets, asset_map):
     log_write(f"\n{'='*60}\nSCHRITT 6: train_walk_forward() [{elapsed()}]\n{'='*60}")
 
+    # Modul-Cache leeren damit bei erneutem Run immer der frische Code geladen wird.
+    # (Ohne Kernel-Restart bleibt trainer.py sonst aus dem vorherigen Lauf gecacht.)
+    for _mod in list(sys.modules.keys()):
+        if _mod.startswith(("models", "features", "strategy")):
+            del sys.modules[_mod]
+
+    # Checkpoints-Verzeichnis sicherstellen (Fallback falls trainer.py es nicht anlegt)
+    (WORKING / "checkpoints").mkdir(parents=True, exist_ok=True)
+
     from models.trainer import train_walk_forward
 
     gpu_ok = os.environ.get("KAGGLE_GPU_INCOMPATIBLE", "0") != "1"
