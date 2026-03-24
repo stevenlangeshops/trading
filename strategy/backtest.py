@@ -613,12 +613,28 @@ def compute_benchmarks(
     start_date = dates[0]
     end_date   = dates[-1]
 
+    # Timezone-Normalisierung: Cache-Index ist UTC-aware, dates sind tz-naiv.
+    # Für Vergleiche (<=, >=) müssen beide auf tz-naiv normalisiert werden.
+    def _norm(idx: pd.DatetimeIndex) -> pd.DatetimeIndex:
+        return idx.tz_localize(None) if idx.tz is not None else idx
+
+    def _norm_ts(ts: pd.Timestamp) -> pd.Timestamp:
+        return ts.tz_localize(None) if ts.tzinfo is not None else ts
+
+    start_cmp = _norm_ts(start_date)
+
+    def _series_before(s: pd.Series, ts: pd.Timestamp) -> pd.Series:
+        """Slice einer ggf. tz-aware Series bis inkl. ts (tz-naiv)."""
+        idx_norm = _norm(s.index)
+        return s[idx_norm <= _norm_ts(ts)]
+
     # ── 1. SPY Buy & Hold ─────────────────────────────────────────────────
     spy_series  = price_cache.get(spy_ticker)
     spy_equity  = []
     spy_ret     = None
     if spy_series is not None:
-        p0 = float(spy_series[spy_series.index <= start_date].iloc[-1]) if len(spy_series[spy_series.index <= start_date]) > 0 else None
+        past0 = _series_before(spy_series, start_date)
+        p0    = float(past0.iloc[-1]) if len(past0) > 0 else None
         if p0:
             for d in dates:
                 p = _get_price(price_cache, spy_ticker, d)
@@ -632,7 +648,7 @@ def compute_benchmarks(
     for a in assets:
         s = price_cache.get(a)
         if s is not None:
-            past = s[s.index <= start_date]
+            past = _series_before(s, start_date)
             if len(past) > 0:
                 p0_map[a] = float(past.iloc[-1])
 

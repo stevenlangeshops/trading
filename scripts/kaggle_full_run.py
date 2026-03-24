@@ -403,7 +403,7 @@ def step_backtest(features, targets, asset_map, fold_results):
 
     # ATR-Cache fuer alle Assets vorab aufbauen (geteilt zwischen Long-Only und Long-Short)
     atr_cache = build_atr_cache(list(asset_map.keys()), raw_dir=raw_dir, period=14)
-    log_write(f"  ATR-Cache: {len(atr_cache)} Assets (period=14, k=2.5)")
+    log_write(f"  ATR-Cache: {len(atr_cache)} Assets (period=14, k=3.5, min_hold=3)")
 
     result_a = run_backtest(
         features=features, targets=targets,
