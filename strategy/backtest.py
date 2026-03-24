@@ -259,11 +259,15 @@ def run_backtest(
     init_cash:        float = 10_000.0,
     seq_len:          int   = 64,
     # ATR-basierter Trailing Stop (bevorzugt)
-    use_atr_trailing: bool  = True,   # ATR-Trailing aktivieren
-    atr_period:       int   = 14,     # ATR-Periode in Handelstagen
-    atr_k:            float = 2.5,    # Multiplikator: stop = close - k * ATR
+    use_atr_trailing:  bool  = True,   # ATR-Trailing aktivieren
+    atr_period:        int   = 14,     # ATR-Periode in Handelstagen
+    atr_k:             float = 3.5,    # Multiplikator: stop = close - k * ATR
+                                       # k=2.5 war zu eng (schnitt Gewinner ab),
+                                       # k=3.5 lässt normale Schwankungen durch
+    atr_min_hold_days: int   = 3,      # Stop erst nach n Tagen aktiv (verhindert
+                                       # frühzeitigen Exit bei Entry-Volatilität)
     # Fallback: fester Stop-Loss (greift wenn kein ATR verfügbar)
-    stop_loss_pct:    float = 0.05,   # 5% Stop-Loss vom Einstiegskurs
+    stop_loss_pct:     float = 0.05,   # 5% Stop-Loss vom Einstiegskurs
     rotation_buffer:  int   = 2,      # Rotation nur wenn neuer Kandidat >= buffer Ränge besser
     # Regime-Filter
     use_regime:       bool  = True,   # Adaptives N aktivieren
@@ -424,11 +428,15 @@ def run_backtest(
                 # a) Stop-Loss:
                 #    Bevorzugt ATR-Trailing (volatilitätsangepasst),
                 #    Fallback auf festen prozentualen Stop wenn kein ATR da.
-                if use_atr_trailing and pos.get('trailing_stop') is not None:
+                #    atr_min_hold_days: Stop erst nach n Tagen aktiv —
+                #    verhindert Entry-Volatilität als falschen Ausstieg.
+                hold_days_so_far = pos.get('hold_days', 0)
+                atr_active = hold_days_so_far >= atr_min_hold_days
+                if use_atr_trailing and pos.get('trailing_stop') is not None and atr_active:
                     if current_price < pos['trailing_stop']:
                         to_close.append((asset, 'atr_trailing_stop'))
                         continue
-                else:
+                elif not use_atr_trailing or not atr_active:
                     gross_loss = (current_price - pos['entry']) / pos['entry'] * pos['direction']
                     if gross_loss < -stop_loss_pct:
                         to_close.append((asset, 'stop_loss'))
