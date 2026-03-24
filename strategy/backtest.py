@@ -175,34 +175,39 @@ def predict_cross_section(
 # ── Backtest Engine ───────────────────────────────────────────────────────────
 
 def run_backtest(
-    features:    pd.DataFrame,
-    targets:     pd.Series,
-    fold_results: list[dict],
-    asset_map:   dict[str, int],
+    features:         pd.DataFrame,
+    targets:          pd.Series,
+    fold_results:     list[dict],
+    asset_map:        dict[str, int],
     # Strategie-Parameter
-    n_max:        int   = 5,     # Max Positionen bei Bull-Markt
-    n_mid:        int   = 3,     # Positionen bei neutralem Markt
-    n_min:        int   = 1,     # Min Positionen bei Bär-Markt
-    long_short:   bool  = False, # True = Long-Short, False = Long-Only
-    fees:         float = 0.001, # 0.1% Transaktionskosten
-    init_cash:    float = 10_000.0,
-    seq_len:      int   = 64,
-    holding_days: int   = 11,   # Haltedauer in Handelstagen (muss zum Vorhersage-Horizont passen)
+    n_max:            int   = 5,      # Max Positionen bei Bull-Markt
+    n_mid:            int   = 3,      # Positionen bei neutralem Markt
+    n_min:            int   = 1,      # Min Positionen bei Bär-Markt
+    long_short:       bool  = False,  # True = Long-Short, False = Long-Only
+    fees:             float = 0.001,  # 0.1% Transaktionskosten pro Seite
+    init_cash:        float = 10_000.0,
+    seq_len:          int   = 64,
+    # Dynamisches Positions-Management
+    stop_loss_pct:    float = 0.05,   # 5% Stop-Loss vom Einstiegskurs
+    rotation_buffer:  int   = 2,      # Rotation nur wenn neuer Kandidat >= buffer Ränge besser
     # Regime-Filter
-    use_regime:  bool  = True,  # Adaptives N aktivieren
-    spy_ticker:  str   = "SPY", # Referenz-Asset für Regime
-    # Optionaler Pre-built Price-Cache (vermeidet wiederholtes Disk-IO)
-    price_cache: Optional[dict] = None,
+    use_regime:       bool  = True,   # Adaptives N aktivieren
+    spy_ticker:       str   = "SPY",  # Referenz-Asset für Regime
+    # Optionaler Pre-built Price-Cache
+    price_cache:      Optional[dict] = None,
 ) -> dict:
     """
     Führt den Cross-Sectional Backtest über alle Folds durch.
 
-    Pro Handelstag:
+    Täglich:
       1. Regime bestimmen (adaptives N)
-      2. Modell-Vorhersagen für alle Assets
-      3. Top-N kaufen (Long), Bottom-N leerverkaufen (Short, nur Variante B)
-      4. Nach horizon Tagen glattstellen
-      5. Performance berechnen
+      2. Frische Modell-Vorhersagen für alle Assets
+      3. Jede gehaltene Position prüfen:
+         a. Stop-Loss: exit wenn Verlust > stop_loss_pct
+         b. Rotation: exit wenn Rang schlechter als n_long + rotation_buffer
+            UND ein freier besserer Kandidat existiert
+      4. Freie Slots mit den besten ungehaltenen Top-N Kandidaten befüllen
+      5. Positionen können beliebig lang gehalten werden (kein festes Zeitlimit)
     """
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -231,9 +236,29 @@ def run_backtest(
     equity_dates = []
 
     strategy_name = "Long-Short" if long_short else "Long-Only"
-    logger.info(f"Backtest: {strategy_name}  n_max={n_max}  fees={fees:.3f}  holding={holding_days}d")
+    logger.info(
+        f"Backtest: {strategy_name}  n_max={n_max}  fees={fees:.3f}  "
+        f"stop_loss={stop_loss_pct*100:.1f}%  rotation_buffer={rotation_buffer}"
+    )
 
-    day_counter = 0   # zaehlt Handelstage seit letztem Rebalancing
+    def _close_position(asset: str, pos: dict, date, reason: str, regime: str) -> None:
+        """Schließt eine Position, bucht Erlös und schreibt Trade-Log."""
+        nonlocal cash
+        price = _get_price(price_cache, asset, date)
+        if price is None:
+            return
+        proceeds = pos['shares'] * price * (1 - fees) * pos['direction']
+        cash    += proceeds
+        pnl      = (price - pos['entry']) / pos['entry'] * pos['direction']
+        trade_log.append({
+            'date':       str(date.date()),
+            'asset':      asset,
+            'direction':  'long' if pos['direction'] == 1 else 'short',
+            'pnl_pct':    round(pnl * 100, 3),
+            'regime':     regime,
+            'exit_reason': reason,
+            'hold_days':  pos.get('hold_days', 0),
+        })
 
     for fold in fold_results:
         ckpt_path = fold['ckpt_path']
@@ -247,13 +272,9 @@ def run_backtest(
 
         logger.info(f"  Fold {fold['fold_id']}: [{val_start.date()} → {val_end.date()}]")
 
-        # Timezone-Normalisierung: all_dates koennte UTC-aware sein (datetime64[ms, UTC])
-        # waehrend val_start/val_end tz-naive sind → strip tz fuer Vergleich.
         cmp_dates = all_dates.tz_localize(None) if getattr(all_dates, 'tz', None) is not None else all_dates
         vs = val_start.tz_localize(None) if val_start.tzinfo is not None else val_start
         ve = val_end.tz_localize(None)   if val_end.tzinfo   is not None else val_end
-
-        # Handelstage in diesem Val-Zeitraum
         fold_dates = all_dates[(cmp_dates >= vs) & (cmp_dates <= ve)]
 
         for date in fold_dates:
@@ -267,86 +288,118 @@ def run_backtest(
                 regime = 'neutral'
                 n_long = n_mid
 
-            rebalance_today = (day_counter % holding_days == 0)
-            day_counter += 1
-
-            if not rebalance_today:
-                # Nur Equity tracken, keine Trades
-                equity.append(cash + _position_value(positions, price_cache, date))
-                equity_dates.append(date)
-                continue
-
             # ── Vorhersagen generieren ────────────────────────────────────
             preds = predict_cross_section(
                 model, features, asset_map, date, seq_len, device
             )
             if len(preds) < 2:
+                # Kein Signal → Positionen halten, Equity tracken
+                for pos in positions.values():
+                    pos['hold_days'] = pos.get('hold_days', 0) + 1
                 equity.append(cash + _position_value(positions, price_cache, date))
                 equity_dates.append(date)
                 continue
 
-            # ── Bestehende Positionen auflösen (nur bei Rebalancing) ──────
-            for asset, pos in list(positions.items()):
-                price = _get_price(price_cache, asset, date)
-                if price is None:
+            # Rang-Lookup: asset → Rang (0 = bester)
+            rank_of = {asset: i for i, asset in enumerate(preds.index)}
+
+            # ── Stop-Loss & Rotation prüfen ───────────────────────────────
+            to_close: list[tuple[str, str]] = []  # (asset, reason)
+
+            for asset, pos in positions.items():
+                current_price = _get_price(price_cache, asset, date)
+                if current_price is None:
                     continue
-                proceeds = pos['shares'] * price * (1 - fees) * pos['direction']
-                cash    += proceeds
-                pnl      = (price - pos['entry']) / pos['entry'] * pos['direction']
-                trade_log.append({
-                    'date':      str(date.date()),
-                    'asset':     asset,
-                    'direction': 'long' if pos['direction'] == 1 else 'short',
-                    'pnl_pct':   round(pnl * 100, 3),
-                    'regime':    regime,
-                })
-            positions = {}
 
-            # ── Neue Positionen aufbauen ──────────────────────────────────
-            n_actual   = min(n_long, len(preds))
-            top_assets = preds.index[:n_actual].tolist()
-
-            short_assets = []
-            if long_short and n_actual > 0:
-                n_short      = min(n_actual, len(preds) - n_actual)
-                short_assets = preds.index[-n_short:].tolist()
-
-            total_positions = len(top_assets) + len(short_assets)
-            if total_positions == 0:
-                equity.append(cash)
-                equity_dates.append(date)
-                continue
-
-            per_position = cash / total_positions
-
-            for asset in top_assets:
-                price = _get_price(price_cache, asset, date)
-                if price is None or price <= 0:
+                # a) Stop-Loss
+                gross_loss = (current_price - pos['entry']) / pos['entry'] * pos['direction']
+                if gross_loss < -stop_loss_pct:
+                    to_close.append((asset, 'stop_loss'))
                     continue
-                shares = (per_position * (1 - fees)) / price
-                positions[asset] = {'shares': shares, 'entry': price, 'direction': 1}
-                cash -= per_position
 
-            for asset in short_assets:
-                price = _get_price(price_cache, asset, date)
-                if price is None or price <= 0:
-                    continue
-                shares = (per_position * (1 - fees)) / price
-                positions[asset] = {'shares': shares, 'entry': price, 'direction': -1}
-                cash += per_position * (1 - fees)
+                # b) Rotation: nur wenn Rang deutlich außerhalb Top-N
+                asset_rank = rank_of.get(asset, len(preds))
+                if asset_rank >= n_long + rotation_buffer:
+                    # Prüfen ob ein besserer Kandidat existiert der noch nicht gehalten wird
+                    held_after_close = set(positions) - {a for a, _ in to_close}
+                    candidates = [a for a in preds.index[:n_long]
+                                  if a not in held_after_close]
+                    if candidates:
+                        to_close.append((asset, 'rotation'))
+
+            # ── Geschlossene Positionen abwickeln ────────────────────────
+            for asset, reason in to_close:
+                _close_position(asset, positions[asset], date, reason, regime)
+                del positions[asset]
+
+            # ── Freie Slots mit besten Kandidaten füllen ─────────────────
+            free_slots = n_long - len(positions)
+            if free_slots > 0:
+                held = set(positions.keys())
+                new_longs = [a for a in preds.index if a not in held][:free_slots]
+
+                # Kapital gleichmäßig auf freie Slots verteilen
+                # (bestehende Positionen bleiben in ihrer bisherigen Größe)
+                if new_longs and cash > 0:
+                    per_position = cash / len(new_longs)
+                    for asset in new_longs:
+                        price = _get_price(price_cache, asset, date)
+                        if price is None or price <= 0:
+                            continue
+                        shares = (per_position * (1 - fees)) / price
+                        positions[asset] = {
+                            'shares':    shares,
+                            'entry':     price,
+                            'direction': 1,
+                            'hold_days': 0,
+                        }
+                        cash -= per_position
+
+            # Short-Seite (Variante B): Bottom-N leer verkaufen
+            if long_short and n_long > 0:
+                held = set(positions.keys())
+                n_short      = min(n_long, len(preds) - n_long)
+                short_assets = [a for a in preds.index[-n_short:] if a not in held]
+                # Shorts schließen die nicht mehr Bottom-N sind
+                for asset, pos in list(positions.items()):
+                    if pos['direction'] == -1:
+                        asset_rank = rank_of.get(asset, 0)
+                        if asset_rank < len(preds) - n_short - rotation_buffer:
+                            _close_position(asset, pos, date, 'rotation_short', regime)
+                            del positions[asset]
+                # Neue Shorts eröffnen
+                held = set(positions.keys())
+                short_free = n_short - sum(1 for p in positions.values() if p['direction'] == -1)
+                if short_free > 0 and cash > 0:
+                    new_shorts = [a for a in preds.index[-n_short:] if a not in held][:short_free]
+                    per_position = cash / max(len(new_shorts), 1)
+                    for asset in new_shorts:
+                        price = _get_price(price_cache, asset, date)
+                        if price is None or price <= 0:
+                            continue
+                        shares = (per_position * (1 - fees)) / price
+                        positions[asset] = {
+                            'shares':    shares,
+                            'entry':     price,
+                            'direction': -1,
+                            'hold_days': 0,
+                        }
+                        cash += per_position * (1 - fees)
+
+            # Hold-Days aktualisieren
+            for pos in positions.values():
+                pos['hold_days'] = pos.get('hold_days', 0) + 1
 
             # ── Equity berechnen ──────────────────────────────────────────
             portfolio_value = cash + _position_value(positions, price_cache, date)
             equity.append(portfolio_value)
             equity_dates.append(date)
 
-    # Letzte Positionen auflösen
+    # Letzte Positionen auflösen (Ende des Backtests)
     if positions and equity_dates:
         last_date = equity_dates[-1]
-        for asset, pos in positions.items():
-            price = _get_price(price_cache, asset, last_date)
-            if price:
-                cash += pos['shares'] * price * (1 - fees) * pos['direction']
+        for asset, pos in list(positions.items()):
+            _close_position(asset, pos, last_date, 'end_of_backtest', 'n/a')
         positions = {}
 
     # ── Metriken berechnen ────────────────────────────────────────────────────
@@ -360,8 +413,11 @@ def run_backtest(
     daily_rets   = np.diff(equity_arr) / (equity_arr[:-1] + 1e-9)
     sharpe       = (daily_rets.mean() / (daily_rets.std() + 1e-9)) * np.sqrt(252)
 
-    wins  = [t for t in trade_log if t['pnl_pct'] > 0]
-    win_r = len(wins) / len(trade_log) * 100 if trade_log else 0
+    wins      = [t for t in trade_log if t['pnl_pct'] > 0]
+    win_r     = len(wins) / len(trade_log) * 100 if trade_log else 0
+    avg_hold  = sum(t.get('hold_days', 0) for t in trade_log) / len(trade_log) if trade_log else 0
+    stop_hits = sum(1 for t in trade_log if t.get('exit_reason') == 'stop_loss')
+    rotations = sum(1 for t in trade_log if 'rotation' in t.get('exit_reason', ''))
 
     logger.success("═" * 55)
     logger.success(f"BACKTEST: {strategy_name}")
@@ -371,18 +427,23 @@ def run_backtest(
     logger.success(f"  Sharpe Ratio  : {sharpe:.3f}")
     logger.success(f"  Trades        : {len(trade_log)}")
     logger.success(f"  Win Rate      : {win_r:.1f}%")
+    logger.success(f"  Avg Hold Days : {avg_hold:.1f}")
+    logger.success(f"  Stop-Loss Hits: {stop_hits}  |  Rotations: {rotations}")
     logger.success("═" * 55)
 
     return {
-        'strategy':     strategy_name,
-        'total_return': round(total_return, 2),
-        'max_drawdown': round(max_dd, 2),
-        'sharpe':       round(sharpe, 3),
-        'n_trades':     len(trade_log),
-        'win_rate':     round(win_r, 1),
-        'equity':       equity_arr.tolist(),
-        'equity_dates': [str(d.date()) for d in equity_dates],
-        'trade_log':    trade_log,
+        'strategy':      strategy_name,
+        'total_return':  round(total_return, 2),
+        'max_drawdown':  round(max_dd, 2),
+        'sharpe':        round(sharpe, 3),
+        'n_trades':      len(trade_log),
+        'win_rate':      round(win_r, 1),
+        'avg_hold_days': round(avg_hold, 1),
+        'stop_loss_hits': stop_hits,
+        'rotations':     rotations,
+        'equity':        equity_arr.tolist(),
+        'equity_dates':  [str(d.date()) for d in equity_dates],
+        'trade_log':     trade_log,
     }
 
 
