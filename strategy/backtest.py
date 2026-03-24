@@ -66,6 +66,77 @@ def build_price_cache(
     return cache
 
 
+# ── ATR-Cache (Average True Range) ────────────────────────────────────────────
+
+def compute_atr(
+    high:   pd.Series,
+    low:    pd.Series,
+    close:  pd.Series,
+    period: int = 14,
+) -> pd.Series:
+    """
+    Berechnet Wilder's Average True Range (ATR) per pandas.
+
+    True Range (TR) kombiniert drei Volatilitätskomponenten:
+      1. Tages-Range:         H - L
+      2. Overnight-Gap oben:  |H - prev_Close|
+      3. Overnight-Gap unten: |L - prev_Close|
+
+    Wilder's Glättung entspricht einem EWM mit alpha = 1/period,
+    was äquivalent zu com = period - 1 ist.
+
+    Robust gegen Lücken/Gaps: Gaps fließen als Overnight-Komponenten in
+    die TR ein und erhöhen den ATR automatisch, ohne Sonderbehandlung.
+    """
+    prev_close = close.shift(1)
+    tr = pd.concat(
+        [
+            (high - low).rename('hl'),
+            (high - prev_close).abs().rename('hpc'),
+            (low  - prev_close).abs().rename('lpc'),
+        ],
+        axis=1,
+    ).max(axis=1)
+    return tr.ewm(com=period - 1, min_periods=period).mean()
+
+
+def build_atr_cache(
+    assets:  list[str],
+    raw_dir: Path = RAW_DIR,
+    period:  int  = 14,
+) -> dict[str, pd.Series]:
+    """
+    Lädt OHLCV-Daten und berechnet den ATR einmalig für alle Assets.
+
+    Wird einmalig vor dem Backtest aufgebaut und dann pro Tag/Asset per
+    _get_atr() nachgeschlagen — kein wiederholtes Einlesen von Disk.
+
+    Returns:
+        Dict: asset-Name → pd.Series(index=DatetimeIndex, values=ATR)
+              NaN-Werte in den ersten `period` Zeilen sind erwartet.
+    """
+    cache: dict[str, pd.Series] = {}
+    missing_cols: list[str]     = []
+
+    for asset in assets:
+        fpath = raw_dir / f"{asset.replace('.', '_')}_1d.parquet"
+        if not fpath.exists():
+            continue
+        try:
+            df = pd.read_parquet(fpath, columns=['high', 'low', 'close'])
+            df.index = pd.to_datetime(df.index)
+            cache[asset] = compute_atr(df['high'], df['low'], df['close'], period)
+        except Exception as exc:
+            # Fehlende high/low-Spalten (z.B. bei ETF-Proxys) still überspringen
+            missing_cols.append(asset)
+            logger.debug(f"atr_cache: {asset} übersprungen ({exc})")
+
+    if missing_cols:
+        logger.warning(f"atr_cache: {len(missing_cols)} Assets ohne OHLCV-Spalten übersprungen")
+    logger.info(f"atr_cache: {len(cache)}/{len(assets)} Assets geladen (period={period})")
+    return cache
+
+
 # ── Modell laden ──────────────────────────────────────────────────────────────
 
 def load_fold_model(ckpt_path: str, device: str) -> tuple[CrossSectionalLSTM, dict]:
@@ -187,14 +258,19 @@ def run_backtest(
     fees:             float = 0.001,  # 0.1% Transaktionskosten pro Seite
     init_cash:        float = 10_000.0,
     seq_len:          int   = 64,
-    # Dynamisches Positions-Management
+    # ATR-basierter Trailing Stop (bevorzugt)
+    use_atr_trailing: bool  = True,   # ATR-Trailing aktivieren
+    atr_period:       int   = 14,     # ATR-Periode in Handelstagen
+    atr_k:            float = 2.5,    # Multiplikator: stop = close - k * ATR
+    # Fallback: fester Stop-Loss (greift wenn kein ATR verfügbar)
     stop_loss_pct:    float = 0.05,   # 5% Stop-Loss vom Einstiegskurs
     rotation_buffer:  int   = 2,      # Rotation nur wenn neuer Kandidat >= buffer Ränge besser
     # Regime-Filter
     use_regime:       bool  = True,   # Adaptives N aktivieren
     spy_ticker:       str   = "SPY",  # Referenz-Asset für Regime
-    # Optionaler Pre-built Price-Cache
+    # Optionale Pre-built Caches (werden intern aufgebaut wenn None)
     price_cache:      Optional[dict] = None,
+    atr_cache:        Optional[dict] = None,
 ) -> dict:
     """
     Führt den Cross-Sectional Backtest über alle Folds durch.
@@ -202,21 +278,31 @@ def run_backtest(
     Täglich:
       1. Regime bestimmen (adaptives N)
       2. Frische Modell-Vorhersagen für alle Assets
-      3. Jede gehaltene Position prüfen:
-         a. Stop-Loss: exit wenn Verlust > stop_loss_pct
+      3. ATR-Trailing-Stop aller Long-Positionen nach oben nachziehen:
+           new_stop = max(old_stop, close - atr_k * ATR)
+      4. Jede gehaltene Position prüfen:
+         a. ATR-Trailing-Stop: exit wenn close < trailing_stop
+            (Fallback: fester stop_loss_pct wenn kein ATR verfügbar)
          b. Rotation: exit wenn Rang schlechter als n_long + rotation_buffer
             UND ein freier besserer Kandidat existiert
-      4. Freie Slots mit den besten ungehaltenen Top-N Kandidaten befüllen
-      5. Positionen können beliebig lang gehalten werden (kein festes Zeitlimit)
+      5. Freie Slots mit den besten ungehaltenen Top-N Kandidaten befüllen
+      6. Positionen können beliebig lang gehalten werden (kein festes Zeitlimit)
     """
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    # Price-Cache einmalig aufbauen (falls nicht von außen übergeben)
+    # Caches einmalig aufbauen falls nicht von außen übergeben
+    all_assets_for_cache = list(asset_map.keys())
+    if use_regime and spy_ticker not in all_assets_for_cache:
+        all_assets_for_cache.append(spy_ticker)
+
     if price_cache is None:
-        all_assets = list(asset_map.keys())
-        if use_regime and spy_ticker not in all_assets:
-            all_assets.append(spy_ticker)
-        price_cache = build_price_cache(all_assets)
+        price_cache = build_price_cache(all_assets_for_cache)
+
+    if atr_cache is None and use_atr_trailing:
+        atr_cache = build_atr_cache(
+            list(asset_map.keys()),  # SPY braucht keinen ATR-Cache
+            period=atr_period,
+        )
 
     # SPY Preisreihe für Regime-Filter aus Cache
     spy_prices = None
@@ -236,9 +322,14 @@ def run_backtest(
     equity_dates = []
 
     strategy_name = "Long-Short" if long_short else "Long-Only"
+    stop_desc = (
+        f"ATR-Trailing(period={atr_period}, k={atr_k})"
+        if use_atr_trailing and atr_cache
+        else f"Fixed-Stop({stop_loss_pct*100:.1f}%)"
+    )
     logger.info(
         f"Backtest: {strategy_name}  n_max={n_max}  fees={fees:.3f}  "
-        f"stop_loss={stop_loss_pct*100:.1f}%  rotation_buffer={rotation_buffer}"
+        f"stop={stop_desc}  rotation_buffer={rotation_buffer}"
     )
 
     def _close_position(asset: str, pos: dict, date, reason: str, regime: str) -> None:
@@ -303,7 +394,26 @@ def run_backtest(
             # Rang-Lookup: asset → Rang (0 = bester)
             rank_of = {asset: i for i, asset in enumerate(preds.index)}
 
-            # ── Stop-Loss & Rotation prüfen ───────────────────────────────
+            # ── ATR-Trailing-Stop täglich nachziehen (nur Long, nur nach oben) ──
+            # Formel: stop_candidate = close - k * ATR
+            #         new_stop       = max(old_stop, stop_candidate)
+            # So wird der Stop bei steigenden Kursen mitgezogen, nie gesenkt.
+            if use_atr_trailing and atr_cache:
+                for asset, pos in positions.items():
+                    if pos['direction'] != 1:
+                        continue
+                    current_price = _get_price(price_cache, asset, date)
+                    atr_val       = _get_atr(atr_cache, asset, date)
+                    if current_price is None or atr_val is None:
+                        continue
+                    stop_candidate = current_price - atr_k * atr_val
+                    # Nur nach oben nachziehen — niemals den Stop senken
+                    pos['trailing_stop'] = max(
+                        pos.get('trailing_stop', stop_candidate),
+                        stop_candidate,
+                    )
+
+            # ── Stop & Rotation prüfen ────────────────────────────────────
             to_close: list[tuple[str, str]] = []  # (asset, reason)
 
             for asset, pos in positions.items():
@@ -311,11 +421,18 @@ def run_backtest(
                 if current_price is None:
                     continue
 
-                # a) Stop-Loss
-                gross_loss = (current_price - pos['entry']) / pos['entry'] * pos['direction']
-                if gross_loss < -stop_loss_pct:
-                    to_close.append((asset, 'stop_loss'))
-                    continue
+                # a) Stop-Loss:
+                #    Bevorzugt ATR-Trailing (volatilitätsangepasst),
+                #    Fallback auf festen prozentualen Stop wenn kein ATR da.
+                if use_atr_trailing and pos.get('trailing_stop') is not None:
+                    if current_price < pos['trailing_stop']:
+                        to_close.append((asset, 'atr_trailing_stop'))
+                        continue
+                else:
+                    gross_loss = (current_price - pos['entry']) / pos['entry'] * pos['direction']
+                    if gross_loss < -stop_loss_pct:
+                        to_close.append((asset, 'stop_loss'))
+                        continue
 
                 # b) Rotation: nur wenn Rang deutlich außerhalb Top-N
                 asset_rank = rank_of.get(asset, len(preds))
@@ -343,15 +460,24 @@ def run_backtest(
                 if new_longs and cash > 0:
                     per_position = cash / len(new_longs)
                     for asset in new_longs:
-                        price = _get_price(price_cache, asset, date)
+                        price   = _get_price(price_cache, asset, date)
+                        atr_val = _get_atr(atr_cache, asset, date) if (use_atr_trailing and atr_cache) else None
                         if price is None or price <= 0:
                             continue
                         shares = (per_position * (1 - fees)) / price
+                        # Initialer Trailing-Stop beim Einstieg: close - k * ATR
+                        # (Fallback auf prozentualen Stop wenn kein ATR verfügbar)
+                        initial_stop = (
+                            price - atr_k * atr_val
+                            if atr_val is not None
+                            else price * (1 - stop_loss_pct)
+                        )
                         positions[asset] = {
-                            'shares':    shares,
-                            'entry':     price,
-                            'direction': 1,
-                            'hold_days': 0,
+                            'shares':        shares,
+                            'entry':         price,
+                            'direction':     1,
+                            'hold_days':     0,
+                            'trailing_stop': initial_stop,
                         }
                         cash -= per_position
 
@@ -416,7 +542,10 @@ def run_backtest(
     wins      = [t for t in trade_log if t['pnl_pct'] > 0]
     win_r     = len(wins) / len(trade_log) * 100 if trade_log else 0
     avg_hold  = sum(t.get('hold_days', 0) for t in trade_log) / len(trade_log) if trade_log else 0
-    stop_hits = sum(1 for t in trade_log if t.get('exit_reason') == 'stop_loss')
+    stop_hits = sum(
+        1 for t in trade_log
+        if t.get('exit_reason') in ('stop_loss', 'atr_trailing_stop')
+    )
     rotations = sum(1 for t in trade_log if 'rotation' in t.get('exit_reason', ''))
 
     logger.success("═" * 55)
@@ -669,6 +798,26 @@ def _get_price(
     idx = series.index.searchsorted(date)
     idx = min(idx, len(series) - 1)
     return float(series.iloc[idx])
+
+
+def _get_atr(
+    cache: dict[str, pd.Series],
+    asset: str,
+    date:  pd.Timestamp,
+) -> Optional[float]:
+    """
+    Gibt den ATR-Wert eines Assets an einem Tag aus dem ATR-Cache zurück.
+
+    Nutzt dieselbe searchsorted-Logik wie _get_price — O(log n).
+    Gibt None zurück bei fehlendem Asset oder NaN-Wert (Warm-up-Phase).
+    """
+    series = cache.get(asset)
+    if series is None or len(series) == 0:
+        return None
+    idx = series.index.searchsorted(date)
+    idx = min(idx, len(series) - 1)
+    val = float(series.iloc[idx])
+    return None if np.isnan(val) else val
 
 
 def _position_value(

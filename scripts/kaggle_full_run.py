@@ -371,7 +371,7 @@ def step_backtest(features, targets, asset_map, fold_results):
     log_write(f"\n{'='*60}\nSCHRITT 7: Backtest [{elapsed()}]\n{'='*60}")
 
     from strategy.backtest import (
-        run_backtest, build_price_cache, plot_equity, compute_benchmarks
+        run_backtest, build_price_cache, build_atr_cache, plot_equity, compute_benchmarks
     )
 
     raw_dir     = REPO_DIR / "data" / "raw"
@@ -381,15 +381,19 @@ def step_backtest(features, targets, asset_map, fold_results):
         all_assets.append("SPY")
     price_cache = build_price_cache(all_assets, raw_dir=raw_dir)
 
+    # ATR-Cache fuer alle Assets vorab aufbauen (geteilt zwischen Long-Only und Long-Short)
+    atr_cache = build_atr_cache(list(asset_map.keys()), raw_dir=raw_dir, period=14)
+    log_write(f"  ATR-Cache: {len(atr_cache)} Assets (period=14, k=2.5)")
+
     result_a = run_backtest(
         features=features, targets=targets,
         fold_results=fold_results, asset_map=asset_map,
-        long_short=False, price_cache=price_cache,
+        long_short=False, price_cache=price_cache, atr_cache=atr_cache,
     )
     result_b = run_backtest(
         features=features, targets=targets,
         fold_results=fold_results, asset_map=asset_map,
-        long_short=True, price_cache=price_cache,
+        long_short=True, price_cache=price_cache, atr_cache=atr_cache,
     )
 
     # Benchmarks berechnen (gleicher Zeitraum wie Backtest)
