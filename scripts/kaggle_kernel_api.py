@@ -198,6 +198,12 @@ def copy_code_for_kernel(staging_dir: Path, exclude_files: tuple[str, ...]) -> N
 def write_kernel_metadata(staging_dir: Path, cfg: SubmitConfig) -> None:
     _owner, kernel_slug = cfg.kernel_id.split("/", 1)
     title = cfg.kernel_title
+    # machine_shape steuert den GPU-Typ:
+    #   "Gpu"   -> P100 (legacy, default wenn enable_gpu=true)
+    #   "T4x2"  -> Tesla T4 x2 (neuere Kaggle-GPUs, schneller)
+    # enable_gpu muss zusaetzlich auf true stehen damit GPU aktiviert wird.
+    gpu_shape = "T4x2" if cfg.accelerator == "gpu" else "None"
+
     metadata = {
         "id": cfg.kernel_id,
         "title": title,
@@ -205,8 +211,10 @@ def write_kernel_metadata(staging_dir: Path, cfg: SubmitConfig) -> None:
         "language": "python",
         "kernel_type": "script",
         "is_private": "false",
-        "enable_gpu": "true",
+        "enable_gpu": "true" if cfg.accelerator == "gpu" else "false",
+        "enable_tpu": "false",
         "enable_internet": "true" if cfg.enable_internet else "false",
+        "machine_shape": gpu_shape,
         "dataset_sources": list(cfg.dataset_sources),
         "competition_sources": [],
         "kernel_sources": [],

@@ -142,18 +142,41 @@ def resubmit(kernel_id: str) -> bool:
 
 # ── Haupt-Watch-Schleife ───────────────────────────────────────────────────────
 
+GPU_INCOMPATIBLE_EXIT = 42   # step_check_cuda() wirft SystemExit(42) bei SM<7.0
+MAX_GPU_RETRIES       = 5   # Nach N P100-Versuchen CPU-Fallback erzwingen
+
+
+def _patch_cpu_fallback() -> None:
+    """Ersetzt SystemExit(42) in kaggle_full_run.py durch CPU-Fallback."""
+    src = FULL_RUN_SCRIPT.read_text(encoding="utf-8")
+    if "FORCE_CPU_FALLBACK" in src:
+        return   # bereits gepatcht
+    patched = src.replace(
+        'raise SystemExit(42)  # Exit-Code 42 = GPU_INCOMPATIBLE_RETRY',
+        '# FORCE_CPU_FALLBACK: alle GPU-Versuche aufgebraucht\n'
+        '        os.environ["CUDA_VISIBLE_DEVICES"] = ""\n'
+        '        os.environ["KAGGLE_GPU_INCOMPATIBLE"] = "1"\n'
+        '        log_write("  MAX GPU-Retries erreicht -> CPU-Fallback erzwungen.")\n'
+        '        return'
+    )
+    FULL_RUN_SCRIPT.write_text(patched, encoding="utf-8")
+    log("  CPU-Fallback-Patch in kaggle_full_run.py angewendet.")
+
+
 def watch(kernel_id: str) -> int:
-    env        = build_env()
-    retries    = 0
-    poll_count = 0
-    run_dir    = REPO_ROOT / "kaggle_kernel_runs" / kernel_id.replace("/", "__")
+    env              = build_env()
+    retries          = 0
+    gpu_incompatible = 0   # Zaehlt P100/SM_60-Fehlschlaege
+    poll_count       = 0
+    run_dir          = REPO_ROOT / "kaggle_kernel_runs" / kernel_id.replace("/", "__")
 
     status_data = {
-        "kernel_id": kernel_id,
-        "state":     "WATCHING",
-        "retries":   retries,
-        "last_log":  "",
-        "diagnosis": "",
+        "kernel_id":        kernel_id,
+        "state":            "WATCHING",
+        "retries":          retries,
+        "gpu_incompatible": gpu_incompatible,
+        "last_log":         "",
+        "diagnosis":        "",
     }
     write_status(status_data)
     log(f"Watcher gestartet für: {kernel_id}")

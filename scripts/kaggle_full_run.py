@@ -156,11 +156,11 @@ def step_check_cuda():
     if sm_major > 0 and sm_major < 7:
         # P100 (SM_60) oder aeltere GPUs: PyTorch 2.x + Python 3.12 unterstuetzt
         # diese Architektur grundsaetzlich nicht. Reinstall waere zwecklos.
+        # -> Schnell-Fail mit Exit-Code 42 damit der Watcher sofort neu startet
+        # und auf eine kompatible GPU (T4, SM_75) hofft.
         log_write(f"  GPU SM_{sm_major}.x < 7.0: inkompatibel mit PyTorch 2.x / Python 3.12.")
-        log_write("  Kein Reinstall moeglich -> direkt CPU-Modus.")
-        os.environ["CUDA_VISIBLE_DEVICES"] = ""
-        os.environ["KAGGLE_GPU_INCOMPATIBLE"] = "1"  # Merker fuer step_train
-        return
+        log_write("  Schnell-Fail (exit 42) -> Watcher startet neu fuer andere GPU.")
+        raise SystemExit(42)  # Exit-Code 42 = GPU_INCOMPATIBLE_RETRY
 
     if sm_major >= 7:
         # SM OK, aber matmul schlug fehl -> cu124 nachinstallieren
@@ -438,6 +438,17 @@ def main() -> int:
         step_pack_artifacts(result_a, result_b)
         log_write(f"\n[DONE] Gesamtdauer: {elapsed()}")
         return 0
+    except SystemExit as se:
+        # Exit-Code 42: GPU inkompatibel (P100/SM_60) -> Watcher soll neu starten
+        code = se.code if isinstance(se.code, int) else 1
+        (WORKING / "kaggle_cmd_exit_code.txt").write_text(str(code))
+        (WORKING / "kaggle_cmd_stdout_stderr.txt").write_text(
+            f"GPU_INCOMPATIBLE_EXIT{code}: inkompatible GPU (SM<7.0), bitte neu starten."
+        )
+        (WORKING / "kernel_summary.json").write_text(
+            json.dumps({"return_code": code, "error": f"GPU_INCOMPATIBLE_EXIT{code}"})
+        )
+        raise
     except Exception as exc:
         import traceback
         tb = traceback.format_exc()
