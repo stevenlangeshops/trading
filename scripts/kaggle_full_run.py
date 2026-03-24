@@ -57,9 +57,10 @@ def _init_log() -> None:
 
 def log_write(msg: str) -> None:
     """Schreibt in pipeline.log UND auf stdout."""
+    import builtins
     ts = time.strftime("%H:%M:%S")
     line = f"[{ts}] {msg}"
-    log_write(line)
+    builtins.print(line, flush=True)   # builtins.print direkt – kein Rekursions-Risiko
     if _log_fh:
         _log_fh.write(line + "\n")
         _log_fh.flush()
