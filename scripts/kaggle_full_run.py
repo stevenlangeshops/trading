@@ -619,6 +619,71 @@ def step_persist_results():
             )
 
 
+# ── Schritt 6b: Checkpoints aus Dataset laden (Backtest-Only-Modus) ───────────
+
+def step_load_checkpoints() -> list[dict] | None:
+    """
+    Lädt vorhandene Fold-Checkpoints aus dem Kaggle Dataset 'trading-results'.
+
+    Gibt fold_results zurück wenn alle Checkpoints vorhanden sind,
+    sonst None → Training wird normal ausgeführt.
+
+    Aktivierung: Umgebungsvariable BACKTEST_ONLY=1 setzen, oder
+    automatisch wenn training-results Dataset eingebunden ist und
+    alle Checkpoint-Dateien vorhanden sind.
+    """
+    backtest_only = os.environ.get("BACKTEST_ONLY", "0") == "1"
+
+    # Mögliche Quellen für vorhandene Checkpoints
+    candidate_dirs = [
+        WORKING / "checkpoints",
+        Path("/kaggle/input/trading-results/checkpoints"),
+        Path("/kaggle/input/trading-results"),
+    ]
+
+    wf_json = None
+    ckpt_src = None
+    for d in candidate_dirs:
+        wf_candidate = d / "walk_forward_results.json"
+        if wf_candidate.exists() and list(d.glob("fold_*_best.pt")):
+            wf_json  = wf_candidate
+            ckpt_src = d
+            break
+
+    if wf_json is None:
+        if backtest_only:
+            log_write("  [WARN] BACKTEST_ONLY gesetzt aber keine Checkpoints gefunden.")
+        return None
+
+    import json as _json
+    fold_results = _json.loads(wf_json.read_text())
+
+    # Checkpoint-Pfade auf aktuellen Speicherort zeigen lassen
+    ckpt_target = WORKING / "checkpoints"
+    ckpt_target.mkdir(parents=True, exist_ok=True)
+
+    updated = []
+    for fold in fold_results:
+        src_pt = ckpt_src / f"fold_{fold['fold_id']}_best.pt"
+        dst_pt = ckpt_target / f"fold_{fold['fold_id']}_best.pt"
+        if src_pt.exists() and not dst_pt.exists():
+            shutil.copy(src_pt, dst_pt)
+        if dst_pt.exists():
+            fold["ckpt_path"] = str(dst_pt)
+            updated.append(fold)
+
+    if len(updated) == len(fold_results):
+        log_write(
+            f"  [OK] {len(updated)} Checkpoints geladen aus {ckpt_src}\n"
+            f"  Training wird uebersprungen (BACKTEST_ONLY oder vorhandene Checkpoints)."
+        )
+        return updated
+
+    missing = len(fold_results) - len(updated)
+    log_write(f"  [WARN] {missing} Checkpoints fehlen → Training wird ausgefuehrt.")
+    return None
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main() -> int:
@@ -632,7 +697,12 @@ def main() -> int:
         step_copy_data()
         features, targets = step_build_panel()
         asset_map         = step_build_asset_map(features)
-        fold_results      = step_train(features, targets, asset_map)
+
+        # Vorhandene Checkpoints nutzen wenn verfügbar (spart ~25-30 Min Training)
+        fold_results = step_load_checkpoints()
+        if fold_results is None:
+            fold_results = step_train(features, targets, asset_map)
+
         result_a, result_b = step_backtest(features, targets, asset_map, fold_results)
         step_pack_artifacts(result_a, result_b)
         log_write(f"\n[DONE] Gesamtdauer: {elapsed()}")
