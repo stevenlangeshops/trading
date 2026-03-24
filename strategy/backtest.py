@@ -161,23 +161,19 @@ def load_fold_model(ckpt_path: str, device: str) -> tuple[CrossSectionalLSTM, di
 def get_market_regime(
     spy_prices:  pd.Series,
     date:        pd.Timestamp,
-    window_fast: int   = 50,
-    window_slow: int   = 200,
-    window_st:   int   = 20,   # Kurzzeitfenster für Drawdown-Check
-    st_dd_thr:   float = 0.05, # Wenn SPY >5% unter 20d-Hoch → Regime eine Stufe runter
+    window_fast: int = 50,
+    window_slow: int = 200,
 ) -> str:
     """
-    Bestimmt das Marktregime anhand von SPY SMAs + Kurzzeitmomentum.
+    Bestimmt das Marktregime anhand von SPY SMAs.
 
-    Primär:
-        'bull'    — SPY > SMA50 > SMA200  → volle Position
-        'neutral' — SPY > SMA200 aber < SMA50 → reduzierte Position
-        'bear'    — SPY < SMA200  → Long-Only: kein Trade
+        'bull'    — SPY > SMA50 > SMA200  → volle Position (n_max)
+        'neutral' — SPY > SMA200 aber < SMA50 → reduzierte Position (n_mid)
+        'bear'    — SPY < SMA200  → Long-Only: keine neuen Longs (n_min)
 
-    Zusätzlich: wenn SPY > st_dd_thr% unter seinem 20-Tage-Hoch liegt
-    (schneller Einbruch), wird das Regime um eine Stufe herabgesetzt.
-    Schützt vor Crash-Beginn wie Covid Feb 2020 oder Tariff-Selloff 2025,
-    bevor SMA200 reagiert.
+    Bewusst NUR SMA-basiert: ein 5–10% Rücksetzer vom kurzfristigen Hoch
+    ist normales Marktgeräusch (passiert 4–6× pro Jahr) und darf nicht
+    die Positionsanzahl reduzieren — das würde bull-market Alpha vernichten.
     """
     # Timezone normalisieren (price_cache ist UTC-aware, date ggf. tz-naiv)
     spy_norm = spy_prices.copy()
@@ -193,25 +189,11 @@ def get_market_regime(
     sma_slow = float(past.iloc[-window_slow:].mean())
 
     if price > sma_fast and sma_fast > sma_slow:
-        regime = 'bull'
+        return 'bull'
     elif price > sma_slow:
-        regime = 'neutral'
+        return 'neutral'
     else:
-        regime = 'bear'
-
-    # Kurzzeit-Drawdown-Check: schneller Einbruch vom 20-Tage-Hoch
-    if len(past) >= window_st:
-        recent_high = float(past.iloc[-window_st:].max())
-        if recent_high > 0:
-            recent_dd = (price - recent_high) / recent_high
-            if recent_dd < -st_dd_thr:
-                # Regime eine Stufe herabsetzen
-                if regime == 'bull':
-                    regime = 'neutral'
-                elif regime == 'neutral':
-                    regime = 'bear'
-
-    return regime
+        return 'bear'
 
 
 def adaptive_n(
@@ -287,13 +269,19 @@ def run_backtest(
     # ATR-basierter Trailing Stop (bevorzugt)
     use_atr_trailing:  bool  = True,   # ATR-Trailing aktivieren
     atr_period:        int   = 14,     # ATR-Periode in Handelstagen
-    atr_k:             float = 3.5,    # Multiplikator: stop = close - k * ATR
-                                       # k=2.5 war zu eng (schnitt Gewinner ab),
-                                       # k=3.5 lässt normale Schwankungen durch
+    atr_k:             float = 2.5,    # Multiplikator: stop = close - k * ATR
+                                       # k=2.5: fängt graduelle Rückgänge früher ab
+                                       # ohne echte Gewinner abzuschneiden;
+                                       # k=3.5 war zu weit für hochvolatile Stocks
+                                       # (META/GOOG/TSLA bis -30%)
     atr_min_hold_days: int   = 3,      # Stop erst nach n Tagen aktiv (verhindert
                                        # frühzeitigen Exit bei Entry-Volatilität)
-    # Hard Stop: maximaler Verlust vom Einstiegskurs (übersteuert ATR-Trailing)
-    hard_stop_pct:     float = 0.15,   # 15% Hard-Stop — greift immer, unabhängig von ATR
+    # Hard Stop: maximaler Verlust vom Einstiegskurs (nur Gap-Down-Schutz)
+    # Bewusst großzügig (25%): soll nur echte Crash-Gaps abfangen, nicht
+    # normale Rücksetzer, die der ATR-Trailing-Stop besser handhabt.
+    # Analyse zeigt: 15% Hard-Stop verursachte -545% PnL-Drain durch zu
+    # frühe Exits von Positionen, die via ATR/Rotation besser geendet hätten.
+    hard_stop_pct:     float = 0.25,   # 25% Hard-Stop — nur Gap-Schutz
     # Fallback: fester Stop-Loss (greift wenn ATR nicht verfügbar)
     stop_loss_pct:     float = 0.05,   # 5% Stop-Loss vom Einstiegskurs
     rotation_buffer:  int   = 2,      # Rotation nur wenn neuer Kandidat >= buffer Ränge besser
