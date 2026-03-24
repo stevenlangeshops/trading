@@ -180,13 +180,14 @@ def run_backtest(
     fold_results: list[dict],
     asset_map:   dict[str, int],
     # Strategie-Parameter
-    n_max:       int   = 5,     # Max Positionen bei Bull-Markt
-    n_mid:       int   = 3,     # Positionen bei neutralem Markt
-    n_min:       int   = 1,     # Min Positionen bei Bär-Markt
-    long_short:  bool  = False, # True = Long-Short, False = Long-Only
-    fees:        float = 0.001, # 0.1% Transaktionskosten
-    init_cash:   float = 10_000.0,
-    seq_len:     int   = 64,
+    n_max:        int   = 5,     # Max Positionen bei Bull-Markt
+    n_mid:        int   = 3,     # Positionen bei neutralem Markt
+    n_min:        int   = 1,     # Min Positionen bei Bär-Markt
+    long_short:   bool  = False, # True = Long-Short, False = Long-Only
+    fees:         float = 0.001, # 0.1% Transaktionskosten
+    init_cash:    float = 10_000.0,
+    seq_len:      int   = 64,
+    holding_days: int   = 11,   # Haltedauer in Handelstagen (muss zum Vorhersage-Horizont passen)
     # Regime-Filter
     use_regime:  bool  = True,  # Adaptives N aktivieren
     spy_ticker:  str   = "SPY", # Referenz-Asset für Regime
@@ -230,7 +231,9 @@ def run_backtest(
     equity_dates = []
 
     strategy_name = "Long-Short" if long_short else "Long-Only"
-    logger.info(f"Backtest: {strategy_name}  n_max={n_max}  fees={fees:.3f}")
+    logger.info(f"Backtest: {strategy_name}  n_max={n_max}  fees={fees:.3f}  holding={holding_days}d")
+
+    day_counter = 0   # zaehlt Handelstage seit letztem Rebalancing
 
     for fold in fold_results:
         ckpt_path = fold['ckpt_path']
@@ -259,10 +262,19 @@ def run_backtest(
                 regime = get_market_regime(spy_prices, date)
                 n_long = adaptive_n(regime, n_max, n_mid, n_min)
                 if regime == 'bear' and long_short:
-                    n_long = 0   # Im Bärenmarkt: nur Shorts
+                    n_long = 0
             else:
                 regime = 'neutral'
                 n_long = n_mid
+
+            rebalance_today = (day_counter % holding_days == 0)
+            day_counter += 1
+
+            if not rebalance_today:
+                # Nur Equity tracken, keine Trades
+                equity.append(cash + _position_value(positions, price_cache, date))
+                equity_dates.append(date)
+                continue
 
             # ── Vorhersagen generieren ────────────────────────────────────
             preds = predict_cross_section(
@@ -273,7 +285,7 @@ def run_backtest(
                 equity_dates.append(date)
                 continue
 
-            # ── Bestehende Positionen auflösen ────────────────────────────
+            # ── Bestehende Positionen auflösen (nur bei Rebalancing) ──────
             for asset, pos in list(positions.items()):
                 price = _get_price(price_cache, asset, date)
                 if price is None:
@@ -294,7 +306,6 @@ def run_backtest(
             n_actual   = min(n_long, len(preds))
             top_assets = preds.index[:n_actual].tolist()
 
-            # Short-Seite: Bottom-N (nur Variante B)
             short_assets = []
             if long_short and n_actual > 0:
                 n_short      = min(n_actual, len(preds) - n_actual)
@@ -320,10 +331,9 @@ def run_backtest(
                 price = _get_price(price_cache, asset, date)
                 if price is None or price <= 0:
                     continue
-                # Short: wir erhalten den Erlös sofort
                 shares = (per_position * (1 - fees)) / price
                 positions[asset] = {'shares': shares, 'entry': price, 'direction': -1}
-                cash += per_position * (1 - fees)  # Short-Erlös
+                cash += per_position * (1 - fees)
 
             # ── Equity berechnen ──────────────────────────────────────────
             portfolio_value = cash + _position_value(positions, price_cache, date)
