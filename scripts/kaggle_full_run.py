@@ -370,10 +370,15 @@ def step_train(features, targets, asset_map):
 def step_backtest(features, targets, asset_map, fold_results):
     log_write(f"\n{'='*60}\nSCHRITT 7: Backtest [{elapsed()}]\n{'='*60}")
 
-    from strategy.backtest import run_backtest, build_price_cache, plot_equity
+    from strategy.backtest import (
+        run_backtest, build_price_cache, plot_equity, compute_benchmarks
+    )
 
     raw_dir     = REPO_DIR / "data" / "raw"
+    # SPY fuer Regime-Filter und Benchmark laden
     all_assets  = list(asset_map.keys())
+    if "SPY" not in all_assets:
+        all_assets.append("SPY")
     price_cache = build_price_cache(all_assets, raw_dir=raw_dir)
 
     result_a = run_backtest(
@@ -387,7 +392,33 @@ def step_backtest(features, targets, asset_map, fold_results):
         long_short=True, price_cache=price_cache,
     )
 
-    # JSON ohne equity/trade_log (zu gross)
+    # Benchmarks berechnen (gleicher Zeitraum wie Backtest)
+    benchmarks = {}
+    try:
+        benchmarks = compute_benchmarks(
+            price_cache=price_cache,
+            equity_dates=result_a.get("equity_dates", []),
+            asset_map=asset_map,
+            init_cash=10_000.0,
+        )
+        # Benchmark-Ergebnisse loggen
+        for key in ("spy", "ew_bh", "ew_rebalanced"):
+            bm = benchmarks.get(key, {})
+            if bm.get("total_return") is not None:
+                log_write(
+                    f"  Benchmark {bm['label']:30s}  "
+                    f"Return: {bm['total_return']:+7.1f}%  "
+                    f"Sharpe: {bm.get('sharpe', 0):.3f}"
+                )
+        with open(WORKING / "benchmarks.json", "w") as f:
+            # Ohne equity-Liste (zu gross)
+            slim_bm = {k: {kk: vv for kk, vv in v.items() if kk != "equity"}
+                       for k, v in benchmarks.items() if k != "dates"}
+            json.dump(slim_bm, f, indent=2)
+    except Exception as e:
+        log_write(f"  [WARN] compute_benchmarks: {e}")
+
+    # JSON ohne equity/trade_log (zu gross fuer Uebersicht)
     def slim(r):
         return {k: v for k, v in r.items() if k not in ("equity", "trade_log", "equity_dates")}
 
@@ -403,7 +434,9 @@ def step_backtest(features, targets, asset_map, fold_results):
         json.dump(result_b.get("trade_log", []), f, indent=2)
 
     try:
-        plot_equity(result_a, result_b, save_path=str(WORKING / "equity_curve.png"))
+        plot_equity(result_a, result_b,
+                    benchmarks=benchmarks,
+                    save_path=str(WORKING / "equity_curve.png"))
     except Exception as e:
         log_write(f"  [WARN] plot_equity: {e}")
 
@@ -420,6 +453,7 @@ def step_pack_artifacts(result_a: dict, result_b: dict):
         WORKING / "walk_forward_results.json",
         WORKING / "backtest_results_long_only.json",
         WORKING / "backtest_results_long_short.json",
+        WORKING / "benchmarks.json",
         WORKING / "trade_log_long_only.json",
         WORKING / "trade_log_long_short.json",
         WORKING / "equity_curve.png",

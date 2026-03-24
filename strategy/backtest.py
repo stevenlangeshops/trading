@@ -447,20 +447,145 @@ def run_backtest(
     }
 
 
+# ── Benchmark-Berechnung ──────────────────────────────────────────────────────
+
+def compute_benchmarks(
+    price_cache:  dict[str, pd.Series],
+    equity_dates: list,
+    asset_map:    dict[str, int],
+    spy_ticker:   str = "SPY",
+    init_cash:    float = 10_000.0,
+) -> dict:
+    """
+    Berechnet drei Benchmarks über denselben Zeitraum wie der Backtest:
+
+    1. SPY Buy & Hold          — Standard-Marktbenchmark (S&P 500)
+    2. EW Universe B&H         — Equal-weighted Buy & Hold aller 79 Assets
+                                 (passives "alles halten" im eigenen Universum)
+    3. EW Universe Rebalanced  — Monatlich auf equal-weight zurückgewichtet
+                                 (fängt den "Rebalancing Premium" ein)
+
+    Für einen Cross-Sectional-Strategievergleich ist EW Universe der fairste
+    Benchmark: er zeigt ob unsere Aktienauswahl dem "einfach alles halten"
+    überlegen ist, ohne Marktlevel-Effekte herauszurechnen.
+    """
+    if not equity_dates:
+        return {}
+
+    dates = pd.DatetimeIndex([pd.Timestamp(d) for d in equity_dates])
+    start_date = dates[0]
+    end_date   = dates[-1]
+
+    # ── 1. SPY Buy & Hold ─────────────────────────────────────────────────
+    spy_series  = price_cache.get(spy_ticker)
+    spy_equity  = []
+    spy_ret     = None
+    if spy_series is not None:
+        p0 = float(spy_series[spy_series.index <= start_date].iloc[-1]) if len(spy_series[spy_series.index <= start_date]) > 0 else None
+        if p0:
+            for d in dates:
+                p = _get_price(price_cache, spy_ticker, d)
+                spy_equity.append(init_cash * (p / p0) if p else (spy_equity[-1] if spy_equity else init_cash))
+            spy_ret = (spy_equity[-1] / init_cash - 1) * 100
+
+    # ── 2. EW Universe Buy & Hold (kein Rebalancing) ─────────────────────
+    assets = list(asset_map.keys())
+    # Startpreise aller Assets
+    p0_map: dict[str, float] = {}
+    for a in assets:
+        s = price_cache.get(a)
+        if s is not None:
+            past = s[s.index <= start_date]
+            if len(past) > 0:
+                p0_map[a] = float(past.iloc[-1])
+
+    ew_assets     = [a for a in assets if a in p0_map]
+    ew_equity     = []
+    ew_ret        = None
+    if ew_assets:
+        n = len(ew_assets)
+        per_asset_cash = init_cash / n
+        # Anteile am Starttag kaufen (keine Fees für Benchmark)
+        shares_map = {a: per_asset_cash / p0_map[a] for a in ew_assets}
+        for d in dates:
+            total = sum(
+                shares_map[a] * (_get_price(price_cache, a, d) or p0_map[a])
+                for a in ew_assets
+            )
+            ew_equity.append(total)
+        ew_ret = (ew_equity[-1] / init_cash - 1) * 100
+
+    # ── 3. EW Universe monatlich rebalanciert ─────────────────────────────
+    ewr_equity    = [init_cash]
+    last_rebal    = start_date
+    rebal_shares  = {a: (init_cash / len(ew_assets)) / p0_map[a] for a in ew_assets} if ew_assets else {}
+    ewr_ret       = None
+
+    if ew_assets:
+        for d in dates:
+            # Monatliches Rebalancing: Portfoliowert gleichmäßig neu aufteilen
+            if (d.year * 12 + d.month) > (last_rebal.year * 12 + last_rebal.month):
+                port_value = sum(
+                    rebal_shares[a] * (_get_price(price_cache, a, d) or p0_map[a])
+                    for a in ew_assets
+                )
+                per_asset = port_value / len(ew_assets)
+                rebal_shares = {
+                    a: per_asset / max(_get_price(price_cache, a, d) or p0_map[a], 1e-9)
+                    for a in ew_assets
+                }
+                last_rebal = d
+            total = sum(
+                rebal_shares[a] * (_get_price(price_cache, a, d) or p0_map[a])
+                for a in ew_assets
+            )
+            ewr_equity.append(total)
+        ewr_equity = ewr_equity[1:]  # ersten Startwert entfernen
+        ewr_ret = (ewr_equity[-1] / init_cash - 1) * 100
+
+    # Sharpe-Berechnung für Benchmarks
+    def _sharpe(eq_list):
+        arr  = np.array(eq_list)
+        rets = np.diff(arr) / (arr[:-1] + 1e-9)
+        return float((rets.mean() / (rets.std() + 1e-9)) * np.sqrt(252))
+
+    def _maxdd(eq_list):
+        arr  = np.array(eq_list)
+        peak = np.maximum.accumulate(arr)
+        return float(((arr - peak) / (peak + 1e-9) * 100).min())
+
+    result = {
+        'dates':          [str(d.date()) for d in dates],
+        'spy':            {'label': 'SPY Buy & Hold',           'equity': spy_equity,  'total_return': round(spy_ret, 2) if spy_ret is not None else None, 'sharpe': _sharpe(spy_equity) if spy_equity else None, 'max_drawdown': _maxdd(spy_equity) if spy_equity else None},
+        'ew_bh':          {'label': 'EW Universe Buy & Hold',   'equity': ew_equity,   'total_return': round(ew_ret, 2) if ew_ret is not None else None,  'sharpe': _sharpe(ew_equity) if ew_equity else None,  'max_drawdown': _maxdd(ew_equity) if ew_equity else None},
+        'ew_rebalanced':  {'label': 'EW Universe Rebalanciert', 'equity': ewr_equity,  'total_return': round(ewr_ret, 2) if ewr_ret is not None else None, 'sharpe': _sharpe(ewr_equity) if ewr_equity else None, 'max_drawdown': _maxdd(ewr_equity) if ewr_equity else None},
+    }
+
+    logger.info("─" * 55)
+    logger.info("BENCHMARKS (gleicher Zeitraum wie Backtest)")
+    for k, bm in result.items():
+        if k == 'dates' or bm.get('total_return') is None:
+            continue
+        logger.info(f"  {bm['label']:30s}  Return: {bm['total_return']:+7.1f}%  Sharpe: {bm.get('sharpe', 0):.3f}  MaxDD: {bm.get('max_drawdown', 0):.1f}%")
+    logger.info("─" * 55)
+
+    return result
+
+
 # ── Equity-Kurve plotten ──────────────────────────────────────────────────────
 
 def plot_equity(
-    result_a: dict,
-    result_b: dict,
-    bh_return: Optional[float] = None,
-    save_path: str = '/kaggle/working/equity_curve.png',
+    result_a:   dict,
+    result_b:   dict,
+    benchmarks: Optional[dict] = None,
+    save_path:  str = '/kaggle/working/equity_curve.png',
 ):
-    """Vergleichs-Plot: Long-Only vs Long-Short vs Buy & Hold."""
+    """Vergleichs-Plot: Long-Only vs Long-Short vs Benchmarks."""
     try:
         import matplotlib.pyplot as plt
         import matplotlib.dates as mdates
 
-        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 10))
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 12))
 
         # ── Equity Kurven ─────────────────────────────────────────────────
         dates_a = pd.to_datetime(result_a['equity_dates'])
@@ -469,33 +594,50 @@ def plot_equity(
         eq_b    = np.array(result_b['equity'])
 
         ax1.plot(dates_a, eq_a / eq_a[0] * 100 - 100,
-                 label=f"Long-Only  (Return: {result_a['total_return']:+.1f}%)",
-                 color='#2196F3', linewidth=2)
+                 label=f"Long-Only  ({result_a['total_return']:+.1f}%)",
+                 color='#2196F3', linewidth=2.5, zorder=5)
         ax1.plot(dates_b, eq_b / eq_b[0] * 100 - 100,
-                 label=f"Long-Short (Return: {result_b['total_return']:+.1f}%)",
-                 color='#4CAF50', linewidth=2)
-        if bh_return is not None:
-            ax1.axhline(bh_return, color='#FF9800', linestyle='--',
-                        linewidth=1.5, label=f"SPY Buy & Hold ({bh_return:+.1f}%)")
+                 label=f"Long-Short ({result_b['total_return']:+.1f}%)",
+                 color='#4CAF50', linewidth=2.5, zorder=5)
+
+        # Benchmarks einzeichnen
+        bm_colors = {'spy': '#FF9800', 'ew_bh': '#9C27B0', 'ew_rebalanced': '#F44336'}
+        if benchmarks:
+            bm_dates = pd.to_datetime(benchmarks.get('dates', []))
+            for key, color in bm_colors.items():
+                bm = benchmarks.get(key, {})
+                if bm.get('equity') and bm.get('total_return') is not None:
+                    eq_bm = np.array(bm['equity'])
+                    ax1.plot(bm_dates[:len(eq_bm)], eq_bm / eq_bm[0] * 100 - 100,
+                             label=f"{bm['label']} ({bm['total_return']:+.1f}%)",
+                             color=color, linewidth=1.5, linestyle='--', alpha=0.85)
+
         ax1.axhline(0, color='gray', linewidth=0.8, alpha=0.5)
-        ax1.set_title('Equity-Kurve: Long-Only vs Long-Short', fontsize=14, fontweight='bold')
+        ax1.set_title('Equity-Kurve vs Benchmarks', fontsize=14, fontweight='bold')
         ax1.set_ylabel('Kumulativer Return (%)')
-        ax1.legend()
+        ax1.legend(loc='upper left', fontsize=9)
         ax1.grid(True, alpha=0.3)
         ax1.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m'))
 
         # ── Drawdown ──────────────────────────────────────────────────────
         def drawdown(eq):
-            peak = np.maximum.accumulate(eq)
-            return (eq - peak) / (peak + 1e-9) * 100
+            arr  = np.array(eq)
+            peak = np.maximum.accumulate(arr)
+            return (arr - peak) / (peak + 1e-9) * 100
 
-        ax2.fill_between(dates_a, drawdown(eq_a), 0, alpha=0.4, color='#2196F3',
+        ax2.fill_between(dates_a, drawdown(eq_a), 0, alpha=0.35, color='#2196F3',
                          label=f"Long-Only  (MaxDD: {result_a['max_drawdown']:.1f}%)")
-        ax2.fill_between(dates_b, drawdown(eq_b), 0, alpha=0.4, color='#4CAF50',
+        ax2.fill_between(dates_b, drawdown(eq_b), 0, alpha=0.35, color='#4CAF50',
                          label=f"Long-Short (MaxDD: {result_b['max_drawdown']:.1f}%)")
-        ax2.set_title('Drawdown', fontsize=12)
+        # SPY Drawdown als Referenz
+        if benchmarks and benchmarks.get('spy', {}).get('equity'):
+            eq_spy = np.array(benchmarks['spy']['equity'])
+            ax2.plot(bm_dates[:len(eq_spy)], drawdown(eq_spy),
+                     color='#FF9800', linewidth=1.2, linestyle='--', alpha=0.8,
+                     label=f"SPY (MaxDD: {benchmarks['spy'].get('max_drawdown', 0):.1f}%)")
+        ax2.set_title('Drawdown-Vergleich', fontsize=12)
         ax2.set_ylabel('Drawdown (%)')
-        ax2.legend()
+        ax2.legend(fontsize=9)
         ax2.grid(True, alpha=0.3)
         ax2.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m'))
 
