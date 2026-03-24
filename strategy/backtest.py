@@ -805,6 +805,22 @@ def plot_equity(
 
 # ── Hilfsfunktionen ───────────────────────────────────────────────────────────
 
+def _align_date_tz(date: pd.Timestamp, index: pd.DatetimeIndex) -> pd.Timestamp:
+    """
+    Gleicht die Timezone von `date` an `index` an, damit searchsorted funktioniert.
+
+    Equity-Dates werden als naive Strings gespeichert ("2020-01-28"),
+    der Price-Cache-Index ist UTC-aware. Ohne Angleichung wirft searchsorted:
+    'Cannot compare tz-naive and tz-aware datetime-like objects'.
+    """
+    date = pd.Timestamp(date)
+    if index.tz is not None and date.tzinfo is None:
+        return date.tz_localize("UTC")
+    if index.tz is None and date.tzinfo is not None:
+        return date.tz_localize(None)
+    return date
+
+
 def _get_price(
     cache: dict[str, pd.Series],
     asset: str,
@@ -819,6 +835,7 @@ def _get_price(
     series = cache.get(asset)
     if series is None or len(series) == 0:
         return None
+    date = _align_date_tz(date, series.index)
     idx = series.index.searchsorted(date)
     idx = min(idx, len(series) - 1)
     return float(series.iloc[idx])
@@ -838,6 +855,7 @@ def _get_atr(
     series = cache.get(asset)
     if series is None or len(series) == 0:
         return None
+    date = _align_date_tz(date, series.index)
     idx = series.index.searchsorted(date)
     idx = min(idx, len(series) - 1)
     val = float(series.iloc[idx])

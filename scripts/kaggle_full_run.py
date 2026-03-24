@@ -117,6 +117,11 @@ def step_check_cuda():
     """
     log_write(f"\n{'='*60}\nSCHRITT 1b: CUDA Health-Check [{elapsed()}]\n{'='*60}")
 
+    # Stale Flags aus eventuell vorherigem Notebook-Run immer zuerst löschen,
+    # damit Env-Vars aus einem P100-Run nicht in einen T4-Run hinüberlaufen.
+    os.environ.pop("KAGGLE_GPU_INCOMPATIBLE", None)
+    os.environ.pop("CUDA_VISIBLE_DEVICES",    None)
+
     # Schritt 1: SM-Version und matmul-Test in Subprocess
     probe_code = (
         "import torch, sys, warnings; warnings.filterwarnings('ignore'); "
@@ -153,7 +158,8 @@ def step_check_cuda():
     cuda_ok = r.returncode == 0 and "matmul=OK" in probe_out
 
     if cuda_ok:
-        log_write("  CUDA : OK -> GPU-Training aktiv")
+        log_write("  CUDA : OK -> GPU-Training aktiv (SM gefunden, matmul=OK)")
+        os.environ["KAGGLE_GPU_OK"] = "1"
         return
 
     if sm_major > 0 and sm_major < 7:
@@ -199,6 +205,7 @@ def step_check_cuda():
                     try:
                         _a = _torch.zeros(4, 4, device="cuda") @ _torch.ones(4, 4, device="cuda")
                         log_write(f"  Hauptprozess CUDA matmul=OK -> GPU-Modus (SM={_sm})")
+                        os.environ["KAGGLE_GPU_OK"] = "1"
                         return   # GPU funktioniert -> kein CPU-Flag setzen
                     except Exception as _e:
                         log_write(f"  Hauptprozess matmul fehlgeschlagen: {_e}")
@@ -337,15 +344,17 @@ def step_train(features, targets, asset_map):
 
     from models.trainer import train_walk_forward
 
-    gpu_ok = os.environ.get("KAGGLE_GPU_INCOMPATIBLE", "0") != "1"
+    # KAGGLE_GPU_OK=1 wird von step_check_cuda explizit gesetzt wenn T4/A100/etc. OK.
+    # KAGGLE_GPU_INCOMPATIBLE=1 wird gesetzt wenn P100 (SM<7) oder kein CUDA.
+    # Beide Flags werden am Anfang von step_check_cuda gelöscht; so überlebt
+    # kein stale-Flag aus einem früheren Notebook-Run ohne Kernel-Restart.
+    gpu_ok = os.environ.get("KAGGLE_GPU_OK", "0") == "1"
     if gpu_ok:
         log_write("  Modus: GPU — volle Parameter (12 Folds, 50 Epochs, hidden=128)")
         _epochs, _patience, _hidden, _layers, _step_months = 50, 7, 128, 2, 6.0
     else:
-        # CPU-Modus (P100 oder kein CUDA): gute Parameter die in ~2h fertig sind.
-        # Basis Run-12 (6 Folds, 15 Ep, hidden=64): 29min.
-        # 9 Folds, 30 Ep, hidden=96, 2 Layers: ca. 120-150 min — gut innerhalb 9h.
-        log_write("  Modus: CPU (P100 inkompatibel) — 9 Folds, 30 Ep, hidden=96")
+        # CPU-Modus (P100 oder kein CUDA): reduzierte Parameter fuer Zeitlimit.
+        log_write("  Modus: CPU — 9 Folds, 30 Ep, hidden=96")
         _epochs, _patience, _hidden, _layers, _step_months = 30, 6, 96, 2, 8.0
 
     results = train_walk_forward(
