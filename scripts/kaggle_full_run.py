@@ -11,6 +11,7 @@ Vollstaendige Trading-Bot Pipeline fuer Kaggle GPU:
   7. run_backtest() - Long-Only + Long-Short
   8. Ergebnisse als JSON + PNG speichern
   9. Alles in kaggle_artifacts.tar.gz packen
+ 10. Ergebnisse in permanentes Kaggle Dataset hochladen (busersteven/trading-results)
 
 Erwartet:
   /kaggle/input/trading-raw-data/*.parquet  (79 Parquet-Dateien)
@@ -499,6 +500,125 @@ def step_pack_artifacts(result_a: dict, result_b: dict):
     log_write("\n" + json.dumps(summary, indent=2))
 
 
+# ── Schritt 9: Ergebnisse in Kaggle Dataset persistieren ──────────────────────
+
+def step_persist_results():
+    """
+    Lädt die wichtigsten Ergebnisse in ein permanentes Kaggle Dataset hoch,
+    damit sie nach Ende der interaktiven Session nicht verloren gehen.
+
+    Die Dateien in /kaggle/working/ sind in einer interaktiven Session nur
+    temporär verfügbar (~20 Minuten nach Sessionende). Ein Kaggle Dataset
+    hingegen ist dauerhaft und kann jederzeit per API heruntergeladen werden.
+
+    Setup (einmalig):
+      1. kaggle.com → Datasets → "New Dataset" → Name: "trading-results" → Create
+      2. Notebook Settings → Add-ons → Secrets:
+           Name:  KAGGLE_KEY
+           Value: <dein API-Key, z.B. KGAT_b1c32e3f8e3fd192150c7bbfd78b8dec>
+
+    Nach jedem Run erscheint eine neue Version unter:
+      kaggle.com/busersteven/trading-results
+    Download lokal:
+      kaggle datasets download busersteven/trading-results
+    """
+    log_write(f"\n{'='*60}\nSCHRITT 9: Ergebnisse persistieren [{elapsed()}]\n{'='*60}")
+
+    # ── API-Key ermitteln ──────────────────────────────────────────────────────
+    # Bevorzuge Kaggle Notebook Secret (sicherste Methode), dann Env-Var-Fallback.
+    kaggle_key = None
+    try:
+        from kaggle_secrets import UserSecretsClient  # nur in Kaggle-Notebooks verfügbar
+        kaggle_key = UserSecretsClient().get_secret("KAGGLE_KEY")
+    except Exception:
+        pass
+    if not kaggle_key:
+        kaggle_key = os.environ.get("KAGGLE_KEY") or os.environ.get("KAGGLE_API_TOKEN")
+
+    if not kaggle_key:
+        log_write(
+            "  [SKIP] Kein KAGGLE_KEY gefunden - Ergebnisse werden nicht persistiert.\n"
+            "  Tipp: Notebook Settings → Add-ons → Secrets → KAGGLE_KEY hinzufuegen."
+        )
+        return
+
+    # ── kaggle.json konfigurieren ──────────────────────────────────────────────
+    kaggle_cfg = Path("/root/.kaggle/kaggle.json")
+    kaggle_cfg.parent.mkdir(parents=True, exist_ok=True)
+    kaggle_cfg.write_text(json.dumps({"username": "busersteven", "key": kaggle_key}))
+    kaggle_cfg.chmod(0o600)
+
+    # ── Upload-Verzeichnis befüllen ────────────────────────────────────────────
+    ts         = time.strftime("%Y%m%d_%H%M%S")
+    upload_dir = WORKING / "dataset_upload"
+    upload_dir.mkdir(exist_ok=True)
+
+    # Zu persistierende Dateien (bewusst kein .pt um Dataset-Größe gering zu halten;
+    # das vollständige tar.gz enthält die Checkpoints)
+    upload_files = [
+        "kaggle_artifacts.tar.gz",           # alles inkl. Checkpoints
+        "equity_curve.png",                  # Equity-Kurve mit Benchmarks
+        "kernel_summary.json",               # kompakte Ergebnis-Übersicht
+        "benchmarks.json",                   # SPY / EW-Vergleich
+        "backtest_results_long_only.json",
+        "backtest_results_long_short.json",
+        "walk_forward_results.json",
+        "pipeline.log",                      # vollständiges Prozess-Log
+    ]
+    copied = []
+    for fname in upload_files:
+        src = WORKING / fname
+        if src.exists():
+            shutil.copy(src, upload_dir / fname)
+            copied.append(fname)
+
+    if not copied:
+        log_write("  [SKIP] Keine Dateien zum Hochladen gefunden.")
+        return
+
+    log_write(f"  Dateien fuer Upload: {copied}")
+
+    # ── Dataset-Metadaten schreiben ────────────────────────────────────────────
+    dataset_meta = {
+        "title":    "trading-results",
+        "id":       "busersteven/trading-results",
+        "licenses": [{"name": "other"}],
+    }
+    (upload_dir / "dataset-metadata.json").write_text(json.dumps(dataset_meta, indent=2))
+
+    # ── Version hochladen ──────────────────────────────────────────────────────
+    cmd = [
+        "kaggle", "datasets", "version",
+        "-p", str(upload_dir),
+        "-m", f"Pipeline Run {ts}",
+        "--dir-mode", "zip",
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8",
+                            errors="replace")
+
+    if result.returncode == 0:
+        log_write(
+            f"  [OK] Dataset aktualisiert: https://kaggle.com/busersteven/trading-results\n"
+            f"  Lokal herunterladen: kaggle datasets download busersteven/trading-results"
+        )
+    else:
+        # Zweiter Versuch: Dataset existiert vielleicht noch nicht → erstmal anlegen
+        log_write(f"  [WARN] version fehlgeschlagen ({result.stderr[:200]}), versuche create ...")
+        cmd_create = [
+            "kaggle", "datasets", "create",
+            "-p", str(upload_dir),
+        ]
+        result2 = subprocess.run(cmd_create, capture_output=True, text=True,
+                                 encoding="utf-8", errors="replace")
+        if result2.returncode == 0:
+            log_write("  [OK] Dataset erstellt: https://kaggle.com/busersteven/trading-results")
+        else:
+            log_write(
+                f"  [FAIL] Auch create fehlgeschlagen: {result2.stderr[:400]}\n"
+                f"  Bitte manuell 'Save Version' im Notebook-UI klicken."
+            )
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main() -> int:
@@ -516,6 +636,12 @@ def main() -> int:
         result_a, result_b = step_backtest(features, targets, asset_map, fold_results)
         step_pack_artifacts(result_a, result_b)
         log_write(f"\n[DONE] Gesamtdauer: {elapsed()}")
+        # Ergebnisse dauerhaft in Kaggle Dataset speichern (non-blocking: Fehler hier
+        # brechen den erfolgreichen Run nicht ab)
+        try:
+            step_persist_results()
+        except Exception as persist_exc:
+            log_write(f"  [WARN] step_persist_results: {persist_exc}")
         return 0
     except Exception as exc:
         import traceback
@@ -537,6 +663,11 @@ def main() -> int:
                 p = WORKING / fname
                 if p.exists():
                     tf.add(str(p), arcname=fname)
+        # Auch bei Fehler versuchen zu persistieren (z.B. das Log ist wertvoll)
+        try:
+            step_persist_results()
+        except Exception:
+            pass
         return 1
 
 
