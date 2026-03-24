@@ -43,6 +43,7 @@ INPUT_DIRS = [
     Path("/kaggle/input/trading-raw-data-v2/raw"),
     Path("/kaggle/input/trading-raw-data-v2"),
 ]
+KAGGLE_INPUT = Path("/kaggle/input")
 t0 = time.time()
 
 # Zentrales Log-File das ALLES mitschreibt (stdout wird zusaetzlich gespiegelt)
@@ -209,21 +210,46 @@ def step_copy_data():
     raw_dst = REPO_DIR / "data" / "raw"
     raw_dst.mkdir(parents=True, exist_ok=True)
 
+    # Zeige was ueberhaupt unter /kaggle/input/ vorhanden ist (Diagnostik)
+    if KAGGLE_INPUT.exists():
+        entries = sorted(p.name for p in KAGGLE_INPUT.iterdir())
+        log_write(f"  /kaggle/input/ Inhalt: {entries}")
+    else:
+        log_write("  WARNUNG: /kaggle/input/ existiert nicht!")
+
     copied = 0
+
+    # Schritt 1: Vordefinierte Pfade durchsuchen
     for src_dir in INPUT_DIRS:
         if not src_dir.exists():
             log_write(f"  [SKIP] {src_dir}")
             continue
         files = list(src_dir.glob("*.parquet"))
+        if not files:
+            log_write(f"  [LEER]  {src_dir} (kein .parquet)")
+            continue
         log_write(f"  [FOUND] {src_dir}: {len(files)} Parquet-Dateien")
         for f in files:
             shutil.copy2(f, raw_dst / f.name)
             copied += 1
         break  # erste vorhandene Quelle reicht
 
+    # Schritt 2: Falls nichts gefunden -> rekursiv ALLE .parquet unter /kaggle/input/ suchen
+    if copied == 0 and KAGGLE_INPUT.exists():
+        log_write("  Durchsuche /kaggle/input/ rekursiv nach .parquet Dateien ...")
+        all_parquet = list(KAGGLE_INPUT.rglob("*.parquet"))
+        if all_parquet:
+            log_write(f"  Gefunden: {len(all_parquet)} Dateien unter {all_parquet[0].parent}")
+            for f in all_parquet:
+                shutil.copy2(f, raw_dst / f.name)
+                copied += 1
+        else:
+            log_write("  Keine .parquet Dateien unter /kaggle/input/ gefunden.")
+
     log_write(f"  {copied} Dateien nach {raw_dst} kopiert")
+
+    # Schritt 3: Fallback raw.zip
     if copied == 0:
-        # Fallback: raw.zip im Repo entpacken (falls vorhanden)
         raw_zip = REPO_DIR / "data" / "raw.zip"
         if raw_zip.exists():
             import zipfile
@@ -236,8 +262,8 @@ def step_copy_data():
     if copied == 0:
         raise RuntimeError(
             "Keine Parquet-Daten gefunden!\n"
-            "Bitte Dataset 'trading-raw-data' zum Kernel hinzufuegen:\n"
-            "  Kaggle UI -> Kernel Settings -> Add Data -> trading-raw-data"
+            "Dataset 'trading-raw-data' muss zum Notebook hinzugefuegt sein.\n"
+            f"Aktueller /kaggle/input/ Inhalt: {[p.name for p in KAGGLE_INPUT.iterdir()] if KAGGLE_INPUT.exists() else 'n/a'}"
         )
     return copied
 
