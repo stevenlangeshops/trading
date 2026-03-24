@@ -159,20 +159,32 @@ def load_fold_model(ckpt_path: str, device: str) -> tuple[CrossSectionalLSTM, di
 # ── Marktregime bestimmen ─────────────────────────────────────────────────────
 
 def get_market_regime(
-    spy_prices: pd.Series,
-    date:       pd.Timestamp,
-    window_fast: int = 50,
-    window_slow: int = 200,
+    spy_prices:  pd.Series,
+    date:        pd.Timestamp,
+    window_fast: int   = 50,
+    window_slow: int   = 200,
+    window_st:   int   = 20,   # Kurzzeitfenster für Drawdown-Check
+    st_dd_thr:   float = 0.05, # Wenn SPY >5% unter 20d-Hoch → Regime eine Stufe runter
 ) -> str:
     """
-    Bestimmt das Marktregime anhand von SPY SMAs.
+    Bestimmt das Marktregime anhand von SPY SMAs + Kurzzeitmomentum.
 
-    Returns:
+    Primär:
         'bull'    — SPY > SMA50 > SMA200  → volle Position
         'neutral' — SPY > SMA200 aber < SMA50 → reduzierte Position
-        'bear'    — SPY < SMA200  → Long-Only: kein Trade, Short bleibt
+        'bear'    — SPY < SMA200  → Long-Only: kein Trade
+
+    Zusätzlich: wenn SPY > st_dd_thr% unter seinem 20-Tage-Hoch liegt
+    (schneller Einbruch), wird das Regime um eine Stufe herabgesetzt.
+    Schützt vor Crash-Beginn wie Covid Feb 2020 oder Tariff-Selloff 2025,
+    bevor SMA200 reagiert.
     """
-    past = spy_prices[spy_prices.index <= date]
+    # Timezone normalisieren (price_cache ist UTC-aware, date ggf. tz-naiv)
+    spy_norm = spy_prices.copy()
+    spy_norm.index = spy_norm.index.tz_localize(None) if spy_norm.index.tz is not None else spy_norm.index
+    date_norm = date.tz_localize(None) if getattr(date, 'tzinfo', None) is not None else date
+
+    past = spy_norm[spy_norm.index <= date_norm]
     if len(past) < window_slow:
         return 'neutral'
 
@@ -181,11 +193,25 @@ def get_market_regime(
     sma_slow = float(past.iloc[-window_slow:].mean())
 
     if price > sma_fast and sma_fast > sma_slow:
-        return 'bull'
+        regime = 'bull'
     elif price > sma_slow:
-        return 'neutral'
+        regime = 'neutral'
     else:
-        return 'bear'
+        regime = 'bear'
+
+    # Kurzzeit-Drawdown-Check: schneller Einbruch vom 20-Tage-Hoch
+    if len(past) >= window_st:
+        recent_high = float(past.iloc[-window_st:].max())
+        if recent_high > 0:
+            recent_dd = (price - recent_high) / recent_high
+            if recent_dd < -st_dd_thr:
+                # Regime eine Stufe herabsetzen
+                if regime == 'bull':
+                    regime = 'neutral'
+                elif regime == 'neutral':
+                    regime = 'bear'
+
+    return regime
 
 
 def adaptive_n(
@@ -266,7 +292,9 @@ def run_backtest(
                                        # k=3.5 lässt normale Schwankungen durch
     atr_min_hold_days: int   = 3,      # Stop erst nach n Tagen aktiv (verhindert
                                        # frühzeitigen Exit bei Entry-Volatilität)
-    # Fallback: fester Stop-Loss (greift wenn kein ATR verfügbar)
+    # Hard Stop: maximaler Verlust vom Einstiegskurs (übersteuert ATR-Trailing)
+    hard_stop_pct:     float = 0.15,   # 15% Hard-Stop — greift immer, unabhängig von ATR
+    # Fallback: fester Stop-Loss (greift wenn ATR nicht verfügbar)
     stop_loss_pct:     float = 0.05,   # 5% Stop-Loss vom Einstiegskurs
     rotation_buffer:  int   = 2,      # Rotation nur wenn neuer Kandidat >= buffer Ränge besser
     # Regime-Filter
@@ -333,7 +361,7 @@ def run_backtest(
     )
     logger.info(
         f"Backtest: {strategy_name}  n_max={n_max}  fees={fees:.3f}  "
-        f"stop={stop_desc}  rotation_buffer={rotation_buffer}"
+        f"stop={stop_desc}  hard_stop={hard_stop_pct*100:.0f}%  rotation_buffer={rotation_buffer}"
     )
 
     def _close_position(asset: str, pos: dict, date, reason: str, regime: str) -> None:
@@ -425,11 +453,21 @@ def run_backtest(
                 if current_price is None:
                     continue
 
-                # a) Stop-Loss:
-                #    Bevorzugt ATR-Trailing (volatilitätsangepasst),
-                #    Fallback auf festen prozentualen Stop wenn kein ATR da.
-                #    atr_min_hold_days: Stop erst nach n Tagen aktiv —
-                #    verhindert Entry-Volatilität als falschen Ausstieg.
+                # a) Stop-Loss — drei Ebenen (höchste Priorität zuerst):
+                #
+                #    1. Hard-Stop: max. Verlust vom Entry (greift IMMER, übersteuert ATR).
+                #       Verhindert extreme Einzeltrade-Verluste (z.B. META -34%).
+                #       Standard: 15% — schützt auch wenn ATR zu weit gesetzt ist.
+                #
+                #    2. ATR-Trailing: volatilitätsangepasster nachgezogener Stop.
+                #       Aktiv nach atr_min_hold_days, zieht nur nach oben nach.
+                #
+                #    3. Fester Stop: 5% Fallback wenn kein ATR verfügbar.
+                gross_loss = (current_price - pos['entry']) / pos['entry'] * pos['direction']
+                if gross_loss < -hard_stop_pct:
+                    to_close.append((asset, 'hard_stop'))
+                    continue
+
                 hold_days_so_far = pos.get('hold_days', 0)
                 atr_active = hold_days_so_far >= atr_min_hold_days
                 if use_atr_trailing and pos.get('trailing_stop') is not None and atr_active:
@@ -437,7 +475,6 @@ def run_backtest(
                         to_close.append((asset, 'atr_trailing_stop'))
                         continue
                 elif not use_atr_trailing or not atr_active:
-                    gross_loss = (current_price - pos['entry']) / pos['entry'] * pos['direction']
                     if gross_loss < -stop_loss_pct:
                         to_close.append((asset, 'stop_loss'))
                         continue
@@ -550,11 +587,11 @@ def run_backtest(
     wins      = [t for t in trade_log if t['pnl_pct'] > 0]
     win_r     = len(wins) / len(trade_log) * 100 if trade_log else 0
     avg_hold  = sum(t.get('hold_days', 0) for t in trade_log) / len(trade_log) if trade_log else 0
-    stop_hits = sum(
-        1 for t in trade_log
-        if t.get('exit_reason') in ('stop_loss', 'atr_trailing_stop')
-    )
-    rotations = sum(1 for t in trade_log if 'rotation' in t.get('exit_reason', ''))
+    hard_stops = sum(1 for t in trade_log if t.get('exit_reason') == 'hard_stop')
+    atr_stops  = sum(1 for t in trade_log if t.get('exit_reason') == 'atr_trailing_stop')
+    fix_stops  = sum(1 for t in trade_log if t.get('exit_reason') == 'stop_loss')
+    stop_hits  = hard_stops + atr_stops + fix_stops
+    rotations  = sum(1 for t in trade_log if 'rotation' in t.get('exit_reason', ''))
 
     logger.success("═" * 55)
     logger.success(f"BACKTEST: {strategy_name}")
@@ -565,7 +602,11 @@ def run_backtest(
     logger.success(f"  Trades        : {len(trade_log)}")
     logger.success(f"  Win Rate      : {win_r:.1f}%")
     logger.success(f"  Avg Hold Days : {avg_hold:.1f}")
-    logger.success(f"  Stop-Loss Hits: {stop_hits}  |  Rotations: {rotations}")
+    logger.success(
+        f"  Stops: {stop_hits} total  "
+        f"(hard={hard_stops}  atr={atr_stops}  fixed={fix_stops})  "
+        f"|  Rotations: {rotations}"
+    )
     logger.success("═" * 55)
 
     return {
