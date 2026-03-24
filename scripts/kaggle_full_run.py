@@ -158,13 +158,7 @@ def step_check_cuda():
 
     if sm_major > 0 and sm_major < 7:
         # P100 (SM_60): fundamental inkompatibel mit Python 3.12 + PyTorch 2.x.
-        # - CUDA 12.x hat SM_60-Unterstuetzung komplett entfernt
-        # - torch+cu118 vom whl-Index linkt gegen System-libcudart.so.11 (nicht vorhanden)
-        # - Python-3.12-Wheels fuer altes torch (1.x mit SM_60) existieren nicht
-        # => Kein GPU-Training moeglich. Sofort CPU-Modus.
-        log_write(f"  SM_{sm_major}.x (P100) erkannt.")
-        log_write("  P100/SM_60 + Python 3.12 + PyTorch 2.x: fundamental inkompatibel.")
-        log_write("  Kein GPU-Training moeglich -> CPU-Modus.")
+        log_write(f"  SM_{sm_major}.x (P100) erkannt — fundamental inkompatibel, CPU-Modus.")
         os.environ["CUDA_VISIBLE_DEVICES"] = ""
         os.environ["KAGGLE_GPU_INCOMPATIBLE"] = "1"
         return
@@ -189,7 +183,32 @@ def step_check_cuda():
             log_write("  CUDA nach Reinstall : OK")
             return
 
-    # Letzter Ausweg
+    # Subprocess fehlgeschlagen (z.B. MKL-Ladefehler im Subprocess aber torch im
+    # Hauptprozess bereits geladen und funktionsfaehig) -> direkt im Hauptprozess pruefen.
+    if r.returncode != 0 and sm_major == 0:
+        log_write("  Subprocess-Fehler (MKL?) -> pruefe CUDA direkt im Hauptprozess ...")
+        try:
+            import torch as _torch
+            if _torch.cuda.is_available():
+                _cap = _torch.cuda.get_device_capability(0)
+                _sm  = _cap[0]
+                _dev = _torch.cuda.get_device_name(0)
+                log_write(f"  Hauptprozess: gpu={_dev}  sm={_sm}.{_cap[1]}")
+                if _sm >= 7:
+                    # Matmul-Test direkt
+                    try:
+                        _a = _torch.zeros(4, 4, device="cuda") @ _torch.ones(4, 4, device="cuda")
+                        log_write(f"  Hauptprozess CUDA matmul=OK -> GPU-Modus (SM={_sm})")
+                        return   # GPU funktioniert -> kein CPU-Flag setzen
+                    except Exception as _e:
+                        log_write(f"  Hauptprozess matmul fehlgeschlagen: {_e}")
+                else:
+                    log_write(f"  SM_{_sm}.x < 7.0 -> CPU-Modus")
+            else:
+                log_write("  Hauptprozess: kein CUDA verfuegbar")
+        except Exception as _ex:
+            log_write(f"  Hauptprozess-Check fehlgeschlagen: {_ex}")
+
     log_write("  CUDA nicht nutzbar -> CPU-Modus (CUDA_VISIBLE_DEVICES='')")
     os.environ["CUDA_VISIBLE_DEVICES"] = ""
     os.environ["KAGGLE_GPU_INCOMPATIBLE"] = "1"
@@ -634,18 +653,26 @@ def step_load_checkpoints() -> list[dict] | None:
     """
     backtest_only = os.environ.get("BACKTEST_ONLY", "0") == "1"
 
-    # Mögliche Quellen für vorhandene Checkpoints
+    # Mögliche Quellen für vorhandene Checkpoints.
+    # Kaggle-Notebooks legen Datasets je nach Einbindungsart unter verschiedenen
+    # Pfaden ab:
+    #   - Via "Add Data" im Notebook-UI: /kaggle/input/datasets/<user>/<name>/
+    #   - Via API kernel-metadata datasets_sources: /kaggle/input/<name>/
     candidate_dirs = [
         WORKING / "checkpoints",
-        Path("/kaggle/input/trading-results/checkpoints"),
         Path("/kaggle/input/trading-results"),
+        Path("/kaggle/input/trading-results/checkpoints"),
+        Path("/kaggle/input/datasets/busersteven/trading-results"),
+        Path("/kaggle/input/datasets/busersteven/trading-results/checkpoints"),
     ]
 
     wf_json = None
     ckpt_src = None
     for d in candidate_dirs:
         wf_candidate = d / "walk_forward_results.json"
-        if wf_candidate.exists() and list(d.glob("fold_*_best.pt")):
+        pts = list(d.glob("fold_*_best.pt")) if d.exists() else []
+        log_write(f"  Suche Checkpoints: {d}  -> wf={wf_candidate.exists()}  pts={len(pts)}")
+        if wf_candidate.exists() and pts:
             wf_json  = wf_candidate
             ckpt_src = d
             break
@@ -653,6 +680,8 @@ def step_load_checkpoints() -> list[dict] | None:
     if wf_json is None:
         if backtest_only:
             log_write("  [WARN] BACKTEST_ONLY gesetzt aber keine Checkpoints gefunden.")
+        else:
+            log_write("  Keine vorhandenen Checkpoints -> Training wird ausgefuehrt.")
         return None
 
     import json as _json
