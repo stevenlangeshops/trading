@@ -266,15 +266,17 @@ def run_backtest(
     fees:             float = 0.001,  # 0.1% Transaktionskosten pro Seite
     init_cash:        float = 10_000.0,
     seq_len:          int   = 64,
-    # ATR-basierter Trailing Stop (bevorzugt)
-    use_atr_trailing:  bool  = True,   # ATR-Trailing aktivieren
-    atr_period:        int   = 14,     # ATR-Periode in Handelstagen
-    atr_k:             float = 3.5,    # Multiplikator: stop = close - k * ATR
-                                       # Run F: zurück auf k=3.5 — k=2.5 war zu eng,
-                                       # schnitt Gewinner ab (-521% ATR-Stop-PnL in Run E).
-                                       # k=3.5 lässt Trends länger laufen.
-    atr_min_hold_days: int   = 3,      # Stop erst nach n Tagen aktiv (verhindert
-                                       # frühzeitigen Exit bei Entry-Volatilität)
+    # ATR-basierter Trailing Stop
+    # Run G: DEAKTIVIERT — empirische Analyse über alle Runs zeigt:
+    #   ATR-Stop zerstört konsequent Wert (Run E: -521%, Run F: -704%).
+    #   Das Rotations-Signal des LSTM ist überlegen (Run F: +956%, win=69%).
+    #   ATR-Stops feuern auf Positionen, die der Ranker noch als Top-N hält —
+    #   Rotation exitiert früher und profitabler (+5.5% avg vs -9.9% ATR).
+    #   Portfolioschutz übernimmt DD-Control + Regime-Filter + Hard-Stop.
+    use_atr_trailing:  bool  = False,  # Run G: deaktiviert (empirisch belegt)
+    atr_period:        int   = 14,     # ATR-Periode (nur relevant wenn True)
+    atr_k:             float = 3.5,    # Multiplikator (nur relevant wenn True)
+    atr_min_hold_days: int   = 3,      # Min. Haltetage vor Stop-Aktivierung
     # Hard Stop: maximaler Verlust vom Einstiegskurs (nur Gap-Down-Schutz)
     # Bewusst großzügig (25%): soll nur echte Crash-Gaps abfangen, nicht
     # normale Rücksetzer, die der ATR-Trailing-Stop besser handhabt.
@@ -301,8 +303,10 @@ def run_backtest(
     # Erholung: DD muss dd_recovery_margin über dem Triggerlevel liegen bevor
     #           Normalmodus zurückkehrt (verhindert ständiges Hin- und Her).
     use_dd_control:      bool  = True,   # DD-Control aktivieren
-    dd_threshold_1:      float = 0.20,   # 20% DD → Stufe 1 (reduziertes N)
-    dd_threshold_2:      float = 0.30,   # 30% DD → Stufe 2 (Defensivmodus)
+    # Run G: Schwellen angehoben — Run F war 71% der Zeit im Schutzmode,
+    # verpasste Rallies 2020 (April-Juli) und 2022 (H2-Erholung).
+    dd_threshold_1:      float = 0.25,   # 25% DD → Stufe 1 (reduziertes N)
+    dd_threshold_2:      float = 0.40,   # 40% DD → Stufe 2 (Defensivmodus, nur echte Krisen)
     dd_reduction_factor: int   = 2,      # n_max // dd_reduction_factor bei Stufe 1
     dd_recovery_margin:  float = 0.05,   # DD muss 5% besser sein vor Erholung
     # Optionale Pre-built Caches (werden intern aufgebaut wenn None)
@@ -320,11 +324,11 @@ def run_backtest(
          a. Hard-Stop (25%, nur Gap-Schutz) → ATR-Trailing → Fixed-Stop
          b. Rotation: exit wenn Rang > n_long + rotation_buffer
       5. Freie Slots mit Top-Kandidaten füllen — dabei:
-         - Run F: Pure Model-Ranking (n_max=7, Equal-Weight, kein Korr.-Filter)
+         - Run G: Pure Model-Ranking (n_max=7, Equal-Weight, kein ATR, kein Korr.-Filter)
          - Optional: corr_cap < 1.0 aktiviert Rolling-Korrelations-Filter
-      6. Portfolio-DD prüfen (Run F):
-         - DD > dd_threshold_1 (20%): n_max halbieren
-         - DD > dd_threshold_2 (30%): Defensivmodus, keine neuen Positionen
+      6. Portfolio-DD prüfen (Run G):
+         - DD > dd_threshold_1 (25%): n_max halbieren
+         - DD > dd_threshold_2 (40%): Defensivmodus (nur echte Krisen)
          - Erholung erst nach dd_recovery_margin über dem Triggerlevel
     """
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -379,7 +383,7 @@ def run_backtest(
     logger.info(
         f"Backtest: {strategy_name}  n_max={n_max}  fees={fees:.3f}  "
         f"stop={stop_desc}  hard_stop={hard_stop_pct*100:.0f}%  rotation_buffer={rotation_buffer}  "
-        f"[Run F] corr_cap={'OFF' if corr_cap >= 1.0 else f'{corr_cap:.2f}'}  "
+        f"[Run G] corr_cap={'OFF' if corr_cap >= 1.0 else f'{corr_cap:.2f}'}  "
         f"vol_sizing={'OFF' if not use_vol_sizing else f'ON(risk={risk_per_trade:.2%})'}  "
         f"{dd_desc}"
     )

@@ -410,19 +410,28 @@ def step_backtest(features, targets, asset_map, fold_results):
         all_assets.append("SPY")
     price_cache = build_price_cache(all_assets, raw_dir=raw_dir)
 
-    # ATR-Cache fuer alle Assets vorab aufbauen (geteilt zwischen Long-Only und Long-Short)
-    atr_cache = build_atr_cache(list(asset_map.keys()), raw_dir=raw_dir, period=14)
-    log_write(f"  ATR-Cache: {len(atr_cache)} Assets (period=14, k=3.5, min_hold=3)")
+    # Run G: ATR-Trailing deaktiviert — kein ATR-Cache nötig (spart ~2 Min)
+    # Empirisch belegt: ATR-Stop zerstörte Wert in Run E (-521%) und Run F (-704%).
+    # Das Rotations-Signal des LSTM ist überlegen (Run F: +956% Rotation vs -704% ATR).
+    USE_ATR = False   # Auf True setzen um ATR-Stop wieder zu aktivieren
+    atr_cache = None
+    if USE_ATR:
+        atr_cache = build_atr_cache(list(asset_map.keys()), raw_dir=raw_dir, period=14)
+        log_write(f"  ATR-Cache: {len(atr_cache)} Assets (period=14)")
+    else:
+        log_write("  ATR-Cache: DEAKTIVIERT (Run G: Rotation > ATR-Stop)")
 
     result_a = run_backtest(
         features=features, targets=targets,
         fold_results=fold_results, asset_map=asset_map,
         long_short=False, price_cache=price_cache, atr_cache=atr_cache,
+        use_atr_trailing=USE_ATR,
     )
     result_b = run_backtest(
         features=features, targets=targets,
         fold_results=fold_results, asset_map=asset_map,
         long_short=True, price_cache=price_cache, atr_cache=atr_cache,
+        use_atr_trailing=USE_ATR,
     )
 
     # Benchmarks berechnen (gleicher Zeitraum wie Backtest)
@@ -510,13 +519,17 @@ def step_pack_artifacts(result_a: dict, result_b: dict):
     sz = tar_path.stat().st_size // 1024
     log_write(f"  {tar_path.name}: {sz} KB, {len(seen)} Dateien")
 
-    # Run E Referenzwerte für direkten Vergleich im Summary
+    # Vorherige Runs als Referenz für direkten Vergleich im Summary
     run_e_ref = {
-        "long_only":  {"total_return": 29.71,  "max_drawdown": -24.03, "sharpe": 0.414,
-                       "n_trades": 1208, "avg_hold_days": 4.2,
-                       "note": "Run E: corr_cap=0.80 + risk_parity + stop_loss_5pct"},
-        "long_short": {"total_return": -10.11, "max_drawdown": -85.52, "sharpe": 0.324,
-                       "n_trades": 5552, "avg_hold_days": 2.0},
+        "run_e_long_only":  {"total_return": 29.71,  "max_drawdown": -24.03, "sharpe": 0.414,
+                              "n_trades": 1208, "avg_hold_days": 4.2,
+                              "note": "corr_cap=0.80 + risk_parity + stop_loss_5pct"},
+        "run_f_long_only":  {"total_return": 17.87,  "max_drawdown": -67.96, "sharpe": 0.298,
+                              "n_trades": 248,  "avg_hold_days": 13.2,
+                              "note": "kein corr_filter, kein risk_parity, ATR k=3.5, DD-th1=20%/th2=30%"},
+        "run_d_long_only":  {"total_return": 175.0,  "max_drawdown": -60.0,  "sharpe": 0.582,
+                              "n_trades": 520,  "avg_hold_days": 9.7,
+                              "note": "260 assets, GPU training"},
     }
     summary = {
         "return_code":  0,
