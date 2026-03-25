@@ -510,6 +510,14 @@ def step_pack_artifacts(result_a: dict, result_b: dict):
     sz = tar_path.stat().st_size // 1024
     log_write(f"  {tar_path.name}: {sz} KB, {len(seen)} Dateien")
 
+    # Run E Referenzwerte für direkten Vergleich im Summary
+    run_e_ref = {
+        "long_only":  {"total_return": 29.71,  "max_drawdown": -24.03, "sharpe": 0.414,
+                       "n_trades": 1208, "avg_hold_days": 4.2,
+                       "note": "Run E: corr_cap=0.80 + risk_parity + stop_loss_5pct"},
+        "long_short": {"total_return": -10.11, "max_drawdown": -85.52, "sharpe": 0.324,
+                       "n_trades": 5552, "avg_hold_days": 2.0},
+    }
     summary = {
         "return_code":  0,
         "duration_min": round((time.time() - t0) / 60, 1),
@@ -517,6 +525,7 @@ def step_pack_artifacts(result_a: dict, result_b: dict):
                        if k not in ("equity", "trade_log", "equity_dates")},
         "long_short": {k: v for k, v in result_b.items()
                        if k not in ("equity", "trade_log", "equity_dates")},
+        "run_e_reference": run_e_ref,
     }
     (WORKING / "kernel_summary.json").write_text(json.dumps(summary, indent=2))
     (WORKING / "kaggle_cmd_exit_code.txt").write_text("0")

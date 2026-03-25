@@ -292,6 +292,19 @@ def run_backtest(
     # Volatilitäts-basiertes Sizing (Risk Parity): Run F → deaktiviert, Equal-Weight
     use_vol_sizing:   bool  = False,  # Run F: False — Risk-Parity übersteuerte Modellsignal
     risk_per_trade:   float = 0.01,   # 1% Portfoliowert Risiko pro Position (bei Stop-Auslösung)
+    # ── Portfolio-Drawdown-Control (Run F, neu) ────────────────────────────────
+    # Zweistufiger DD-Schutz: reduziert n_max progressiv wenn das Portfolio
+    # unter Wasser gerät, ohne Positionen zwangsweise zu schließen.
+    #
+    # Stufe 1 (dd_threshold_1): n_max / dd_reduction_factor  → z.B. 7 → 3
+    # Stufe 2 (dd_threshold_2): n_max = n_min (1), n_mid = 0 → Defensivmodus
+    # Erholung: DD muss dd_recovery_margin über dem Triggerlevel liegen bevor
+    #           Normalmodus zurückkehrt (verhindert ständiges Hin- und Her).
+    use_dd_control:      bool  = True,   # DD-Control aktivieren
+    dd_threshold_1:      float = 0.20,   # 20% DD → Stufe 1 (reduziertes N)
+    dd_threshold_2:      float = 0.30,   # 30% DD → Stufe 2 (Defensivmodus)
+    dd_reduction_factor: int   = 2,      # n_max // dd_reduction_factor bei Stufe 1
+    dd_recovery_margin:  float = 0.05,   # DD muss 5% besser sein vor Erholung
     # Optionale Pre-built Caches (werden intern aufgebaut wenn None)
     price_cache:      Optional[dict] = None,
     atr_cache:        Optional[dict] = None,
@@ -309,6 +322,10 @@ def run_backtest(
       5. Freie Slots mit Top-Kandidaten füllen — dabei:
          - Run F: Pure Model-Ranking (n_max=7, Equal-Weight, kein Korr.-Filter)
          - Optional: corr_cap < 1.0 aktiviert Rolling-Korrelations-Filter
+      6. Portfolio-DD prüfen (Run F):
+         - DD > dd_threshold_1 (20%): n_max halbieren
+         - DD > dd_threshold_2 (30%): Defensivmodus, keine neuen Positionen
+         - Erholung erst nach dd_recovery_margin über dem Triggerlevel
     """
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -343,17 +360,28 @@ def run_backtest(
     trade_log = []
     equity_dates = []
 
+    # ── DD-Control Tracking ───────────────────────────────────────────────────
+    max_equity_so_far = init_cash   # laufendes Maximum für DD-Berechnung
+    dd_mode           = 0           # 0=normal, 1=reduziert, 2=defensiv
+    dd_mode_days      = 0           # Tage im aktuellen Modus > 0
+    dd_events: list[dict] = []      # Log: {date, mode, dd_pct, action}
+
     strategy_name = "Long-Short" if long_short else "Long-Only"
     stop_desc = (
         f"ATR-Trailing(period={atr_period}, k={atr_k})"
         if use_atr_trailing
         else f"Hard-Stop-only({hard_stop_pct*100:.0f}%)"
     )
+    dd_desc = (
+        f"dd_ctrl=ON(th1={dd_threshold_1*100:.0f}%/th2={dd_threshold_2*100:.0f}%)"
+        if use_dd_control else "dd_ctrl=OFF"
+    )
     logger.info(
         f"Backtest: {strategy_name}  n_max={n_max}  fees={fees:.3f}  "
         f"stop={stop_desc}  hard_stop={hard_stop_pct*100:.0f}%  rotation_buffer={rotation_buffer}  "
         f"[Run F] corr_cap={'OFF' if corr_cap >= 1.0 else f'{corr_cap:.2f}'}  "
-        f"vol_sizing={'OFF' if not use_vol_sizing else f'ON(risk={risk_per_trade:.2%})'}"
+        f"vol_sizing={'OFF' if not use_vol_sizing else f'ON(risk={risk_per_trade:.2%})'}  "
+        f"{dd_desc}"
     )
 
     def _close_position(asset: str, pos: dict, date, reason: str, regime: str) -> None:
@@ -393,15 +421,64 @@ def run_backtest(
         fold_dates = all_dates[(cmp_dates >= vs) & (cmp_dates <= ve)]
 
         for date in fold_dates:
+            # ── Portfolio-DD berechnen und DD-Modus setzen ────────────────
+            # Aktuellen Portfolio-Wert für DD-Berechnung (vor dem heutigen Trade)
+            current_pv = cash + _position_value(positions, price_cache, date)
+            max_equity_so_far = max(max_equity_so_far, current_pv)
+            current_dd = (current_pv - max_equity_so_far) / (max_equity_so_far + 1e-9)
+
+            if use_dd_control:
+                prev_dd_mode = dd_mode
+                if current_dd < -dd_threshold_2:
+                    dd_mode = 2
+                elif current_dd < -dd_threshold_1:
+                    dd_mode = 1
+                else:
+                    # Erholung: erst zurück wenn DD über (threshold - recovery_margin)
+                    if dd_mode == 2 and current_dd > -(dd_threshold_2 - dd_recovery_margin):
+                        dd_mode = 1
+                    if dd_mode == 1 and current_dd > -(dd_threshold_1 - dd_recovery_margin):
+                        dd_mode = 0
+
+                if dd_mode != prev_dd_mode:
+                    action = {0: 'NORMAL', 1: 'REDUZIERT', 2: 'DEFENSIV'}[dd_mode]
+                    logger.warning(
+                        f"  DD-Control [{date.date()}]: Modus → {action}  "
+                        f"DD={current_dd*100:.1f}%  equity={current_pv:,.0f}"
+                    )
+                    dd_events.append({
+                        'date': str(date.date()),
+                        'mode': dd_mode,
+                        'dd_pct': round(current_dd * 100, 2),
+                        'action': action,
+                    })
+
+                if dd_mode > 0:
+                    dd_mode_days += 1
+
+                # Effektives N für diesen Tag
+                if dd_mode == 2:
+                    eff_n_max = n_min
+                    eff_n_mid = 0
+                    eff_n_min = 0
+                elif dd_mode == 1:
+                    eff_n_max = max(1, n_max // dd_reduction_factor)
+                    eff_n_mid = max(1, n_mid // dd_reduction_factor)
+                    eff_n_min = n_min
+                else:
+                    eff_n_max, eff_n_mid, eff_n_min = n_max, n_mid, n_min
+            else:
+                eff_n_max, eff_n_mid, eff_n_min = n_max, n_mid, n_min
+
             # ── Regime bestimmen ──────────────────────────────────────────
             if use_regime and spy_prices is not None:
                 regime = get_market_regime(spy_prices, date)
-                n_long = adaptive_n(regime, n_max, n_mid, n_min)
+                n_long = adaptive_n(regime, eff_n_max, eff_n_mid, eff_n_min)
                 if regime == 'bear' and long_short:
                     n_long = 0
             else:
                 regime = 'neutral'
-                n_long = n_mid
+                n_long = eff_n_mid
 
             # ── Vorhersagen generieren ────────────────────────────────────
             preds = predict_cross_section(
@@ -649,38 +726,91 @@ def run_backtest(
     wins      = [t for t in trade_log if t['pnl_pct'] > 0]
     win_r     = len(wins) / len(trade_log) * 100 if trade_log else 0
     avg_hold  = sum(t.get('hold_days', 0) for t in trade_log) / len(trade_log) if trade_log else 0
-    hard_stops = sum(1 for t in trade_log if t.get('exit_reason') == 'hard_stop')
-    atr_stops  = sum(1 for t in trade_log if t.get('exit_reason') == 'atr_trailing_stop')
-    fix_stops  = sum(1 for t in trade_log if t.get('exit_reason') == 'stop_loss')
-    stop_hits  = hard_stops + atr_stops + fix_stops
-    rotations  = sum(1 for t in trade_log if 'rotation' in t.get('exit_reason', ''))
 
-    logger.success("═" * 55)
+    # ── PnL-Beitrag pro Exit-Typ ──────────────────────────────────────────────
+    def _exit_stats(reason_filter: str) -> dict:
+        subset = [t for t in trade_log if reason_filter in t.get('exit_reason', '')]
+        if not subset:
+            return {'n': 0, 'pnl_sum': 0.0, 'pnl_avg': 0.0, 'hold_avg': 0.0, 'win_pct': 0.0}
+        pnls  = [t['pnl_pct'] for t in subset]
+        holds = [t.get('hold_days', 0) for t in subset]
+        return {
+            'n':        len(subset),
+            'pnl_sum':  round(sum(pnls), 1),
+            'pnl_avg':  round(sum(pnls) / len(pnls), 2),
+            'hold_avg': round(sum(holds) / len(holds), 1),
+            'win_pct':  round(sum(1 for p in pnls if p > 0) / len(pnls) * 100, 1),
+        }
+
+    stats_hard    = _exit_stats('hard_stop')
+    stats_atr     = _exit_stats('atr_trailing_stop')
+    stats_fix     = _exit_stats('stop_loss')
+    stats_rot     = _exit_stats('rotation')
+
+    stop_hits = stats_hard['n'] + stats_atr['n'] + stats_fix['n']
+
+    logger.success("═" * 63)
     logger.success(f"BACKTEST: {strategy_name}")
-    logger.success("═" * 55)
+    logger.success("═" * 63)
     logger.success(f"  Total Return  : {total_return:+.2f}%")
     logger.success(f"  Max Drawdown  : {max_dd:.2f}%")
     logger.success(f"  Sharpe Ratio  : {sharpe:.3f}")
     logger.success(f"  Trades        : {len(trade_log)}")
     logger.success(f"  Win Rate      : {win_r:.1f}%")
     logger.success(f"  Avg Hold Days : {avg_hold:.1f}")
+    logger.success("  ── PnL pro Exit-Typ ──────────────────────────────")
     logger.success(
-        f"  Stops: {stop_hits} total  "
-        f"(hard={hard_stops}  atr={atr_stops}  fixed={fix_stops})  "
-        f"|  Rotations: {rotations}"
+        f"  Rotation     : n={stats_rot['n']:4d}  "
+        f"sum={stats_rot['pnl_sum']:+8.0f}%  avg={stats_rot['pnl_avg']:+5.1f}%  "
+        f"hold={stats_rot['hold_avg']:.1f}d  win={stats_rot['win_pct']:.0f}%"
     )
-    logger.success("═" * 55)
+    logger.success(
+        f"  ATR-Stop     : n={stats_atr['n']:4d}  "
+        f"sum={stats_atr['pnl_sum']:+8.0f}%  avg={stats_atr['pnl_avg']:+5.1f}%  "
+        f"hold={stats_atr['hold_avg']:.1f}d  win={stats_atr['win_pct']:.0f}%"
+    )
+    logger.success(
+        f"  Hard-Stop    : n={stats_hard['n']:4d}  "
+        f"sum={stats_hard['pnl_sum']:+8.0f}%  avg={stats_hard['pnl_avg']:+5.1f}%  "
+        f"hold={stats_hard['hold_avg']:.1f}d  win={stats_hard['win_pct']:.0f}%"
+    )
+    if stats_fix['n'] > 0:
+        logger.warning(
+            f"  Fix-Stop(5%) : n={stats_fix['n']:4d}  "
+            f"sum={stats_fix['pnl_sum']:+8.0f}%  avg={stats_fix['pnl_avg']:+5.1f}%  "
+            f"(sollte 0 sein in Run F!)"
+        )
+    if use_dd_control and dd_mode_days > 0:
+        logger.success(
+            f"  DD-Control   : {dd_mode_days} Tage im Schutz-Modus  "
+            f"({len(dd_events)} Modus-Wechsel)"
+        )
+    logger.success("═" * 63)
 
     return {
-        'strategy':      strategy_name,
-        'total_return':  round(total_return, 2),
-        'max_drawdown':  round(max_dd, 2),
-        'sharpe':        round(sharpe, 3),
-        'n_trades':      len(trade_log),
-        'win_rate':      round(win_r, 1),
-        'avg_hold_days': round(avg_hold, 1),
+        'strategy':       strategy_name,
+        'total_return':   round(total_return, 2),
+        'max_drawdown':   round(max_dd, 2),
+        'sharpe':         round(sharpe, 3),
+        'n_trades':       len(trade_log),
+        'win_rate':       round(win_r, 1),
+        'avg_hold_days':  round(avg_hold, 1),
         'stop_loss_hits': stop_hits,
-        'rotations':     rotations,
+        'rotations':      stats_rot['n'],
+        # Detaillierte Exit-Stats (Run F Reporting)
+        'exit_stats': {
+            'rotation':          stats_rot,
+            'atr_trailing_stop': stats_atr,
+            'hard_stop':         stats_hard,
+            'fix_stop':          stats_fix,
+        },
+        # DD-Control Stats
+        'dd_control': {
+            'enabled':        use_dd_control,
+            'days_in_mode':   dd_mode_days,
+            'n_mode_switches': len(dd_events),
+            'events':         dd_events,
+        },
         'equity':        equity_arr.tolist(),
         'equity_dates':  [str(d.date()) for d in equity_dates],
         'trade_log':     trade_log,
