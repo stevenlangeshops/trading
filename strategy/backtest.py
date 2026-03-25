@@ -302,11 +302,13 @@ def run_backtest(
     # Stufe 2 (dd_threshold_2): n_max = n_min (1), n_mid = 0 → Defensivmodus
     # Erholung: DD muss dd_recovery_margin über dem Triggerlevel liegen bevor
     #           Normalmodus zurückkehrt (verhindert ständiges Hin- und Her).
-    use_dd_control:      bool  = True,   # DD-Control aktivieren
-    # Run G: Schwellen angehoben — Run F war 71% der Zeit im Schutzmode,
-    # verpasste Rallies 2020 (April-Juli) und 2022 (H2-Erholung).
-    dd_threshold_1:      float = 0.25,   # 25% DD → Stufe 1 (reduziertes N)
-    dd_threshold_2:      float = 0.40,   # 40% DD → Stufe 2 (Defensivmodus, nur echte Krisen)
+    # ── Portfolio-Drawdown-Control ────────────────────────────────────────────
+    # Run G: use_dd_control=False — Baseline-Messung der reinen Rotation+Hard-Stop-Edge.
+    # DD wird weiterhin getrackt (für Reporting), beeinflusst aber KEINE Positionsanzahl.
+    # Aktiviere use_dd_control=True für zukünftige Runs um Portfolioschutz zuzuschalten.
+    use_dd_control:      bool  = False,  # Run G: OFF (Baseline, keine N-Anpassung)
+    dd_threshold_1:      float = 0.25,   # 25% DD → Stufe 1 (nur aktiv wenn use_dd_control=True)
+    dd_threshold_2:      float = 0.40,   # 40% DD → Stufe 2 (nur aktiv wenn use_dd_control=True)
     dd_reduction_factor: int   = 2,      # n_max // dd_reduction_factor bei Stufe 1
     dd_recovery_margin:  float = 0.05,   # DD muss 5% besser sein vor Erholung
     # Optionale Pre-built Caches (werden intern aufgebaut wenn None)
@@ -324,12 +326,11 @@ def run_backtest(
          a. Hard-Stop (25%, nur Gap-Schutz) → ATR-Trailing → Fixed-Stop
          b. Rotation: exit wenn Rang > n_long + rotation_buffer
       5. Freie Slots mit Top-Kandidaten füllen — dabei:
-         - Run G: Pure Model-Ranking (n_max=7, Equal-Weight, kein ATR, kein Korr.-Filter)
+         - Run G Baseline: Pure Model-Ranking, Equal-Weight, kein ATR, kein Korr.-Filter
          - Optional: corr_cap < 1.0 aktiviert Rolling-Korrelations-Filter
-      6. Portfolio-DD prüfen (Run G):
-         - DD > dd_threshold_1 (25%): n_max halbieren
-         - DD > dd_threshold_2 (40%): Defensivmodus (nur echte Krisen)
-         - Erholung erst nach dd_recovery_margin über dem Triggerlevel
+      6. DD-Tracking (immer) für Reporting-Zwecke.
+         DD-Control (use_dd_control=True): passt N dynamisch an — in Run G deaktiviert.
+         Ziel: isolierte Messung der reinen Rotation + Hard-Stop Edge.
     """
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -381,9 +382,16 @@ def run_backtest(
         if use_dd_control else "dd_ctrl=OFF"
     )
     logger.info(
-        f"Backtest: {strategy_name}  n_max={n_max}  fees={fees:.3f}  "
-        f"stop={stop_desc}  hard_stop={hard_stop_pct*100:.0f}%  rotation_buffer={rotation_buffer}  "
-        f"[Run G] corr_cap={'OFF' if corr_cap >= 1.0 else f'{corr_cap:.2f}'}  "
+        f"Backtest: {strategy_name}  n_max={n_max}(mid={n_mid},min={n_min})  "
+        f"fees={fees:.3f}  rotation_buffer={rotation_buffer}"
+    )
+    logger.info(
+        f"  Exits: atr={'ON' if use_atr_trailing else 'OFF'}  "
+        f"hard_stop={hard_stop_pct*100:.0f}%  fix_stop=OFF  "
+        f"[Run G Baseline]"
+    )
+    logger.info(
+        f"  Portfolio: corr_cap={'OFF' if corr_cap >= 1.0 else f'{corr_cap:.2f}'}  "
         f"vol_sizing={'OFF' if not use_vol_sizing else f'ON(risk={risk_per_trade:.2%})'}  "
         f"{dd_desc}"
     )
@@ -425,13 +433,15 @@ def run_backtest(
         fold_dates = all_dates[(cmp_dates >= vs) & (cmp_dates <= ve)]
 
         for date in fold_dates:
-            # ── Portfolio-DD berechnen und DD-Modus setzen ────────────────
-            # Aktuellen Portfolio-Wert für DD-Berechnung (vor dem heutigen Trade)
+            # ── Portfolio-DD immer tracken (für Reporting) ────────────────
+            # Berechnung läuft unabhängig von use_dd_control, damit das
+            # Reporting immer zeigt wie tief der DD tatsächlich war.
             current_pv = cash + _position_value(positions, price_cache, date)
             max_equity_so_far = max(max_equity_so_far, current_pv)
             current_dd = (current_pv - max_equity_so_far) / (max_equity_so_far + 1e-9)
 
             if use_dd_control:
+                # ── DD-Control: N dynamisch anpassen ──────────────────────
                 prev_dd_mode = dd_mode
                 if current_dd < -dd_threshold_2:
                     dd_mode = 2
@@ -460,7 +470,7 @@ def run_backtest(
                 if dd_mode > 0:
                     dd_mode_days += 1
 
-                # Effektives N für diesen Tag
+                # Effektives N für diesen Tag (basierend auf DD-Modus)
                 if dd_mode == 2:
                     eff_n_max = n_min
                     eff_n_mid = 0
@@ -472,6 +482,9 @@ def run_backtest(
                 else:
                     eff_n_max, eff_n_mid, eff_n_min = n_max, n_mid, n_min
             else:
+                # DD-Control deaktiviert (Run G Baseline):
+                # N bleibt immer bei den konfigurierten Maximalwerten.
+                # dd_mode bleibt 0 = NORMAL für das gesamte Reporting.
                 eff_n_max, eff_n_mid, eff_n_min = n_max, n_mid, n_min
 
             # ── Regime bestimmen ──────────────────────────────────────────

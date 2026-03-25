@@ -421,17 +421,26 @@ def step_backtest(features, targets, asset_map, fold_results):
     else:
         log_write("  ATR-Cache: DEAKTIVIERT (Run G: Rotation > ATR-Stop)")
 
+    # Run G Baseline-Konfiguration:
+    # Nur Rotation + Hard-Stop, kein ATR, kein DD-Control.
+    # Ziel: isolierte Messung der reinen Ranking-Signal-Edge.
+    run_g_cfg = dict(
+        use_atr_trailing = USE_ATR,     # False für Run G
+        use_dd_control   = False,       # Explizit: kein Eingriff ins N aufgrund DD
+        hard_stop_pct    = 0.25,        # Gap-Down Failsafe
+    )
+
     result_a = run_backtest(
         features=features, targets=targets,
         fold_results=fold_results, asset_map=asset_map,
         long_short=False, price_cache=price_cache, atr_cache=atr_cache,
-        use_atr_trailing=USE_ATR,
+        **run_g_cfg,
     )
     result_b = run_backtest(
         features=features, targets=targets,
         fold_results=fold_results, asset_map=asset_map,
         long_short=True, price_cache=price_cache, atr_cache=atr_cache,
-        use_atr_trailing=USE_ATR,
+        **run_g_cfg,
     )
 
     # Benchmarks berechnen (gleicher Zeitraum wie Backtest)
@@ -519,17 +528,20 @@ def step_pack_artifacts(result_a: dict, result_b: dict):
     sz = tar_path.stat().st_size // 1024
     log_write(f"  {tar_path.name}: {sz} KB, {len(seen)} Dateien")
 
-    # Vorherige Runs als Referenz für direkten Vergleich im Summary
+    # Vorherige Runs als Referenz für direkten Vergleich im Summary (Run G)
     run_e_ref = {
-        "run_e_long_only":  {"total_return": 29.71,  "max_drawdown": -24.03, "sharpe": 0.414,
-                              "n_trades": 1208, "avg_hold_days": 4.2,
-                              "note": "corr_cap=0.80 + risk_parity + stop_loss_5pct"},
-        "run_f_long_only":  {"total_return": 17.87,  "max_drawdown": -67.96, "sharpe": 0.298,
-                              "n_trades": 248,  "avg_hold_days": 13.2,
-                              "note": "kein corr_filter, kein risk_parity, ATR k=3.5, DD-th1=20%/th2=30%"},
-        "run_d_long_only":  {"total_return": 175.0,  "max_drawdown": -60.0,  "sharpe": 0.582,
-                              "n_trades": 520,  "avg_hold_days": 9.7,
-                              "note": "260 assets, GPU training"},
+        "run_d_long_only": {"total_return": 175.0,  "max_drawdown": -60.0,  "sharpe": 0.582,
+                             "n_trades": 520,  "avg_hold_days": 9.7,
+                             "note": "260 assets, GPU, hard_stop=15%, short-term regime"},
+        "run_e_long_only": {"total_return": 29.71,  "max_drawdown": -24.03, "sharpe": 0.414,
+                             "n_trades": 1208, "avg_hold_days": 4.2,
+                             "note": "corr_cap=0.80, risk_parity, stop_loss_5pct"},
+        "run_f_long_only": {"total_return": 17.87,  "max_drawdown": -67.96, "sharpe": 0.298,
+                             "n_trades": 248,  "avg_hold_days": 13.2,
+                             "exit_rotation_sum": 955.6, "exit_atr_sum": -703.7,
+                             "note": "kein corr_filter, kein risk_parity, ATR k=3.5, DD-ctrl 20/30%"},
+        "benchmarks":      {"spy_bh": "+60.6%", "ew_universe_bh": "+192.8%",
+                             "ew_rebalanced": "+167.3%"},
     }
     summary = {
         "return_code":  0,
