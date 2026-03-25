@@ -259,7 +259,7 @@ def run_backtest(
     fold_results:     list[dict],
     asset_map:        dict[str, int],
     # Strategie-Parameter
-    n_max:            int   = 5,      # Max Positionen bei Bull-Markt
+    n_max:            int   = 7,      # Max Positionen bei Bull-Markt (Run F: 7 statt 5 → nat. Diversifikation)
     n_mid:            int   = 3,      # Positionen bei neutralem Markt
     n_min:            int   = 1,      # Min Positionen bei Bär-Markt
     long_short:       bool  = False,  # True = Long-Short, False = Long-Only
@@ -269,11 +269,10 @@ def run_backtest(
     # ATR-basierter Trailing Stop (bevorzugt)
     use_atr_trailing:  bool  = True,   # ATR-Trailing aktivieren
     atr_period:        int   = 14,     # ATR-Periode in Handelstagen
-    atr_k:             float = 2.5,    # Multiplikator: stop = close - k * ATR
-                                       # k=2.5: fängt graduelle Rückgänge früher ab
-                                       # ohne echte Gewinner abzuschneiden;
-                                       # k=3.5 war zu weit für hochvolatile Stocks
-                                       # (META/GOOG/TSLA bis -30%)
+    atr_k:             float = 3.5,    # Multiplikator: stop = close - k * ATR
+                                       # Run F: zurück auf k=3.5 — k=2.5 war zu eng,
+                                       # schnitt Gewinner ab (-521% ATR-Stop-PnL in Run E).
+                                       # k=3.5 lässt Trends länger laufen.
     atr_min_hold_days: int   = 3,      # Stop erst nach n Tagen aktiv (verhindert
                                        # frühzeitigen Exit bei Entry-Volatilität)
     # Hard Stop: maximaler Verlust vom Einstiegskurs (nur Gap-Down-Schutz)
@@ -282,17 +281,16 @@ def run_backtest(
     # Analyse zeigt: 15% Hard-Stop verursachte -545% PnL-Drain durch zu
     # frühe Exits von Positionen, die via ATR/Rotation besser geendet hätten.
     hard_stop_pct:     float = 0.25,   # 25% Hard-Stop — nur Gap-Schutz
-    # Fallback: fester Stop-Loss (greift wenn ATR nicht verfügbar)
-    stop_loss_pct:     float = 0.05,   # 5% Stop-Loss vom Einstiegskurs
-    rotation_buffer:  int   = 2,      # Rotation nur wenn neuer Kandidat >= buffer Ränge besser
+    rotation_buffer:  int   = 3,      # Run F: 3 statt 2 — weniger unnötige Rotationen
     # Regime-Filter
     use_regime:       bool  = True,   # Adaptives N aktivieren
     spy_ticker:       str   = "SPY",  # Referenz-Asset für Regime
-    # Run E: Konzentrations-Schutz (Korrelations-Cap)
-    corr_cap:         float = 0.80,   # Max. erlaubte Rolling-Korrelation zu gehaltenen Assets
+    # Korrelations-Cap (Run E): 1.0 = deaktiviert (Run F Standard)
+    # Nur aktivieren wenn < 1.0 — dann teuer (O(n²) rolling-corr pro Tag).
+    corr_cap:         float = 1.0,    # Run F: deaktiviert (0.80 → 1.0)
     corr_window:      int   = 60,     # Lookback-Fenster für Korrelationsberechnung (Handelstage)
-    # Run E: Volatilitäts-basiertes Position Sizing (Risk Parity)
-    use_vol_sizing:   bool  = True,   # ATR-basiertes Sizing aktivieren
+    # Volatilitäts-basiertes Sizing (Risk Parity): Run F → deaktiviert, Equal-Weight
+    use_vol_sizing:   bool  = False,  # Run F: False — Risk-Parity übersteuerte Modellsignal
     risk_per_trade:   float = 0.01,   # 1% Portfoliowert Risiko pro Position (bei Stop-Auslösung)
     # Optionale Pre-built Caches (werden intern aufgebaut wenn None)
     price_cache:      Optional[dict] = None,
@@ -309,8 +307,8 @@ def run_backtest(
          a. Hard-Stop (25%, nur Gap-Schutz) → ATR-Trailing → Fixed-Stop
          b. Rotation: exit wenn Rang > n_long + rotation_buffer
       5. Freie Slots mit Top-Kandidaten füllen — dabei:
-         - Run E: Korrelations-Cap (corr_cap) filtert hochkorrelierte Kandidaten
-         - Run E: Risk-Parity-Sizing (risk_per_trade) statt Equal-Weight
+         - Run F: Pure Model-Ranking (n_max=7, Equal-Weight, kein Korr.-Filter)
+         - Optional: corr_cap < 1.0 aktiviert Rolling-Korrelations-Filter
     """
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -348,13 +346,14 @@ def run_backtest(
     strategy_name = "Long-Short" if long_short else "Long-Only"
     stop_desc = (
         f"ATR-Trailing(period={atr_period}, k={atr_k})"
-        if use_atr_trailing and atr_cache
-        else f"Fixed-Stop({stop_loss_pct*100:.1f}%)"
+        if use_atr_trailing
+        else f"Hard-Stop-only({hard_stop_pct*100:.0f}%)"
     )
     logger.info(
         f"Backtest: {strategy_name}  n_max={n_max}  fees={fees:.3f}  "
         f"stop={stop_desc}  hard_stop={hard_stop_pct*100:.0f}%  rotation_buffer={rotation_buffer}  "
-        f"[Run E] corr_cap={corr_cap:.2f}  vol_sizing={use_vol_sizing}  risk_per_trade={risk_per_trade:.2%}"
+        f"[Run F] corr_cap={'OFF' if corr_cap >= 1.0 else f'{corr_cap:.2f}'}  "
+        f"vol_sizing={'OFF' if not use_vol_sizing else f'ON(risk={risk_per_trade:.2%})'}"
     )
 
     def _close_position(asset: str, pos: dict, date, reason: str, regime: str) -> None:
@@ -446,16 +445,15 @@ def run_backtest(
                 if current_price is None:
                     continue
 
-                # a) Stop-Loss — drei Ebenen (höchste Priorität zuerst):
+                # Stop-Loss — zwei Ebenen (Run F: kein fester 5%-Stop mehr):
                 #
-                #    1. Hard-Stop: max. Verlust vom Entry (greift IMMER, übersteuert ATR).
-                #       Verhindert extreme Einzeltrade-Verluste (z.B. META -34%).
-                #       Standard: 15% — schützt auch wenn ATR zu weit gesetzt ist.
+                #    1. Hard-Stop (25%): Nur für extreme Gap-Downs (z.B. Insolvenz über Nacht).
+                #       Greift immer, übersteuert ATR. Bewusst großzügig (25%) damit normale
+                #       Rücksetzer den ATR-Trailing-Stop durchlaufen.
                 #
                 #    2. ATR-Trailing: volatilitätsangepasster nachgezogener Stop.
-                #       Aktiv nach atr_min_hold_days, zieht nur nach oben nach.
-                #
-                #    3. Fester Stop: 5% Fallback wenn kein ATR verfügbar.
+                #       Aktiv nach atr_min_hold_days. Zieht nur nach oben nach.
+                #       Kein fester 5%-Stop mehr — das hat in Run E -660% PnL-Drain verursacht.
                 gross_loss = (current_price - pos['entry']) / pos['entry'] * pos['direction']
                 if gross_loss < -hard_stop_pct:
                     to_close.append((asset, 'hard_stop'))
@@ -466,10 +464,6 @@ def run_backtest(
                 if use_atr_trailing and pos.get('trailing_stop') is not None and atr_active:
                     if current_price < pos['trailing_stop']:
                         to_close.append((asset, 'atr_trailing_stop'))
-                        continue
-                elif not use_atr_trailing or not atr_active:
-                    if gross_loss < -stop_loss_pct:
-                        to_close.append((asset, 'stop_loss'))
                         continue
 
                 # b) Rotation: nur wenn Rang deutlich außerhalb Top-N
@@ -492,30 +486,29 @@ def run_backtest(
             if free_slots > 0:
                 held = set(positions.keys())
 
-                # ALT: new_longs = [a for a in preds.index if a not in held][:free_slots]
+                # Run F: Pure Model-Ranking ohne Korrelations-Filter (corr_cap=1.0 Standard).
+                # Run E zeigte: Korrelations-Filter zwang niedrig-gerankte Kandidaten in
+                # das Portfolio → 750 von 994 Rotationen nach ≤3 Tagen → mehr Gebühren.
                 #
-                # Run E: Korrelations-Cap
-                # Kandidatenliste: top-gerankte Assets die noch nicht gehalten werden.
-                # Wir prüfen bis zu free_slots*5 Kandidaten, damit auch nach Filterung
-                # genug Alternativen vorhanden sind.
-                # Zero-Lookahead: _rolling_return_corr nutzt Close-Preise bis inkl. heute.
-                raw_candidates = [a for a in preds.index if a not in held][: free_slots * 5]
-
-                accepted: list[str] = []  # in dieser Runde akzeptierte Assets
-                for asset in raw_candidates:
-                    if len(accepted) >= free_slots:
-                        break
-                    # Korrelations-Check gegen aktuell gehaltene + heute bereits akzeptierte
-                    too_correlated = any(
-                        _rolling_return_corr(
-                            price_cache, asset, other, date, corr_window
-                        ) > corr_cap
-                        for other in list(held) + accepted
-                    )
-                    if not too_correlated:
-                        accepted.append(asset)
-
-                new_longs = accepted  # Run E: gefilterte Kandidatenliste
+                # Optional (corr_cap < 1.0): Aktiviert O(n²) Rolling-Korr-Check.
+                if corr_cap < 1.0:
+                    raw_candidates = [a for a in preds.index if a not in held][: free_slots * 5]
+                    accepted: list[str] = []
+                    for asset in raw_candidates:
+                        if len(accepted) >= free_slots:
+                            break
+                        too_correlated = any(
+                            _rolling_return_corr(
+                                price_cache, asset, other, date, corr_window
+                            ) > corr_cap
+                            for other in list(held) + accepted
+                        )
+                        if not too_correlated:
+                            accepted.append(asset)
+                    new_longs = accepted
+                else:
+                    # Standard (Run F): Top-gerankte Assets direkt
+                    new_longs = [a for a in preds.index if a not in held][:free_slots]
 
                 if new_longs and cash > 0:
                     # Run E: Volatilitäts-basiertes Sizing (Risk Parity)
@@ -561,7 +554,7 @@ def run_backtest(
                             initial_stop = (
                                 price - atr_k * atr_val
                                 if atr_val is not None
-                                else price * (1 - stop_loss_pct)
+                                else price * (1 - hard_stop_pct)  # Run F: hard_stop als Fallback
                             )
                             positions[asset] = {
                                 'shares':        shares,
@@ -573,7 +566,7 @@ def run_backtest(
                             cash -= scaled_value
 
                     else:
-                        # ALT: Equal-Weight (Fallback wenn use_vol_sizing=False)
+                        # Equal-Weight (Standard in Run F)
                         per_position = cash / len(new_longs)
                         for asset in new_longs:
                             price   = _get_price(price_cache, asset, date)
@@ -584,7 +577,7 @@ def run_backtest(
                             initial_stop = (
                                 price - atr_k * atr_val
                                 if atr_val is not None
-                                else price * (1 - stop_loss_pct)
+                                else price * (1 - hard_stop_pct)  # Run F: hard_stop als Fallback
                             )
                             positions[asset] = {
                                 'shares':        shares,
