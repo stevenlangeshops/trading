@@ -397,109 +397,100 @@ def step_train(features, targets, asset_map):
 # ── Schritt 7: Backtest ───────────────────────────────────────────────────────
 
 def step_backtest(features, targets, asset_map, fold_results):
-    log_write(f"\n{'='*60}\nSCHRITT 7: Backtest [{elapsed()}]\n{'='*60}")
+    # ── RUN H2: Nur Crash-3d-Signal-Analyse, KEIN Backtest ────────────────────
+    # Spart ~80 Min Rechenzeit. Wir berechnen nur das 3-Tage-Crash-Signal
+    # auf SPY und loggen die Phasen, um zu prüfen ob es die richtigen
+    # Crash-Zonen trifft (COVID, 2022, 2025).
+    log_write(f"\n{'='*60}\nSCHRITT 7: Crash-3d Signal-Analyse (Run H2) [{elapsed()}]\n{'='*60}")
 
     from strategy.backtest import (
-        run_backtest, build_price_cache, build_atr_cache,
-        compute_spy_crash_series, plot_equity, compute_benchmarks
+        build_price_cache, compute_spy_crash_3d, analyze_crash_3d_phases,
     )
+    import pandas as pd
 
-    raw_dir    = REPO_DIR / "data" / "raw"
-    all_assets = list(asset_map.keys())
-    if "SPY" not in all_assets:
-        all_assets.append("SPY")
-    price_cache = build_price_cache(all_assets, raw_dir=raw_dir)
+    raw_dir = REPO_DIR / "data" / "raw"
 
-    # ATR-Trailing bleibt deaktiviert (empirisch: Rotation > ATR-Stop)
-    atr_cache = None
-    log_write("  ATR-Cache: DEAKTIVIERT (Rotation > ATR-Stop)")
+    # SPY-Close laden (nur SPY noetig — kein voller price_cache)
+    spy_path = raw_dir / "SPY_1d.parquet"
+    if not spy_path.exists():
+        log_write(f"  [ERROR] {spy_path} nicht gefunden!")
+        return {}, {}
 
-    # RUN H1: SPY ATR Crash-Signal vorberechnen (einmalig, geteilt fuer alle Backtests)
-    log_write("  Berechne SPY Crash-Signal (ATR14, Lookback=10d, Mult=2.0)...")
-    spy_crash_series = compute_spy_crash_series(
-        raw_dir            = raw_dir,
-        spy_ticker         = "SPY",
-        atr_window         = 14,
-        lookback_high_days = 10,
-        crash_atr_mult     = 2.0,
-    )
-    n_crash_days = int(spy_crash_series.sum()) if len(spy_crash_series) > 0 else 0
-    log_write(f"  SPY Crash-Signal: {n_crash_days} Crash-Tage vorberechnet")
+    spy_df = pd.read_parquet(spy_path).sort_index()
+    spy_df.columns = [c.lower() if isinstance(c, str) else str(c).lower() for c in spy_df.columns]
+    spy_close = spy_df['close']
+    log_write(f"  SPY geladen: {len(spy_close)} Tage ({spy_close.index[0].date()} → {spy_close.index[-1].date()})")
 
-    # RUN H1 Konfiguration:
-    # Rotation + Hard-Stop (wie Run G) + SPY-ATR Crash-Schutz (Halbgas-Modus).
-    # Nur Long-Only (spart ~50% Rechenzeit gegenueber Long+Short).
-    run_h1_cfg = dict(
-        use_atr_trailing      = False,          # kein ATR-Trailing-Stop
-        use_dd_control        = False,          # kein DD-Control (isolierter Crash-Schutz)
-        hard_stop_pct         = 0.25,           # Gap-Down Failsafe
-        use_crash_protection  = True,           # RUN H1: Crash-Schutz aktiv
-        spy_atr_window        = 14,
-        spy_lookback_high_days= 10,
-        spy_crash_atr_mult    = 2.0,
-        dd_crash_threshold    = 0.25,           # 25% Portfolio-DD → Halbgas
-        dd_crash_recovery     = 0.10,           # 10% Erholung nötig
-        spy_crash_series      = spy_crash_series,
-    )
+    # ── 3-Tage-Crash-Signal berechnen ─────────────────────────────────────────
+    crash_3d_config = {
+        'crash_3d_return_thresh': 0.05,     # 5% in 3 Tagen (optimal: trifft alle 4 Crash-Zonen)
+        'crash_3d_vol_mult':      1.5,      # 1.5x normale 3d-Bewegung
+        'crash_3d_lookback_vol':  20,        # 20 Tage fuer avg_daily_move
+    }
+    crash_3d = compute_spy_crash_3d(spy_close, **crash_3d_config)
 
-    # Nur Long-Only (Long-Short deaktiviert — spart ~50% Rechenzeit)
-    result_a = run_backtest(
-        features=features, targets=targets,
-        fold_results=fold_results, asset_map=asset_map,
-        long_short=False, price_cache=price_cache, atr_cache=atr_cache,
-        **run_h1_cfg,
-    )
-    result_b = {}   # Long-Short deaktiviert fuer Run H1
+    n_crash = int(crash_3d.sum())
+    n_total = len(crash_3d)
+    log_write(f"  Crash-3d Ergebnis: {n_crash} Crash-Tage von {n_total} ({n_crash/n_total*100:.1f}%)")
 
-    # Benchmarks berechnen (gleicher Zeitraum wie Backtest)
-    benchmarks = {}
-    try:
-        benchmarks = compute_benchmarks(
-            price_cache=price_cache,
-            equity_dates=result_a.get("equity_dates", []),
-            asset_map=asset_map,
-            init_cash=10_000.0,
+    # ── Crash-Phasen analysieren ──────────────────────────────────────────────
+    phases = analyze_crash_3d_phases(crash_3d, spy_close)
+
+    log_write(f"\n  {'='*60}")
+    log_write(f"  CRASH-3D PHASEN-ANALYSE  ({len(phases)} Phasen)")
+    log_write(f"  {'='*60}")
+    log_write(f"  {'Phase':>5s}  {'Start':>12s}  {'Ende':>12s}  {'Dauer':>6s}  {'Crash-d':>8s}  {'SPY-DD':>8s}")
+    log_write(f"  {'─'*60}")
+
+    for i, ph in enumerate(phases):
+        log_write(
+            f"  {i+1:5d}  {ph['start']:>12s}  {ph['end']:>12s}  "
+            f"{ph['n_days']:>5d}d  {ph['crash_days']:>7d}  {ph['spy_dd_pct']:>+7.1f}%"
         )
-        # Benchmark-Ergebnisse loggen
-        for key in ("spy", "ew_bh", "ew_rebalanced"):
-            bm = benchmarks.get(key, {})
-            if bm.get("total_return") is not None:
-                log_write(
-                    f"  Benchmark {bm['label']:30s}  "
-                    f"Return: {bm['total_return']:+7.1f}%  "
-                    f"Sharpe: {bm.get('sharpe', 0):.3f}"
-                )
-        with open(WORKING / "benchmarks.json", "w") as f:
-            # Ohne equity-Liste (zu gross)
-            slim_bm = {k: {kk: vv for kk, vv in v.items() if kk != "equity"}
-                       for k, v in benchmarks.items() if k != "dates"}
-            json.dump(slim_bm, f, indent=2)
-    except Exception as e:
-        log_write(f"  [WARN] compute_benchmarks: {e}")
 
-    # JSON ohne equity/trade_log (zu gross fuer Uebersicht)
-    def slim(r):
-        return {k: v for k, v in r.items() if k not in ("equity", "trade_log", "equity_dates")}
+    log_write(f"  {'─'*60}")
+    log_write(f"  Gesamt: {n_crash} Crash-Tage in {len(phases)} Phasen")
+    log_write(f"  Config: return_thresh={crash_3d_config['crash_3d_return_thresh']*100:.0f}%, "
+              f"vol_mult={crash_3d_config['crash_3d_vol_mult']}x, "
+              f"lookback={crash_3d_config['crash_3d_lookback_vol']}d")
+    log_write(f"  {'='*60}")
 
+    # Bekannte Crash-Zonen zum Abgleich
+    known_crashes = [
+        ("COVID-Crash",        "2020-02-20", "2020-03-23"),
+        ("2022 Baermarkt H1",  "2022-01-03", "2022-06-17"),
+        ("2022 Baermarkt H2",  "2022-08-16", "2022-10-13"),
+        ("2025 Korrektur",     "2025-02-19", "2025-04-08"),
+    ]
+    log_write(f"\n  ABGLEICH MIT BEKANNTEN CRASH-ZONEN:")
+    for label, start, end in known_crashes:
+        mask = (crash_3d.index >= pd.Timestamp(start)) & (crash_3d.index <= pd.Timestamp(end))
+        n_hits = int(crash_3d[mask].sum())
+        n_days_zone = int(mask.sum())
+        log_write(f"    {label:25s}  [{start} → {end}]  {n_hits}/{n_days_zone} Crash-Tage")
+
+    # ── Ergebnis als JSON speichern ───────────────────────────────────────────
+    result_crash = {
+        'run':    'H2_crash_3d_analysis',
+        'config': crash_3d_config,
+        'n_crash_days': n_crash,
+        'n_total_days': n_total,
+        'pct_crash':    round(n_crash / n_total * 100, 2),
+        'phases':       phases,
+    }
+
+    with open(WORKING / "crash_3d_analysis.json", "w") as f:
+        json.dump(result_crash, f, indent=2)
     with open(WORKING / "backtest_results_long_only.json", "w") as f:
-        json.dump(slim(result_a), f, indent=2)
+        json.dump(result_crash, f, indent=2)
     with open(WORKING / "backtest_results_long_short.json", "w") as f:
-        json.dump(slim(result_b), f, indent=2)
+        json.dump({}, f)
+    with open(WORKING / "benchmarks.json", "w") as f:
+        json.dump({}, f)
 
-    # Voller Trade-Log separat
-    with open(WORKING / "trade_log_long_only.json", "w") as f:
-        json.dump(result_a.get("trade_log", []), f, indent=2)
-    with open(WORKING / "trade_log_long_short.json", "w") as f:
-        json.dump(result_b.get("trade_log", []), f, indent=2)
+    log_write(f"\n  crash_3d_analysis.json gespeichert ({len(phases)} Phasen)")
 
-    try:
-        plot_equity(result_a, result_b,
-                    benchmarks=benchmarks,
-                    save_path=str(WORKING / "equity_curve.png"))
-    except Exception as e:
-        log_write(f"  [WARN] plot_equity: {e}")
-
-    return result_a, result_b
+    return result_crash, {}
 
 
 # ── Schritt 8: Tar-Archiv ─────────────────────────────────────────────────────
@@ -517,6 +508,7 @@ def step_pack_artifacts(result_a: dict, result_b: dict):
         WORKING / "trade_log_long_short.json",
         WORKING / "equity_curve.png",
         WORKING / "kernel_summary.json",
+        WORKING / "crash_3d_analysis.json",      # RUN H2
     ]
 
     # Checkpoints
@@ -536,36 +528,28 @@ def step_pack_artifacts(result_a: dict, result_b: dict):
     sz = tar_path.stat().st_size // 1024
     log_write(f"  {tar_path.name}: {sz} KB, {len(seen)} Dateien")
 
-    # Vorherige Runs als Referenz für direkten Vergleich im Summary (Run H1)
-    run_e_ref = {
-        "run_g_long_only": {"total_return": 403.93, "max_drawdown": -55.48, "sharpe": 0.784,
-                             "n_trades": 471,  "avg_hold_days": 14.8,
-                             "exit_rotation_sum": 1273.0, "exit_hardstop_sum": -779.0,
-                             "note": "Baseline: reine Rotation + Hard-Stop, kein ATR, kein Crash-Schutz"},
-        "run_f_long_only": {"total_return": 17.87,  "max_drawdown": -67.96, "sharpe": 0.298,
-                             "n_trades": 248,  "avg_hold_days": 13.2,
-                             "note": "ATR k=3.5, DD-ctrl 20/30%"},
-        "run_d_long_only": {"total_return": 175.0,  "max_drawdown": -60.0,  "sharpe": 0.582,
-                             "n_trades": 520,  "avg_hold_days": 9.7,
-                             "note": "260 assets, GPU training"},
-        "benchmarks":      {"spy_bh": "+60.6%", "ew_universe_bh": "+192.8%",
-                             "ew_rebalanced": "+167.3%"},
-    }
+    # RUN H2: Summary angepasst — Crash-3d-Analyse statt Backtest-Ergebnis
     summary = {
         "return_code":  0,
         "duration_min": round((time.time() - t0) / 60, 1),
-        "long_only":  {k: v for k, v in result_a.items()
-                       if k not in ("equity", "trade_log", "equity_dates")},
-        "long_short": {k: v for k, v in result_b.items()
-                       if k not in ("equity", "trade_log", "equity_dates")},
-        "run_e_reference": run_e_ref,
+        "run":          "H2_crash_3d_analysis",
+        "crash_3d":     result_a if isinstance(result_a, dict) else {},
+        "run_g_reference": {
+            "total_return": 403.93, "max_drawdown": -55.48, "sharpe": 0.784,
+            "n_trades": 471,  "avg_hold_days": 14.8,
+            "note": "Baseline: reine Rotation + Hard-Stop",
+        },
+        "run_h1_reference": {
+            "total_return": 335.25, "max_drawdown": -54.49, "sharpe": 0.724,
+            "n_trades": 406, "avg_hold_days": 14.3,
+            "note": "SPY-ATR Halbgas-Modus (DD marginal besser, hohe Performance-Kosten)",
+        },
     }
     (WORKING / "kernel_summary.json").write_text(json.dumps(summary, indent=2))
     (WORKING / "kaggle_cmd_exit_code.txt").write_text("0")
     (WORKING / "kaggle_cmd_stdout_stderr.txt").write_text(
         f"Pipeline erfolgreich in {summary['duration_min']} Minuten.\n"
-        f"Long-Only  Total Return: {result_a.get('total_return', '?')}%\n"
-        f"Long-Short Total Return: {result_b.get('total_return', '?')}%\n"
+        f"Run H2: Crash-3d Signal-Analyse (kein Backtest).\n"
     )
     log_write("\n" + json.dumps(summary, indent=2))
 

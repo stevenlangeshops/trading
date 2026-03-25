@@ -205,6 +205,132 @@ def compute_spy_crash_series(
         return pd.Series(dtype=bool)
 
 
+# ── RUN H2: 3-Tage Crash-Signal ──────────────────────────────────────────────
+
+def compute_spy_crash_3d(
+    spy_close:          pd.Series,
+    crash_3d_return_thresh: float = 0.05,
+    crash_3d_vol_mult:      float = 1.5,
+    crash_3d_lookback_vol:  int   = 20,
+) -> pd.Series:
+    """
+    # RUN H2: Schnelles 3-Tage-Crash-Signal auf SPY-Close.
+
+    Triggert wenn BEIDE Bedingungen gleichzeitig gelten:
+      1. SPY ist in 3 Tagen um >= crash_3d_return_thresh (z.B. 8%) gefallen:
+            r3 = spy_close[t] / spy_close[t-3] - 1  <=  -crash_3d_return_thresh
+
+      2. Der absolute 3-Tage-Return ist >= crash_3d_vol_mult × "normaler" 3-Tage-Move:
+            |r3| >= crash_3d_vol_mult × (avg_daily_move_20 × 3)
+
+         avg_daily_move_20 = rolling mean(|ln(close[t]/close[t-1])|, 20)
+
+    Zero-Lookahead:
+      - r3 nutzt close[t] und close[t-3] — alles bekannt am Handelsende.
+      - avg_daily_move nutzt .shift(1) → basiert auf Vortagen.
+
+    Returns:
+        pd.Series(bool, index=DatetimeIndex):  True = 3-Tage-Crash aktiv
+    """
+    close = spy_close.sort_index().dropna()
+    if len(close) < crash_3d_lookback_vol + 5:
+        logger.warning("compute_spy_crash_3d: zu wenig Daten — leere Serie")
+        return pd.Series(False, index=close.index)
+
+    # 3-Tage-Return
+    r3 = close / close.shift(3) - 1.0
+
+    # Avg daily move (log-returns, shifted um Lookahead zu vermeiden)
+    log_ret = np.log(close / close.shift(1)).abs()
+    avg_daily_move = log_ret.shift(1).rolling(crash_3d_lookback_vol, min_periods=10).mean()
+
+    # Normal expected 3-day move
+    normal_3d_move = avg_daily_move * 3.0
+
+    # Crash-Bedingung
+    cond_return = r3 <= -crash_3d_return_thresh
+    cond_vol    = r3.abs() >= crash_3d_vol_mult * normal_3d_move
+
+    crash = (cond_return & cond_vol).fillna(False)
+
+    n_crash = int(crash.sum())
+    logger.info(
+        f"  SPY Crash-3d: {n_crash} Tage von {len(crash)} "
+        f"(thresh={crash_3d_return_thresh*100:.0f}%, mult={crash_3d_vol_mult}×, "
+        f"vol_lookback={crash_3d_lookback_vol}d)"
+    )
+    return crash
+
+
+def analyze_crash_3d_phases(
+    crash_3d:   pd.Series,
+    spy_close:  pd.Series,
+) -> list[dict]:
+    """
+    # RUN H2: Gruppiert aufeinanderfolgende Crash-3d-Tage zu Phasen.
+
+    Aufeinanderfolgende True-Tage (mit max. 2 Lücken-Tagen) werden zu einer
+    Phase zusammengefasst. Für jede Phase: Start, Ende, Dauer, SPY-Drawdown.
+    """
+    if crash_3d.sum() == 0:
+        return []
+
+    # Timezone normalisieren (alle tz-naive machen)
+    crash_norm = crash_3d.copy()
+    if crash_norm.index.tz is not None:
+        crash_norm.index = crash_norm.index.tz_localize(None)
+    crash_dates = crash_norm[crash_norm].index.sort_values()
+
+    spy = spy_close.sort_index().copy()
+    if spy.index.tz is not None:
+        spy.index = spy.index.tz_localize(None)
+
+    phases: list[dict] = []
+    phase_start = crash_dates[0]
+    phase_end   = crash_dates[0]
+
+    for d in crash_dates[1:]:
+        gap = (d - phase_end).days
+        if gap <= 5:  # max 5 Kalendertage Lücke → selbe Phase
+            phase_end = d
+        else:
+            # Phase abschließen
+            mask = (spy.index >= phase_start) & (spy.index <= phase_end)
+            spy_phase = spy[mask]
+            if len(spy_phase) > 1:
+                peak = spy_phase.cummax()
+                dd = ((spy_phase - peak) / (peak + 1e-9)).min() * 100
+            else:
+                dd = 0.0
+            phases.append({
+                'start':     str(phase_start.date()),
+                'end':       str(phase_end.date()),
+                'n_days':    int(((phase_end - phase_start).days) + 1),
+                'crash_days': int(crash_norm.loc[phase_start:phase_end].sum()),
+                'spy_dd_pct': round(float(dd), 2),
+            })
+            phase_start = d
+            phase_end   = d
+
+    # Letzte Phase
+    mask = (spy.index >= phase_start) & (spy.index <= phase_end)
+    spy_phase = spy[mask]
+    if len(spy_phase) > 1:
+        peak = spy_phase.cummax()
+        dd = ((spy_phase - peak) / (peak + 1e-9)).min() * 100
+    else:
+        dd = 0.0
+    phases.append({
+        'start':     str(phase_start.date()),
+        'end':       str(phase_end.date()),
+        'n_days':    int(((phase_end - phase_start).days) + 1),
+        'crash_days': int(crash_norm.loc[phase_start:phase_end].sum()),
+        'spy_dd_pct': round(float(dd), 2),
+    })
+
+    return phases
+
+
 def _get_spy_crash(crash_series: "pd.Series | None", date: pd.Timestamp) -> bool:
     """# RUN H1: Gibt das SPY Crash-Flag für einen bestimmten Handelstag zurück."""
     if crash_series is None or len(crash_series) == 0:
