@@ -288,6 +288,12 @@ def run_backtest(
     # Regime-Filter
     use_regime:       bool  = True,   # Adaptives N aktivieren
     spy_ticker:       str   = "SPY",  # Referenz-Asset für Regime
+    # Run E: Konzentrations-Schutz (Korrelations-Cap)
+    corr_cap:         float = 0.80,   # Max. erlaubte Rolling-Korrelation zu gehaltenen Assets
+    corr_window:      int   = 60,     # Lookback-Fenster für Korrelationsberechnung (Handelstage)
+    # Run E: Volatilitäts-basiertes Position Sizing (Risk Parity)
+    use_vol_sizing:   bool  = True,   # ATR-basiertes Sizing aktivieren
+    risk_per_trade:   float = 0.01,   # 1% Portfoliowert Risiko pro Position (bei Stop-Auslösung)
     # Optionale Pre-built Caches (werden intern aufgebaut wenn None)
     price_cache:      Optional[dict] = None,
     atr_cache:        Optional[dict] = None,
@@ -296,17 +302,15 @@ def run_backtest(
     Führt den Cross-Sectional Backtest über alle Folds durch.
 
     Täglich:
-      1. Regime bestimmen (adaptives N)
+      1. Regime bestimmen (adaptives N via SMA50/SMA200)
       2. Frische Modell-Vorhersagen für alle Assets
-      3. ATR-Trailing-Stop aller Long-Positionen nach oben nachziehen:
-           new_stop = max(old_stop, close - atr_k * ATR)
+      3. ATR-Trailing-Stop aller Long-Positionen nach oben nachziehen
       4. Jede gehaltene Position prüfen:
-         a. ATR-Trailing-Stop: exit wenn close < trailing_stop
-            (Fallback: fester stop_loss_pct wenn kein ATR verfügbar)
-         b. Rotation: exit wenn Rang schlechter als n_long + rotation_buffer
-            UND ein freier besserer Kandidat existiert
-      5. Freie Slots mit den besten ungehaltenen Top-N Kandidaten befüllen
-      6. Positionen können beliebig lang gehalten werden (kein festes Zeitlimit)
+         a. Hard-Stop (25%, nur Gap-Schutz) → ATR-Trailing → Fixed-Stop
+         b. Rotation: exit wenn Rang > n_long + rotation_buffer
+      5. Freie Slots mit Top-Kandidaten füllen — dabei:
+         - Run E: Korrelations-Cap (corr_cap) filtert hochkorrelierte Kandidaten
+         - Run E: Risk-Parity-Sizing (risk_per_trade) statt Equal-Weight
     """
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -349,7 +353,8 @@ def run_backtest(
     )
     logger.info(
         f"Backtest: {strategy_name}  n_max={n_max}  fees={fees:.3f}  "
-        f"stop={stop_desc}  hard_stop={hard_stop_pct*100:.0f}%  rotation_buffer={rotation_buffer}"
+        f"stop={stop_desc}  hard_stop={hard_stop_pct*100:.0f}%  rotation_buffer={rotation_buffer}  "
+        f"[Run E] corr_cap={corr_cap:.2f}  vol_sizing={use_vol_sizing}  risk_per_trade={risk_per_trade:.2%}"
     )
 
     def _close_position(asset: str, pos: dict, date, reason: str, regime: str) -> None:
@@ -486,33 +491,109 @@ def run_backtest(
             free_slots = n_long - len(positions)
             if free_slots > 0:
                 held = set(positions.keys())
-                new_longs = [a for a in preds.index if a not in held][:free_slots]
 
-                # Kapital gleichmäßig auf freie Slots verteilen
-                # (bestehende Positionen bleiben in ihrer bisherigen Größe)
+                # ALT: new_longs = [a for a in preds.index if a not in held][:free_slots]
+                #
+                # Run E: Korrelations-Cap
+                # Kandidatenliste: top-gerankte Assets die noch nicht gehalten werden.
+                # Wir prüfen bis zu free_slots*5 Kandidaten, damit auch nach Filterung
+                # genug Alternativen vorhanden sind.
+                # Zero-Lookahead: _rolling_return_corr nutzt Close-Preise bis inkl. heute.
+                raw_candidates = [a for a in preds.index if a not in held][: free_slots * 5]
+
+                accepted: list[str] = []  # in dieser Runde akzeptierte Assets
+                for asset in raw_candidates:
+                    if len(accepted) >= free_slots:
+                        break
+                    # Korrelations-Check gegen aktuell gehaltene + heute bereits akzeptierte
+                    too_correlated = any(
+                        _rolling_return_corr(
+                            price_cache, asset, other, date, corr_window
+                        ) > corr_cap
+                        for other in list(held) + accepted
+                    )
+                    if not too_correlated:
+                        accepted.append(asset)
+
+                new_longs = accepted  # Run E: gefilterte Kandidatenliste
+
                 if new_longs and cash > 0:
-                    per_position = cash / len(new_longs)
-                    for asset in new_longs:
-                        price   = _get_price(price_cache, asset, date)
-                        atr_val = _get_atr(atr_cache, asset, date) if (use_atr_trailing and atr_cache) else None
-                        if price is None or price <= 0:
-                            continue
-                        shares = (per_position * (1 - fees)) / price
-                        # Initialer Trailing-Stop beim Einstieg: close - k * ATR
-                        # (Fallback auf prozentualen Stop wenn kein ATR verfügbar)
-                        initial_stop = (
-                            price - atr_k * atr_val
-                            if atr_val is not None
-                            else price * (1 - stop_loss_pct)
-                        )
-                        positions[asset] = {
-                            'shares':        shares,
-                            'entry':         price,
-                            'direction':     1,
-                            'hold_days':     0,
-                            'trailing_stop': initial_stop,
-                        }
-                        cash -= per_position
+                    # Run E: Volatilitäts-basiertes Sizing (Risk Parity)
+                    # ALT: per_position = cash / len(new_longs)  → Equal-Weight
+                    # NEU: Positionsgröße so wählen dass Stop-Auslösung genau
+                    #      risk_per_trade * Portfolio-Value kostet.
+                    #
+                    #   Stop-Distanz (in Preis-Einheiten) = atr_k * ATR
+                    #   → stop_dist_pct = (atr_k * ATR) / price
+                    #   → position_value = (risk_per_trade * equity) / stop_dist_pct
+                    #
+                    # Proportionale Skalierung wenn Summe > verfügbares Cash.
+                    # Fallback auf Equal-Weight wenn ATR nicht verfügbar oder
+                    # use_vol_sizing=False.
+                    if use_vol_sizing:
+                        total_equity = cash + _position_value(positions, price_cache, date)
+                        raw_sizes: dict[str, float] = {}
+
+                        for asset in new_longs:
+                            price   = _get_price(price_cache, asset, date)
+                            atr_val = _get_atr(atr_cache, asset, date) if (use_atr_trailing and atr_cache) else None
+                            if price is None or price <= 0:
+                                continue
+                            if atr_val is not None and atr_val > 0:
+                                # Risiko-basierte Positionsgröße
+                                stop_dist_pct = (atr_k * atr_val) / price
+                                raw_sizes[asset] = (risk_per_trade * total_equity) / stop_dist_pct
+                            else:
+                                # Fallback Equal-Weight für Assets ohne ATR
+                                raw_sizes[asset] = cash / len(new_longs)
+
+                        # Proportionale Skalierung: Summe darf verfügbares Cash nicht überschreiten
+                        total_raw = sum(raw_sizes.values())
+                        scale = min(1.0, cash / total_raw) if total_raw > 0 else 1.0
+
+                        for asset, pos_value in raw_sizes.items():
+                            price   = _get_price(price_cache, asset, date)
+                            atr_val = _get_atr(atr_cache, asset, date) if (use_atr_trailing and atr_cache) else None
+                            if price is None or price <= 0:
+                                continue
+                            scaled_value = pos_value * scale
+                            shares = (scaled_value * (1 - fees)) / price
+                            initial_stop = (
+                                price - atr_k * atr_val
+                                if atr_val is not None
+                                else price * (1 - stop_loss_pct)
+                            )
+                            positions[asset] = {
+                                'shares':        shares,
+                                'entry':         price,
+                                'direction':     1,
+                                'hold_days':     0,
+                                'trailing_stop': initial_stop,
+                            }
+                            cash -= scaled_value
+
+                    else:
+                        # ALT: Equal-Weight (Fallback wenn use_vol_sizing=False)
+                        per_position = cash / len(new_longs)
+                        for asset in new_longs:
+                            price   = _get_price(price_cache, asset, date)
+                            atr_val = _get_atr(atr_cache, asset, date) if (use_atr_trailing and atr_cache) else None
+                            if price is None or price <= 0:
+                                continue
+                            shares = (per_position * (1 - fees)) / price
+                            initial_stop = (
+                                price - atr_k * atr_val
+                                if atr_val is not None
+                                else price * (1 - stop_loss_pct)
+                            )
+                            positions[asset] = {
+                                'shares':        shares,
+                                'entry':         price,
+                                'direction':     1,
+                                'hold_days':     0,
+                                'trailing_stop': initial_stop,
+                            }
+                            cash -= per_position
 
             # Short-Seite (Variante B): Bottom-N leer verkaufen
             if long_short and n_long > 0:
@@ -848,6 +929,47 @@ def _align_date_tz(date: pd.Timestamp, index: pd.DatetimeIndex) -> pd.Timestamp:
     if index.tz is None and date.tzinfo is not None:
         return date.tz_localize(None)
     return date
+
+
+# ── Run E: Korrelations-Hilfsfunktion ────────────────────────────────────────
+
+def _rolling_return_corr(
+    price_cache: dict[str, pd.Series],
+    asset1:      str,
+    asset2:      str,
+    date:        pd.Timestamp,
+    window:      int = 60,
+) -> float:
+    """
+    Rolling-Return-Korrelation zweier Assets über die letzten `window`
+    Handelstage bis inkl. `date`.
+
+    Zero-Lookahead-sicher: nutzt ausschließlich Schlusskurse die zum
+    Zeitpunkt der Transaktion (Close von `date`) bekannt sind.
+    Gibt 0.0 zurück wenn Daten fehlen oder < 20 gemeinsame Tage vorhanden.
+    """
+    s1 = price_cache.get(asset1)
+    s2 = price_cache.get(asset2)
+    if s1 is None or s2 is None:
+        return 0.0
+
+    d1 = _align_date_tz(date, s1.index)
+    d2 = _align_date_tz(date, s2.index)
+
+    # Letztes `window`-Fenster bis inkl. date (Close bekannt)
+    s1_w = s1[s1.index <= d1].iloc[-window:]
+    s2_w = s2[s2.index <= d2].iloc[-window:]
+
+    common = s1_w.index.intersection(s2_w.index)
+    if len(common) < 20:
+        return 0.0
+
+    r1 = s1_w.loc[common].pct_change().dropna()
+    r2 = s2_w.loc[common].pct_change().dropna()
+    if len(r1) < 10 or r1.std() < 1e-9 or r2.std() < 1e-9:
+        return 0.0
+
+    return float(r1.corr(r2))
 
 
 def _get_price(
