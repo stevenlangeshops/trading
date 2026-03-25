@@ -137,6 +137,87 @@ def build_atr_cache(
     return cache
 
 
+# ── RUN H1: SPY ATR Crash-Signal ─────────────────────────────────────────────
+
+def compute_spy_crash_series(
+    raw_dir:            Path  = RAW_DIR,
+    spy_ticker:         str   = "SPY",
+    atr_window:         int   = 14,
+    lookback_high_days: int   = 10,
+    crash_atr_mult:     float = 2.0,
+) -> pd.Series:
+    """
+    # RUN H1: SPY ATR-basiertes Crash-Erkennungs-Signal.
+
+    Crash-Bedingung (täglich, Zero-Lookahead):
+        spy_crash_t = True  wenn:
+            close_t  <=  max(close_{t-lookback_high_days} … close_{t-1})
+                         − crash_atr_mult × ATR14_t
+
+    Interpretation: SPY ist in den letzten ~10 Tagen mehr als 2× seine
+    typische Tages-Schwankung (ATR14) unter das lokale Hoch gefallen.
+
+    Zero-Lookahead-Garantie:
+    - rolling_high nutzt .shift(1) → basiert auf Vortagen, nicht heute.
+    - ATR14 ist kausal (True-Range-Mittel der letzten 14 Handelstage).
+
+    Returns:
+        pd.Series(bool, index=DatetimeIndex):  True = Crash-Signal aktiv
+    """
+    fpath = raw_dir / f"{spy_ticker.replace('.', '_')}_1d.parquet"
+    if not fpath.exists():
+        logger.warning(f"compute_spy_crash_series: {fpath} nicht gefunden — Crash-Schutz deaktiviert")
+        return pd.Series(dtype=bool)
+
+    try:
+        df = pd.read_parquet(fpath).sort_index()
+        df.columns = [c.lower() if isinstance(c, str) else str(c).lower() for c in df.columns]
+
+        # True Range → ATR (benötigt high/low; Fallback via close-Diff)
+        if 'high' in df.columns and 'low' in df.columns:
+            close_prev = df['close'].shift(1)
+            tr = pd.concat([
+                df['high'] - df['low'],
+                (df['high'] - close_prev).abs(),
+                (df['low']  - close_prev).abs(),
+            ], axis=1).max(axis=1)
+        else:
+            logger.warning("compute_spy_crash_series: high/low fehlen — nutze Pseudo-ATR via |Δclose|")
+            tr = df['close'].diff().abs()
+
+        atr = tr.rolling(atr_window, min_periods=atr_window).mean()
+
+        # Lokales Hoch der letzten lookback_high_days Tage (EXKL. heute → shift(1))
+        rolling_high = df['close'].rolling(lookback_high_days, min_periods=1).max().shift(1)
+
+        # Crash-Signal
+        crash = (df['close'] <= rolling_high - crash_atr_mult * atr).fillna(False)
+
+        n_crash = int(crash.sum())
+        logger.info(
+            f"  SPY Crash-Signal: {n_crash} Crash-Tage von {len(crash)} "
+            f"(ATR{atr_window}, lookback={lookback_high_days}d, mult={crash_atr_mult}×)"
+        )
+        return crash
+
+    except Exception as exc:
+        logger.warning(f"compute_spy_crash_series: Fehler '{exc}' — Crash-Schutz deaktiviert")
+        return pd.Series(dtype=bool)
+
+
+def _get_spy_crash(crash_series: "pd.Series | None", date: pd.Timestamp) -> bool:
+    """# RUN H1: Gibt das SPY Crash-Flag für einen bestimmten Handelstag zurück."""
+    if crash_series is None or len(crash_series) == 0:
+        return False
+    try:
+        aligned = _align_date_tz(date, crash_series.index)
+        if aligned in crash_series.index:
+            return bool(crash_series.loc[aligned])
+    except Exception:
+        pass
+    return False
+
+
 # ── Modell laden ──────────────────────────────────────────────────────────────
 
 def load_fold_model(ckpt_path: str, device: str) -> tuple[CrossSectionalLSTM, dict]:
@@ -311,6 +392,22 @@ def run_backtest(
     dd_threshold_2:      float = 0.40,   # 40% DD → Stufe 2 (nur aktiv wenn use_dd_control=True)
     dd_reduction_factor: int   = 2,      # n_max // dd_reduction_factor bei Stufe 1
     dd_recovery_margin:  float = 0.05,   # DD muss 5% besser sein vor Erholung
+    # ── RUN H1: SPY-ATR Crash-Schutz ─────────────────────────────────────────
+    # Einfacher kombinierter Crash-Schutz: schaltet in "Halbgas-Modus" wenn
+    # GLEICHZEITIG gilt:
+    #   (a) SPY-ATR-Signal zeigt Crash  (spy_crash == True)
+    #   (b) Portfolio-Drawdown >= dd_crash_threshold
+    # Im Halbgas-Modus: n_max und n_mid werden halbiert (weniger Positionen,
+    # mehr Cash-Quote). Ausstieg erst wenn BEIDE Bedingungen nicht mehr gelten
+    # + dd_crash_recovery Puffer.
+    # Rotation, Ranking, Modell und Hard-Stop bleiben vollständig unverändert.
+    use_crash_protection:   bool  = True,    # Run H1: kombinierter Crash-Schutz
+    spy_atr_window:         int   = 14,      # ATR-Periode für SPY
+    spy_lookback_high_days: int   = 10,      # Lookback für lokales SPY-Hoch
+    spy_crash_atr_mult:     float = 2.0,     # Multiplikator: Crash wenn < high - mult*ATR
+    dd_crash_threshold:     float = 0.25,    # Portfolio-DD-Schwelle (25%) für Crash-Modus
+    dd_crash_recovery:      float = 0.10,    # Erholungs-Puffer (10%) für Modus-Rückkehr
+    spy_crash_series:       Optional[pd.Series] = None,  # Pre-computed (None = intern)
     # Optionale Pre-built Caches (werden intern aufgebaut wenn None)
     price_cache:      Optional[dict] = None,
     atr_cache:        Optional[dict] = None,
@@ -370,6 +467,28 @@ def run_backtest(
     dd_mode           = 0           # 0=normal, 1=reduziert, 2=defensiv
     dd_mode_days      = 0           # Tage im aktuellen Modus > 0
     dd_events: list[dict] = []      # Log: {date, mode, dd_pct, action}
+
+    # ── RUN H1: Crash-Schutz Tracking ────────────────────────────────────────
+    # spy_crash_series intern berechnen wenn nicht übergeben
+    _crash_series: Optional[pd.Series] = spy_crash_series
+    if use_crash_protection and _crash_series is None:
+        _crash_series = compute_spy_crash_series(
+            raw_dir            = RAW_DIR,
+            spy_ticker         = spy_ticker,
+            atr_window         = spy_atr_window,
+            lookback_high_days = spy_lookback_high_days,
+            crash_atr_mult     = spy_crash_atr_mult,
+        )
+        if len(_crash_series) == 0:
+            logger.warning("  Crash-Schutz deaktiviert (keine SPY-Daten)")
+            use_crash_protection = False
+
+    equity_peak_h1      = init_cash   # laufendes Equity-Peak für H1-DD
+    crash_mode_active   = False
+    crash_mode_days     = 0
+    crash_phases:  list[dict] = []    # abgeschlossene Crash-Phasen
+    _phase_start:  Optional[pd.Timestamp] = None
+    _phase_max_dd: float = 0.0
 
     strategy_name = "Long-Short" if long_short else "Long-Only"
     stop_desc = (
@@ -482,10 +601,56 @@ def run_backtest(
                 else:
                     eff_n_max, eff_n_mid, eff_n_min = n_max, n_mid, n_min
             else:
-                # DD-Control deaktiviert (Run G Baseline):
+                # DD-Control deaktiviert (Run G/H1 Baseline):
                 # N bleibt immer bei den konfigurierten Maximalwerten.
-                # dd_mode bleibt 0 = NORMAL für das gesamte Reporting.
                 eff_n_max, eff_n_mid, eff_n_min = n_max, n_mid, n_min
+
+            # ── RUN H1: Crash-Schutz State-Machine ───────────────────────
+            # Läuft NACH dem DD-Control, kann dessen eff_n weiter reduzieren.
+            # Bedingung Eintritt:  spy_crash=True  UND  portfolio_dd >= threshold
+            # Bedingung Austritt:  spy_crash=False UND  portfolio_dd < (threshold - recovery)
+            if use_crash_protection:
+                equity_peak_h1 = max(equity_peak_h1, current_pv)
+                equity_dd_h1 = (current_pv - equity_peak_h1) / (equity_peak_h1 + 1e-9)
+                spy_crash_today = _get_spy_crash(_crash_series, date)
+
+                if not crash_mode_active:
+                    # Eintritt: BEIDE Bedingungen müssen gleichzeitig gelten
+                    if spy_crash_today and equity_dd_h1 <= -dd_crash_threshold:
+                        crash_mode_active = True
+                        _phase_start      = date
+                        _phase_max_dd     = equity_dd_h1
+                        logger.warning(
+                            f"  HALBGAS-START [{date.date()}]: "
+                            f"SPY-Crash=True  DD={equity_dd_h1*100:.1f}%  "
+                            f"equity={current_pv:,.0f}"
+                        )
+                else:
+                    # Im Crash-Modus: laufenden Worst-DD tracken
+                    _phase_max_dd = min(_phase_max_dd, equity_dd_h1)
+                    # Austritt: BEIDE müssen nicht mehr gelten
+                    recovery_lvl = -(dd_crash_threshold - dd_crash_recovery)
+                    if not spy_crash_today and equity_dd_h1 > recovery_lvl:
+                        crash_mode_active = False
+                        phase_days = crash_mode_days - sum(p['days'] for p in crash_phases)
+                        crash_phases.append({
+                            'start':   str(_phase_start.date()),
+                            'end':     str(date.date()),
+                            'days':    phase_days,
+                            'max_dd':  round(_phase_max_dd * 100, 2),
+                        })
+                        logger.warning(
+                            f"  HALBGAS-ENDE  [{date.date()}]: "
+                            f"SPY-Crash={spy_crash_today}  DD={equity_dd_h1*100:.1f}%  "
+                            f"Phase-Max-DD={_phase_max_dd*100:.1f}%"
+                        )
+
+                if crash_mode_active:
+                    crash_mode_days += 1
+                    # Halbgas: n_max und n_mid halbieren (floor), n_min unverändert
+                    eff_n_max = max(1, eff_n_max // 2)
+                    eff_n_mid = max(1, eff_n_mid // 2)
+                    # eff_n_min bleibt
 
             # ── Regime bestimmen ──────────────────────────────────────────
             if use_regime and spy_prices is not None:
@@ -729,6 +894,16 @@ def run_backtest(
             _close_position(asset, pos, last_date, 'end_of_backtest', 'n/a')
         positions = {}
 
+    # RUN H1: Noch offene Crash-Phase abschließen
+    if use_crash_protection and crash_mode_active and _phase_start is not None and equity_dates:
+        phase_days = crash_mode_days - sum(p['days'] for p in crash_phases)
+        crash_phases.append({
+            'start':   str(_phase_start.date()),
+            'end':     str(equity_dates[-1].date()) + ' (Backtest-Ende)',
+            'days':    phase_days,
+            'max_dd':  round(_phase_max_dd * 100, 2),
+        })
+
     # ── Metriken berechnen ────────────────────────────────────────────────────
     equity_arr = np.array(equity[1:], dtype=float)
     if len(equity_arr) == 0:
@@ -795,13 +970,42 @@ def run_backtest(
         logger.warning(
             f"  Fix-Stop(5%) : n={stats_fix['n']:4d}  "
             f"sum={stats_fix['pnl_sum']:+8.0f}%  avg={stats_fix['pnl_avg']:+5.1f}%  "
-            f"(sollte 0 sein in Run F!)"
+            f"(sollte 0 sein in Run H1!)"
         )
     if use_dd_control and dd_mode_days > 0:
         logger.success(
             f"  DD-Control   : {dd_mode_days} Tage im Schutz-Modus  "
             f"({len(dd_events)} Modus-Wechsel)"
         )
+    # RUN H1: Crash-Schutz Reporting
+    if use_crash_protection:
+        logger.success(f"  ── RUN H1: Crash-Schutz ──────────────────────────")
+        logger.success(
+            f"  Halbgas-Modus: {crash_mode_days} Tage  ({len(crash_phases)} Phasen)"
+        )
+        for ph in crash_phases:
+            logger.success(
+                f"    Phase {ph['start']} → {ph['end']}  "
+                f"({ph['days']}d)  Max-DD={ph['max_dd']:.1f}%"
+            )
+        # Vergleich mit Run G Referenzwerten
+        logger.success(f"  ── Vergleich Run G → Run H1 (Long-Only) ──────────")
+        run_g = {'return': 403.93, 'dd': -55.48, 'sharpe': 0.784, 'trades': 471, 'hold': 14.8}
+        logger.success(
+            f"  {'Kennzahl':15s}  {'Run G':>10s}  {'Run H1':>10s}  {'Delta':>10s}"
+        )
+        pairs = [
+            ('Total Return%', run_g['return'],  total_return),
+            ('Max Drawdown%', run_g['dd'],       max_dd),
+            ('Sharpe',        run_g['sharpe'],   sharpe),
+            ('Trades',        run_g['trades'],   float(len(trade_log))),
+            ('Avg Hold Days', run_g['hold'],     avg_hold),
+        ]
+        for label, g_val, h_val in pairs:
+            delta = h_val - g_val
+            logger.success(
+                f"  {label:15s}  {g_val:>10.2f}  {h_val:>10.2f}  {delta:>+10.2f}"
+            )
     logger.success("═" * 63)
 
     return {
@@ -827,6 +1031,20 @@ def run_backtest(
             'days_in_mode':   dd_mode_days,
             'n_mode_switches': len(dd_events),
             'events':         dd_events,
+        },
+        # RUN H1: Crash-Schutz Stats
+        'crash_protection': {
+            'enabled':         use_crash_protection,
+            'crash_mode_days': crash_mode_days,
+            'n_phases':        len(crash_phases),
+            'phases':          crash_phases,
+            'config': {
+                'spy_atr_window':         spy_atr_window,
+                'spy_lookback_high_days': spy_lookback_high_days,
+                'spy_crash_atr_mult':     spy_crash_atr_mult,
+                'dd_crash_threshold':     dd_crash_threshold,
+                'dd_crash_recovery':      dd_crash_recovery,
+            },
         },
         'equity':        equity_arr.tolist(),
         'equity_dates':  [str(d.date()) for d in equity_dates],

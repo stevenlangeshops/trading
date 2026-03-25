@@ -400,48 +400,56 @@ def step_backtest(features, targets, asset_map, fold_results):
     log_write(f"\n{'='*60}\nSCHRITT 7: Backtest [{elapsed()}]\n{'='*60}")
 
     from strategy.backtest import (
-        run_backtest, build_price_cache, build_atr_cache, plot_equity, compute_benchmarks
+        run_backtest, build_price_cache, build_atr_cache,
+        compute_spy_crash_series, plot_equity, compute_benchmarks
     )
 
-    raw_dir     = REPO_DIR / "data" / "raw"
-    # SPY fuer Regime-Filter und Benchmark laden
-    all_assets  = list(asset_map.keys())
+    raw_dir    = REPO_DIR / "data" / "raw"
+    all_assets = list(asset_map.keys())
     if "SPY" not in all_assets:
         all_assets.append("SPY")
     price_cache = build_price_cache(all_assets, raw_dir=raw_dir)
 
-    # Run G: ATR-Trailing deaktiviert — kein ATR-Cache nötig (spart ~2 Min)
-    # Empirisch belegt: ATR-Stop zerstörte Wert in Run E (-521%) und Run F (-704%).
-    # Das Rotations-Signal des LSTM ist überlegen (Run F: +956% Rotation vs -704% ATR).
-    USE_ATR = False   # Auf True setzen um ATR-Stop wieder zu aktivieren
+    # ATR-Trailing bleibt deaktiviert (empirisch: Rotation > ATR-Stop)
     atr_cache = None
-    if USE_ATR:
-        atr_cache = build_atr_cache(list(asset_map.keys()), raw_dir=raw_dir, period=14)
-        log_write(f"  ATR-Cache: {len(atr_cache)} Assets (period=14)")
-    else:
-        log_write("  ATR-Cache: DEAKTIVIERT (Run G: Rotation > ATR-Stop)")
+    log_write("  ATR-Cache: DEAKTIVIERT (Rotation > ATR-Stop)")
 
-    # Run G Baseline-Konfiguration:
-    # Nur Rotation + Hard-Stop, kein ATR, kein DD-Control.
-    # Ziel: isolierte Messung der reinen Ranking-Signal-Edge.
-    run_g_cfg = dict(
-        use_atr_trailing = USE_ATR,     # False für Run G
-        use_dd_control   = False,       # Explizit: kein Eingriff ins N aufgrund DD
-        hard_stop_pct    = 0.25,        # Gap-Down Failsafe
+    # RUN H1: SPY ATR Crash-Signal vorberechnen (einmalig, geteilt fuer alle Backtests)
+    log_write("  Berechne SPY Crash-Signal (ATR14, Lookback=10d, Mult=2.0)...")
+    spy_crash_series = compute_spy_crash_series(
+        raw_dir            = raw_dir,
+        spy_ticker         = "SPY",
+        atr_window         = 14,
+        lookback_high_days = 10,
+        crash_atr_mult     = 2.0,
+    )
+    n_crash_days = int(spy_crash_series.sum()) if len(spy_crash_series) > 0 else 0
+    log_write(f"  SPY Crash-Signal: {n_crash_days} Crash-Tage vorberechnet")
+
+    # RUN H1 Konfiguration:
+    # Rotation + Hard-Stop (wie Run G) + SPY-ATR Crash-Schutz (Halbgas-Modus).
+    # Nur Long-Only (spart ~50% Rechenzeit gegenueber Long+Short).
+    run_h1_cfg = dict(
+        use_atr_trailing      = False,          # kein ATR-Trailing-Stop
+        use_dd_control        = False,          # kein DD-Control (isolierter Crash-Schutz)
+        hard_stop_pct         = 0.25,           # Gap-Down Failsafe
+        use_crash_protection  = True,           # RUN H1: Crash-Schutz aktiv
+        spy_atr_window        = 14,
+        spy_lookback_high_days= 10,
+        spy_crash_atr_mult    = 2.0,
+        dd_crash_threshold    = 0.25,           # 25% Portfolio-DD → Halbgas
+        dd_crash_recovery     = 0.10,           # 10% Erholung nötig
+        spy_crash_series      = spy_crash_series,
     )
 
+    # Nur Long-Only (Long-Short deaktiviert — spart ~50% Rechenzeit)
     result_a = run_backtest(
         features=features, targets=targets,
         fold_results=fold_results, asset_map=asset_map,
         long_short=False, price_cache=price_cache, atr_cache=atr_cache,
-        **run_g_cfg,
+        **run_h1_cfg,
     )
-    result_b = run_backtest(
-        features=features, targets=targets,
-        fold_results=fold_results, asset_map=asset_map,
-        long_short=True, price_cache=price_cache, atr_cache=atr_cache,
-        **run_g_cfg,
-    )
+    result_b = {}   # Long-Short deaktiviert fuer Run H1
 
     # Benchmarks berechnen (gleicher Zeitraum wie Backtest)
     benchmarks = {}
@@ -528,18 +536,18 @@ def step_pack_artifacts(result_a: dict, result_b: dict):
     sz = tar_path.stat().st_size // 1024
     log_write(f"  {tar_path.name}: {sz} KB, {len(seen)} Dateien")
 
-    # Vorherige Runs als Referenz für direkten Vergleich im Summary (Run G)
+    # Vorherige Runs als Referenz für direkten Vergleich im Summary (Run H1)
     run_e_ref = {
-        "run_d_long_only": {"total_return": 175.0,  "max_drawdown": -60.0,  "sharpe": 0.582,
-                             "n_trades": 520,  "avg_hold_days": 9.7,
-                             "note": "260 assets, GPU, hard_stop=15%, short-term regime"},
-        "run_e_long_only": {"total_return": 29.71,  "max_drawdown": -24.03, "sharpe": 0.414,
-                             "n_trades": 1208, "avg_hold_days": 4.2,
-                             "note": "corr_cap=0.80, risk_parity, stop_loss_5pct"},
+        "run_g_long_only": {"total_return": 403.93, "max_drawdown": -55.48, "sharpe": 0.784,
+                             "n_trades": 471,  "avg_hold_days": 14.8,
+                             "exit_rotation_sum": 1273.0, "exit_hardstop_sum": -779.0,
+                             "note": "Baseline: reine Rotation + Hard-Stop, kein ATR, kein Crash-Schutz"},
         "run_f_long_only": {"total_return": 17.87,  "max_drawdown": -67.96, "sharpe": 0.298,
                              "n_trades": 248,  "avg_hold_days": 13.2,
-                             "exit_rotation_sum": 955.6, "exit_atr_sum": -703.7,
-                             "note": "kein corr_filter, kein risk_parity, ATR k=3.5, DD-ctrl 20/30%"},
+                             "note": "ATR k=3.5, DD-ctrl 20/30%"},
+        "run_d_long_only": {"total_return": 175.0,  "max_drawdown": -60.0,  "sharpe": 0.582,
+                             "n_trades": 520,  "avg_hold_days": 9.7,
+                             "note": "260 assets, GPU training"},
         "benchmarks":      {"spy_bh": "+60.6%", "ew_universe_bh": "+192.8%",
                              "ew_rebalanced": "+167.3%"},
     }
