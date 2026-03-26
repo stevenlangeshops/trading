@@ -563,6 +563,12 @@ def run_backtest(
     #   "reduce_n" : n_long um signal_filter_n_factor reduzieren
     signal_filter_action:      str   = "no_new",
     signal_filter_n_factor:    float = 0.5,    # N * 0.5 bei "reduce_n"
+    # ── Kalibrierter Expected-Return-Filter ───────────────────────────────
+    # Nutzt ein vorab gefittetes Kalibrier-Modell (score → expected_11d_return),
+    # um Neukäufe zu blockieren wenn der Top-1 kalibrierte Return < Schwelle.
+    # Ersetzt den unkalibriertes min_expected_return Filter.
+    calibration_model:    Optional[dict] = None,  # Output von fit_score_to_return_calibration()
+    min_calibrated_return: float = 0.0,           # Schwelle auf kalibriertem E[ret]
     # Optionale Pre-built Caches (werden intern aufgebaut wenn None)
     price_cache:      Optional[dict] = None,
     atr_cache:        Optional[dict] = None,
@@ -664,6 +670,10 @@ def run_backtest(
     equity_sig_weak:  list[float] = []
     equity_sig_strong: list[float] = []
     daily_signals: list[dict] = []     # Rohdaten pro Handelstag
+
+    # ── Kalibrierter Return Filter Tracking ───────────────────────────────
+    calib_filter_active_days = 0
+    calib_top1_expected: list[float] = []  # kalibrierter E[ret] des Top-1 pro Tag
 
     strategy_name = "Long-Short" if long_short else "Long-Only"
     stop_desc = (
@@ -914,6 +924,18 @@ def run_backtest(
                 sig_strong_days += 1
                 sig_strong_spreads.append(score_spread)
 
+            # ── Kalibrierter Expected-Return-Filter ─────────────────────
+            calib_exp_top1 = None
+            if calibration_model is not None:
+                from strategy.calibration import predict_expected_return as _calib_pred
+                top1_scores = np.array([score_top1])
+                calib_exp_top1 = float(_calib_pred(calibration_model, top1_scores)[0])
+                calib_top1_expected.append(calib_exp_top1)
+
+                if calib_exp_top1 < min_calibrated_return:
+                    allow_new_entries = False
+                    calib_filter_active_days += 1
+
             # Rohdaten für diesen Tag
             daily_signals.append({
                 'date':           str(date.date()),
@@ -930,6 +952,7 @@ def run_backtest(
                 'signal_weak':    signal_weak_today,
                 'allow_new':      allow_new_entries,
                 'best_pred':      round(best_pred, 6),
+                'calib_exp_top1': round(calib_exp_top1, 6) if calib_exp_top1 is not None else None,
                 'equity':         round(cash + _position_value(positions, price_cache, date), 2),
             })
 
@@ -1316,6 +1339,24 @@ def run_backtest(
                 f"strong={avg_s:+.4f}%({len(equity_sig_strong)}d)"
             )
 
+    # ── Kalibrierter Expected-Return-Filter Reporting ─────────────────────
+    if calibration_model is not None and calib_top1_expected:
+        total_days_c = len(calib_top1_expected)
+        avg_exp_all = np.mean(calib_top1_expected)
+        calib_active = [e for e in calib_top1_expected if e < min_calibrated_return]
+        calib_inactive = [e for e in calib_top1_expected if e >= min_calibrated_return]
+        logger.success(f"  ── Kalibrierter E[ret] Filter ────────────────────")
+        logger.success(
+            f"  Filter aktiv  : {calib_filter_active_days}/{total_days_c} Tage "
+            f"({calib_filter_active_days/total_days_c*100:.1f}%)"
+        )
+        logger.success(f"  Threshold     : {min_calibrated_return*100:.2f}%")
+        logger.success(f"  Avg E[ret] Top1: {avg_exp_all*100:.4f}%")
+        if calib_active:
+            logger.success(f"  Avg E[ret] (Filter ON):  {np.mean(calib_active)*100:.4f}%")
+        if calib_inactive:
+            logger.success(f"  Avg E[ret] (Filter OFF): {np.mean(calib_inactive)*100:.4f}%")
+
     if use_dd_control and dd_mode_days > 0:
         logger.success(
             f"  DD-Control   : {dd_mode_days} Tage im Schutz-Modus  "
@@ -1402,6 +1443,15 @@ def run_backtest(
             'avg_daily_ret_strong': round(float(np.mean(equity_sig_strong)) * 100, 4) if equity_sig_strong else None,
         },
         # DD-Control Stats
+        'calibrated_return_filter': {
+            'enabled':               calibration_model is not None,
+            'threshold':             min_calibrated_return,
+            'method':                calibration_model.get('method', 'n/a') if calibration_model else 'n/a',
+            'filter_active_days':    calib_filter_active_days,
+            'total_days':            len(calib_top1_expected),
+            'pct_active':            round(calib_filter_active_days / len(calib_top1_expected) * 100, 1) if calib_top1_expected else 0.0,
+            'avg_exp_return_top1':   round(float(np.mean(calib_top1_expected)) * 100, 4) if calib_top1_expected else None,
+        },
         'dd_control': {
             'enabled':        use_dd_control,
             'days_in_mode':   dd_mode_days,

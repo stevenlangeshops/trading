@@ -420,31 +420,112 @@ def step_backtest(features, targets, asset_map, fold_results):
     atr_cache = None
     log_write("  ATR-Cache: DEAKTIVIERT (Rotation > ATR-Stop)")
 
-    # Run G Baseline + Expected-Return-Filter (neu):
-    # Rotation + Hard-Stop wie Run G. Kein ATR-Stop, kein DD-Control,
-    # kein Crash-Protection. Neu: min_expected_return Filter blockiert
-    # Neukäufe wenn Top-1 pred_return < 0%.
+    # ── Schritt 7a: Score→Return Kalibrierung ──────────────────────────────
+    log_write(f"\n  ── Kalibrierung: Score → Expected Return [{elapsed()}] ──")
+    calib_model = None
+    calib_eval  = None
+    try:
+        from strategy.calibration import (
+            collect_score_return_pairs,
+            fit_score_to_return_calibration,
+            predict_expected_return as calib_predict,
+            evaluate_calibration,
+        )
+        import numpy as np
+
+        log_write("  Sammle Score-Return-Paare aus Walk-Forward Val-Perioden...")
+        calib_df = collect_score_return_pairs(
+            features=features, targets=targets,
+            fold_results=fold_results, asset_map=asset_map,
+        )
+
+        if len(calib_df) > 100:
+            scores_arr  = calib_df['score'].values
+            returns_arr = calib_df['true_return_11d'].values
+
+            # 80/20-Split zeitlich (nach Datum sortiert, damit kein Lookahead)
+            calib_df_sorted = calib_df.sort_values('date')
+            n_train = int(len(calib_df_sorted) * 0.8)
+            train_df = calib_df_sorted.iloc[:n_train]
+            val_df   = calib_df_sorted.iloc[n_train:]
+
+            log_write(f"  Train: {len(train_df)}  Val: {len(val_df)} Paare")
+            log_write(f"  Train-Zeitraum: {train_df['date'].min().date()} → {train_df['date'].max().date()}")
+            log_write(f"  Val-Zeitraum  : {val_df['date'].min().date()} → {val_df['date'].max().date()}")
+
+            # Isotonic Regression (monoton, robust)
+            calib_model = fit_score_to_return_calibration(
+                train_df['score'].values,
+                train_df['true_return_11d'].values,
+                method='isotonic',
+            )
+
+            # Auch lineare Kalibrierung zum Vergleich loggen
+            calib_linear = fit_score_to_return_calibration(
+                train_df['score'].values,
+                train_df['true_return_11d'].values,
+                method='linear',
+            )
+            log_write(f"  Linear: E[ret] = {calib_linear['a']*100:.4f}% + {calib_linear['b']*100:.4f}% * score")
+
+            # Evaluation auf Val-Set
+            log_write("  Evaluation auf Val-Set:")
+            calib_eval = evaluate_calibration(
+                val_df, calib_model,
+                save_dir=str(WORKING),
+            )
+
+            # Auch auf Gesamt-Set evaluieren
+            log_write("  Evaluation auf Gesamt-Set:")
+            calib_eval_full = evaluate_calibration(calib_df, calib_model)
+
+            # Kalibrierungs-Stats als JSON speichern
+            calib_report = {
+                'n_pairs_total':    len(calib_df),
+                'n_pairs_train':    len(train_df),
+                'n_pairs_val':      len(val_df),
+                'method':           calib_model['method'],
+                'val_metrics':      calib_eval,
+                'full_metrics':     calib_eval_full,
+            }
+            with open(WORKING / "calibration_report.json", "w") as f:
+                json.dump(calib_report, f, indent=2, default=str)
+            log_write(f"  calibration_report.json gespeichert")
+
+            # Kalibrierte Scores als CSV speichern (für Offline-Analyse)
+            calib_df['expected_return'] = calib_predict(calib_model, calib_df['score'].values)
+            calib_df.to_csv(str(WORKING / "calibration_data.csv"), index=False)
+            log_write(f"  calibration_data.csv gespeichert ({len(calib_df)} Zeilen)")
+        else:
+            log_write(f"  [WARN] Zu wenig Daten fuer Kalibrierung: {len(calib_df)}")
+    except Exception as e:
+        log_write(f"  [WARN] Kalibrierung fehlgeschlagen: {e}")
+        import traceback
+        log_write(traceback.format_exc())
+
+    # ── Schritt 7b: Run G_calib Backtest ───────────────────────────────────
+    # Run G Baseline-Setup + kalibrierter Expected-Return-Filter
     run_cfg = dict(
         use_atr_trailing      = False,
         use_dd_control        = False,
         hard_stop_pct         = 0.25,
         use_crash_protection  = False,
-        # Expected-Return-Filter (wirkungslos bei Schwelle 0, bleibt als Tracking)
         use_min_expected_return_filter = False,
-        min_expected_return_top       = 0.0,
         use_avg_topN_filter           = False,
         existing_pos_exit_margin      = 0.02,
-        # Signalstärke-Filter (NEU): Spread Top1 vs Median
-        use_signal_strength_filter    = True,
-        use_score_spread_filter       = True,
-        min_score_spread_top1_med     = 0.002,   # 0.2 Pp
-        use_score_std_filter          = False,
-        min_score_std_universe        = 0.003,
-        signal_filter_action          = "no_new",
-        signal_filter_n_factor        = 0.5,
+        use_signal_strength_filter    = False,
+        # Kalibrierter Return-Filter
+        calibration_model     = calib_model,
+        min_calibrated_return = 0.0,
     )
 
-    # Nur Long-Only
+    log_write(f"\n  ── Run G_calib: Backtest mit kalibriertem Filter [{elapsed()}] ──")
+    if calib_model:
+        log_write(f"  Filter: E[ret_top1] >= {run_cfg['min_calibrated_return']*100:.1f}%  "
+                  f"(Methode: {calib_model['method']})")
+    else:
+        log_write("  Kein Kalibrier-Modell — Run G ohne Filter")
+
     result_a = run_backtest(
         features=features, targets=targets,
         fold_results=fold_results, asset_map=asset_map,
@@ -528,6 +609,9 @@ def step_pack_artifacts(result_a: dict, result_b: dict):
         WORKING / "crash_3d_analysis.json",
         WORKING / "daily_signals.json",
         WORKING / "signal_diagnostics.png",
+        WORKING / "calibration_report.json",
+        WORKING / "calibration_data.csv",
+        WORKING / "calibration_diagnostics.png",
     ]
 
     # Checkpoints
@@ -554,6 +638,8 @@ def step_pack_artifacts(result_a: dict, result_b: dict):
         "run_h1_long_only": {"total_return": 335.25, "max_drawdown": -54.49, "sharpe": 0.724,
                               "n_trades": 406, "avg_hold_days": 14.3,
                               "note": "SPY-ATR Halbgas-Modus"},
+        "run_h2_signal_filter": {"total_return": -18.3, "max_drawdown": -41.99, "sharpe": -0.028,
+                                  "n_trades": 108, "note": "Signal-Spread-Filter, 86% aktiv"},
         "benchmarks":       {"spy_bh": "+60.6%", "ew_universe_bh": "+192.8%",
                               "ew_rebalanced": "+167.3%"},
     }
