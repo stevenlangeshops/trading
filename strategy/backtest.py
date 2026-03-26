@@ -534,6 +534,19 @@ def run_backtest(
     dd_crash_threshold:     float = 0.25,    # Portfolio-DD-Schwelle (25%) für Crash-Modus
     dd_crash_recovery:      float = 0.10,    # Erholungs-Puffer (10%) für Modus-Rückkehr
     spy_crash_series:       Optional[pd.Series] = None,  # Pre-computed (None = intern)
+    # ── Mindest-Expected-Return Filter ─────────────────────────────────────
+    # Geht nur in Aktien, deren Modell-Output (pred_return) hoch genug ist.
+    # In Phasen, in denen selbst die Top-gerankte Aktie einen negativen oder
+    # sehr niedrigen Return erwartet, werden KEINE neuen Positionen eröffnet.
+    # Bestehende Positionen werden weiter nach Rotation/Stop gemanagt.
+    use_min_expected_return_filter: bool  = True,
+    min_expected_return_top:       float = 0.0,   # Schwelle für Top-1 pred_return
+    # Optional: stärkere Bedingung auf den Durchschnitt der Top-N
+    use_avg_topN_filter:           bool  = False,
+    min_avg_expected_return_topN:  float = 0.0,   # nur wenn use_avg_topN_filter=True
+    # Bestehende Positionen mit stark negativem pred_return als Rotations-
+    # Kandidat behandeln (verkaufen), auch wenn sie noch im Top-N-Rang sind.
+    existing_pos_exit_margin:      float = 0.02,  # Marge unter threshold → Exit-Kandidat
     # Optionale Pre-built Caches (werden intern aufgebaut wenn None)
     price_cache:      Optional[dict] = None,
     atr_cache:        Optional[dict] = None,
@@ -616,6 +629,15 @@ def run_backtest(
     _phase_start:  Optional[pd.Timestamp] = None
     _phase_max_dd: float = 0.0
 
+    # ── Expected-Return-Filter Tracking ──────────────────────────────────
+    filter_active_days   = 0           # Tage an denen allow_new_entries=False
+    filter_active_dates: list[str] = []
+    top1_preds:  list[float] = []      # best pred_return pro Tag
+    topN_preds:  list[float] = []      # avg top-N pred_return pro Tag
+    # Equity-Tracking getrennt nach Filter-Zustand (für spätere Auswertung)
+    equity_filter_on:  list[float] = []   # daily returns an Filter-aktiv Tagen
+    equity_filter_off: list[float] = []   # daily returns an normalen Tagen
+
     strategy_name = "Long-Short" if long_short else "Long-Only"
     stop_desc = (
         f"ATR-Trailing(period={atr_period}, k={atr_k})"
@@ -635,11 +657,17 @@ def run_backtest(
         f"hard_stop={hard_stop_pct*100:.0f}%  fix_stop=OFF  "
         f"[Run G Baseline]"
     )
+    filter_desc = (
+        f"min_ret_filter={'ON' if use_min_expected_return_filter else 'OFF'}"
+        f"(top1>={min_expected_return_top*100:.1f}%)"
+        + (f" avg_topN>={min_avg_expected_return_topN*100:.1f}%" if use_avg_topN_filter else "")
+    )
     logger.info(
         f"  Portfolio: corr_cap={'OFF' if corr_cap >= 1.0 else f'{corr_cap:.2f}'}  "
         f"vol_sizing={'OFF' if not use_vol_sizing else f'ON(risk={risk_per_trade:.2%})'}  "
         f"{dd_desc}"
     )
+    logger.info(f"  Filter: {filter_desc}")
 
     def _close_position(asset: str, pos: dict, date, reason: str, regime: str) -> None:
         """Schließt eine Position, bucht Erlös und schreibt Trade-Log."""
@@ -803,6 +831,25 @@ def run_backtest(
             # Rang-Lookup: asset → Rang (0 = bester)
             rank_of = {asset: i for i, asset in enumerate(preds.index)}
 
+            # ── Expected-Return-Filter ─────────────────────────────────────
+            best_pred = float(preds.iloc[0]) if len(preds) > 0 else 0.0
+            avg_topN  = float(preds.iloc[:max(n_long, 1)].mean()) if len(preds) > 0 else 0.0
+            top1_preds.append(best_pred)
+            topN_preds.append(avg_topN)
+
+            allow_new_entries = True
+            if use_min_expected_return_filter:
+                if best_pred < min_expected_return_top:
+                    allow_new_entries = False
+
+            if allow_new_entries and use_avg_topN_filter:
+                if avg_topN < min_avg_expected_return_topN:
+                    allow_new_entries = False
+
+            if not allow_new_entries:
+                filter_active_days += 1
+                filter_active_dates.append(str(date.date()))
+
             # ── ATR-Trailing-Stop täglich nachziehen (nur Long, nur nach oben) ──
             # Formel: stop_candidate = close - k * ATR
             #         new_stop       = max(old_stop, stop_candidate)
@@ -851,10 +898,18 @@ def run_backtest(
                         to_close.append((asset, 'atr_trailing_stop'))
                         continue
 
-                # b) Rotation: nur wenn Rang deutlich außerhalb Top-N
+                # b) Expected-Return-Filter: bestehende Position mit stark negativem
+                #    pred_return als Exit-Kandidat markieren (schrittweise Exposure-Reduktion)
+                if use_min_expected_return_filter:
+                    asset_pred = float(preds.get(asset, 0.0))
+                    exit_thresh = min_expected_return_top - existing_pos_exit_margin
+                    if asset_pred < exit_thresh:
+                        to_close.append((asset, 'low_pred_return'))
+                        continue
+
+                # c) Rotation: nur wenn Rang deutlich außerhalb Top-N
                 asset_rank = rank_of.get(asset, len(preds))
                 if asset_rank >= n_long + rotation_buffer:
-                    # Prüfen ob ein besserer Kandidat existiert der noch nicht gehalten wird
                     held_after_close = set(positions) - {a for a, _ in to_close}
                     candidates = [a for a in preds.index[:n_long]
                                   if a not in held_after_close]
@@ -868,7 +923,7 @@ def run_backtest(
 
             # ── Freie Slots mit besten Kandidaten füllen ─────────────────
             free_slots = n_long - len(positions)
-            if free_slots > 0:
+            if free_slots > 0 and allow_new_entries:
                 held = set(positions.keys())
 
                 # Run F: Pure Model-Ranking ohne Korrelations-Filter (corr_cap=1.0 Standard).
@@ -1013,6 +1068,14 @@ def run_backtest(
             equity.append(portfolio_value)
             equity_dates.append(date)
 
+            # Daily-Return nach Filter-Zustand tracken
+            if len(equity) >= 3:
+                day_ret = (equity[-1] - equity[-2]) / (equity[-2] + 1e-9)
+                if not allow_new_entries:
+                    equity_filter_on.append(day_ret)
+                else:
+                    equity_filter_off.append(day_ret)
+
     # Letzte Positionen auflösen (Ende des Backtests)
     if positions and equity_dates:
         last_date = equity_dates[-1]
@@ -1064,6 +1127,7 @@ def run_backtest(
     stats_atr     = _exit_stats('atr_trailing_stop')
     stats_fix     = _exit_stats('stop_loss')
     stats_rot     = _exit_stats('rotation')
+    stats_lowpred = _exit_stats('low_pred_return')
 
     stop_hits = stats_hard['n'] + stats_atr['n'] + stats_fix['n']
 
@@ -1092,12 +1156,48 @@ def run_backtest(
         f"sum={stats_hard['pnl_sum']:+8.0f}%  avg={stats_hard['pnl_avg']:+5.1f}%  "
         f"hold={stats_hard['hold_avg']:.1f}d  win={stats_hard['win_pct']:.0f}%"
     )
+    if stats_lowpred['n'] > 0:
+        logger.success(
+            f"  Low-Pred-Exit: n={stats_lowpred['n']:4d}  "
+            f"sum={stats_lowpred['pnl_sum']:+8.0f}%  avg={stats_lowpred['pnl_avg']:+5.1f}%  "
+            f"hold={stats_lowpred['hold_avg']:.1f}d  win={stats_lowpred['win_pct']:.0f}%"
+        )
     if stats_fix['n'] > 0:
         logger.warning(
             f"  Fix-Stop(5%) : n={stats_fix['n']:4d}  "
             f"sum={stats_fix['pnl_sum']:+8.0f}%  avg={stats_fix['pnl_avg']:+5.1f}%  "
             f"(sollte 0 sein in Run H1!)"
         )
+
+    # ── Expected-Return-Filter Reporting ────────────────────────────────────
+    if use_min_expected_return_filter:
+        total_days = len(top1_preds)
+        avg_top1 = np.mean(top1_preds) if top1_preds else 0.0
+        avg_topN_all = np.mean(topN_preds) if topN_preds else 0.0
+        logger.success(f"  ── Expected-Return-Filter ────────────────────────")
+        logger.success(
+            f"  Filter aktiv  : {filter_active_days}/{total_days} Tage "
+            f"({filter_active_days/total_days*100:.1f}%)" if total_days > 0 else
+            "  Filter aktiv  : 0/0 Tage"
+        )
+        logger.success(f"  Avg Top-1 Pred: {avg_top1*100:.3f}%")
+        logger.success(f"  Avg Top-N Pred: {avg_topN_all*100:.3f}%")
+        logger.success(f"  Low-Pred Exits : {stats_lowpred['n']}")
+
+        if equity_filter_on and equity_filter_off:
+            avg_ret_on  = np.mean(equity_filter_on) * 100
+            avg_ret_off = np.mean(equity_filter_off) * 100
+            std_on      = np.std(equity_filter_on) * 100
+            std_off     = np.std(equity_filter_off) * 100
+            logger.success(
+                f"  Avg Daily-Ret (Filter ON) : {avg_ret_on:+.4f}%  "
+                f"std={std_on:.4f}%  ({len(equity_filter_on)} Tage)"
+            )
+            logger.success(
+                f"  Avg Daily-Ret (Filter OFF): {avg_ret_off:+.4f}%  "
+                f"std={std_off:.4f}%  ({len(equity_filter_off)} Tage)"
+            )
+
     if use_dd_control and dd_mode_days > 0:
         logger.success(
             f"  DD-Control   : {dd_mode_days} Tage im Schutz-Modus  "
@@ -1144,12 +1244,26 @@ def run_backtest(
         'avg_hold_days':  round(avg_hold, 1),
         'stop_loss_hits': stop_hits,
         'rotations':      stats_rot['n'],
-        # Detaillierte Exit-Stats (Run F Reporting)
         'exit_stats': {
             'rotation':          stats_rot,
             'atr_trailing_stop': stats_atr,
             'hard_stop':         stats_hard,
             'fix_stop':          stats_fix,
+            'low_pred_return':   stats_lowpred,
+        },
+        'expected_return_filter': {
+            'enabled':             use_min_expected_return_filter,
+            'min_top1_threshold':  min_expected_return_top,
+            'avg_topN_enabled':    use_avg_topN_filter,
+            'avg_topN_threshold':  min_avg_expected_return_topN,
+            'filter_active_days':  filter_active_days,
+            'total_days':          len(top1_preds),
+            'pct_active':          round(filter_active_days / len(top1_preds) * 100, 1) if top1_preds else 0.0,
+            'avg_top1_pred':       round(float(np.mean(top1_preds)) * 100, 4) if top1_preds else 0.0,
+            'avg_topN_pred':       round(float(np.mean(topN_preds)) * 100, 4) if topN_preds else 0.0,
+            'low_pred_exits':      stats_lowpred['n'],
+            'avg_daily_ret_filter_on':  round(float(np.mean(equity_filter_on)) * 100, 4) if equity_filter_on else None,
+            'avg_daily_ret_filter_off': round(float(np.mean(equity_filter_off)) * 100, 4) if equity_filter_off else None,
         },
         # DD-Control Stats
         'dd_control': {
