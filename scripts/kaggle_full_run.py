@@ -612,13 +612,23 @@ def step_pack_artifacts(result_a: dict, result_b: dict):
         WORKING / "calibration_report.json",
         WORKING / "calibration_data.csv",
         WORKING / "calibration_diagnostics.png",
+        # v2_return_multi Artefakte
+        WORKING / "v2_walk_forward_results.json",
+        WORKING / "v2_backtest_results.json",
+        WORKING / "v2_trade_log.json",
+        WORKING / "v2_daily_signals.json",
+        WORKING / "benchmark_v1_vs_v2_multi.json",
+        WORKING / "v1_vs_v2_equity.png",
     ]
 
-    # Checkpoints
+    # Checkpoints (v1 + v2)
     ckpt_dir = REPO_DIR / "checkpoints"
     if ckpt_dir.is_dir():
         collect += list(ckpt_dir.glob("*.pt"))
         collect += list(ckpt_dir.glob("*.json"))
+    ckpt_v2 = REPO_DIR / "checkpoints" / "v2_return_multi"
+    if ckpt_v2.is_dir():
+        collect += list(ckpt_v2.glob("*.pt"))
 
     tar_path = WORKING / "kaggle_artifacts.tar.gz"
     with tarfile.open(str(tar_path), "w:gz") as tf:
@@ -871,6 +881,119 @@ def step_load_checkpoints(asset_map: dict) -> list[dict] | None:
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
+# ── v2_return_multi Pipeline Steps ────────────────────────────────────────────
+
+def step_build_multi_targets(features, asset_map):
+    """Schritt 10: Multi-Horizon Targets für v2 berechnen."""
+    log_write(f"\n{'='*60}\nSCHRITT 10: v2 Multi-Horizon Targets [{elapsed()}]\n{'='*60}")
+
+    for _mod in list(sys.modules.keys()):
+        if _mod.startswith(("config_v2", "models_v2", "train_v2", "backtest_v2")):
+            del sys.modules[_mod]
+
+    from config_v2_return_multi import V2Config
+    from train_v2_return_multi import build_multi_horizon_targets
+
+    cfg = V2Config()
+    raw_dir = REPO_DIR / "data" / "raw"
+
+    targets_multi = build_multi_horizon_targets(
+        raw_dir=raw_dir, horizons=cfg.horizons,
+        asset_list=list(asset_map.keys()),
+    )
+    log_write(f"  Multi-Targets: {len(targets_multi)} Zeilen, "
+              f"Horizonte={cfg.horizons}")
+    return targets_multi, cfg
+
+
+def step_train_v2(features, targets_multi, asset_map, cfg):
+    """Schritt 11: Walk-Forward Training für v2_return_multi."""
+    log_write(f"\n{'='*60}\nSCHRITT 11: v2 Training [{elapsed()}]\n{'='*60}")
+
+    from train_v2_return_multi import train_walk_forward_v2
+
+    cfg.checkpoint_dir = REPO_DIR / "checkpoints" / "v2_return_multi"
+    cfg.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+    wf_result = train_walk_forward_v2(features, targets_multi, asset_map, cfg)
+
+    wf_path = WORKING / "v2_walk_forward_results.json"
+    import json as _json
+    with open(wf_path, "w") as f:
+        safe = {k: v for k, v in wf_result.items() if k != "fold_results"}
+        safe["fold_summary"] = [
+            {k: v for k, v in fr.items() if k != "best_val_comp"}
+            for fr in wf_result["fold_results"]
+        ]
+        _json.dump(safe, f, indent=2, default=str)
+    log_write(f"  v2_walk_forward_results.json gespeichert")
+
+    return wf_result
+
+
+def step_backtest_v2(features, targets_multi, asset_map, v2_fold_results, cfg, v1_result_a):
+    """Schritt 12: Backtest für v2 + Vergleich mit v1 (Run G)."""
+    log_write(f"\n{'='*60}\nSCHRITT 12: v2 Backtest [{elapsed()}]\n{'='*60}")
+
+    from backtest_v2_return_multi import (
+        run_backtest_v2, build_v1_vs_v2_report, plot_v1_vs_v2,
+    )
+    from strategy.backtest import build_price_cache, compute_benchmarks
+
+    raw_dir = REPO_DIR / "data" / "raw"
+    all_assets = list(asset_map.keys())
+    if "SPY" not in all_assets:
+        all_assets.append("SPY")
+    price_cache = build_price_cache(all_assets, raw_dir=raw_dir)
+
+    v2_result = run_backtest_v2(
+        features=features, targets_multi=targets_multi,
+        fold_results=v2_fold_results, asset_map=asset_map,
+        cfg=cfg, price_cache=price_cache,
+    )
+
+    # Ergebnisse speichern
+    def slim(r):
+        return {k: v for k, v in r.items()
+                if k not in ("equity", "trade_log", "equity_dates", "daily_signals")}
+
+    with open(WORKING / "v2_backtest_results.json", "w") as f:
+        json.dump(slim(v2_result), f, indent=2)
+    with open(WORKING / "v2_trade_log.json", "w") as f:
+        json.dump(v2_result.get("trade_log", []), f, indent=2)
+    with open(WORKING / "v2_daily_signals.json", "w") as f:
+        json.dump(v2_result.get("daily_signals", []), f, indent=1)
+
+    # v1 vs v2 Vergleich
+    benchmark_report = build_v1_vs_v2_report(
+        v1_result=v1_result_a, v2_result=v2_result,
+        save_path=str(WORKING / "benchmark_v1_vs_v2_multi.json"),
+    )
+
+    # Benchmarks
+    benchmarks = {}
+    try:
+        benchmarks = compute_benchmarks(
+            price_cache=price_cache,
+            equity_dates=v2_result.get("equity_dates", []),
+            asset_map=asset_map, init_cash=10_000.0,
+        )
+    except Exception as e:
+        log_write(f"  [WARN] v2 benchmarks: {e}")
+
+    # Vergleichs-Plot
+    try:
+        plot_v1_vs_v2(
+            v1_result=v1_result_a, v2_result=v2_result,
+            benchmarks=benchmarks,
+            save_path=str(WORKING / "v1_vs_v2_equity.png"),
+        )
+    except Exception as e:
+        log_write(f"  [WARN] v2 plot: {e}")
+
+    return v2_result
+
+
 def main() -> int:
     _init_log()
     log_write(f"Trading Bot Full Pipeline | {time.strftime('%Y-%m-%d %H:%M:%S UTC')}")
@@ -883,16 +1006,28 @@ def main() -> int:
         features, targets = step_build_panel()
         asset_map         = step_build_asset_map(features)
 
-        # Vorhandene Checkpoints nutzen wenn verfügbar und asset-kompatibel
+        # ── v1_rank (Run G) ───────────────────────────────────────────
         fold_results = step_load_checkpoints(asset_map)
         if fold_results is None:
             fold_results = step_train(features, targets, asset_map)
 
         result_a, result_b = step_backtest(features, targets, asset_map, fold_results)
+
+        # ── v2_return_multi ───────────────────────────────────────────
+        try:
+            targets_multi, cfg_v2 = step_build_multi_targets(features, asset_map)
+            v2_wf = step_train_v2(features, targets_multi, asset_map, cfg_v2)
+            v2_result = step_backtest_v2(
+                features, targets_multi, asset_map,
+                v2_wf["fold_results"], cfg_v2, result_a,
+            )
+        except Exception as v2_exc:
+            import traceback
+            log_write(f"\n[v2 ERROR]\n{traceback.format_exc()}")
+            v2_result = {}
+
         step_pack_artifacts(result_a, result_b)
         log_write(f"\n[DONE] Gesamtdauer: {elapsed()}")
-        # Ergebnisse dauerhaft in Kaggle Dataset speichern (non-blocking: Fehler hier
-        # brechen den erfolgreichen Run nicht ab)
         try:
             step_persist_results()
         except Exception as persist_exc:
