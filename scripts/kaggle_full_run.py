@@ -1032,7 +1032,7 @@ def main() -> int:
     # V2_ONLY = True  → v1 überspringen, nur v2_return_multi
     # V2_MAX_ASSETS   → Asset-Limit für schnellen Testlauf (0 = alle)
     V2_ONLY       = True
-    V2_MAX_ASSETS = 20   # 0 = alle Assets
+    V2_MAX_ASSETS = 0    # 0 = alle Assets (260 S&P 500)
     # ──────────────────────────────────────────────────────────────────
 
     try:
