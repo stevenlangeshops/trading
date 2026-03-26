@@ -472,7 +472,8 @@ def step_backtest(features, targets, asset_map, fold_results):
 
     # JSON-Ergebnisse speichern
     def slim(r):
-        return {k: v for k, v in r.items() if k not in ("equity", "trade_log", "equity_dates")}
+        return {k: v for k, v in r.items()
+                if k not in ("equity", "trade_log", "equity_dates", "daily_signals")}
 
     with open(WORKING / "backtest_results_long_only.json", "w") as f:
         json.dump(slim(result_a), f, indent=2)
@@ -481,6 +482,10 @@ def step_backtest(features, targets, asset_map, fold_results):
 
     with open(WORKING / "trade_log_long_only.json", "w") as f:
         json.dump(result_a.get("trade_log", []), f, indent=2)
+
+    with open(WORKING / "daily_signals.json", "w") as f:
+        json.dump(result_a.get("daily_signals", []), f, indent=1)
+    log_write(f"  daily_signals.json: {len(result_a.get('daily_signals', []))} Tage")
 
     try:
         plot_equity(result_a, result_b,
@@ -507,7 +512,8 @@ def step_pack_artifacts(result_a: dict, result_b: dict):
         WORKING / "trade_log_long_short.json",
         WORKING / "equity_curve.png",
         WORKING / "kernel_summary.json",
-        WORKING / "crash_3d_analysis.json",      # RUN H2
+        WORKING / "crash_3d_analysis.json",
+        WORKING / "daily_signals.json",
     ]
 
     # Checkpoints

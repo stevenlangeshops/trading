@@ -657,12 +657,13 @@ def run_backtest(
     # ── Signalstärke-Filter Tracking ──────────────────────────────────────
     sig_weak_days          = 0
     sig_strong_days        = 0
-    sig_spreads:    list[float] = []   # score_spread pro Tag (Top1 - Median)
-    sig_stds:       list[float] = []   # score_std pro Tag
+    sig_spreads:    list[float] = []
+    sig_stds:       list[float] = []
     sig_weak_spreads: list[float] = []
     sig_strong_spreads: list[float] = []
-    equity_sig_weak:  list[float] = []   # daily returns an weak-Tagen
-    equity_sig_strong: list[float] = []  # daily returns an strong-Tagen
+    equity_sig_weak:  list[float] = []
+    equity_sig_strong: list[float] = []
+    daily_signals: list[dict] = []     # Rohdaten pro Handelstag
 
     strategy_name = "Long-Short" if long_short else "Long-Only"
     stop_desc = (
@@ -912,6 +913,25 @@ def run_backtest(
             else:
                 sig_strong_days += 1
                 sig_strong_spreads.append(score_spread)
+
+            # Rohdaten für diesen Tag
+            daily_signals.append({
+                'date':           str(date.date()),
+                'regime':         regime if use_regime else 'n/a',
+                'n_long':         n_long,
+                'n_assets':       len(preds),
+                'n_positions':    len(positions),
+                'score_top1':     round(score_top1, 6),
+                'score_med':      round(score_med, 6),
+                'score_spread':   round(score_spread, 6),
+                'score_std':      round(score_std, 6),
+                'score_top5_avg': round(float(preds.iloc[:5].mean()), 6) if len(preds) >= 5 else None,
+                'score_bot5_avg': round(float(preds.iloc[-5:].mean()), 6) if len(preds) >= 5 else None,
+                'signal_weak':    signal_weak_today,
+                'allow_new':      allow_new_entries,
+                'best_pred':      round(best_pred, 6),
+                'equity':         round(cash + _position_value(positions, price_cache, date), 2),
+            })
 
             # ── ATR-Trailing-Stop täglich nachziehen (nur Long, nur nach oben) ──
             # Formel: stop_candidate = close - k * ATR
@@ -1405,6 +1425,7 @@ def run_backtest(
         'equity':        equity_arr.tolist(),
         'equity_dates':  [str(d.date()) for d in equity_dates],
         'trade_log':     trade_log,
+        'daily_signals': daily_signals,
     }
 
 
