@@ -547,6 +547,22 @@ def run_backtest(
     # Bestehende Positionen mit stark negativem pred_return als Rotations-
     # Kandidat behandeln (verkaufen), auch wenn sie noch im Top-N-Rang sind.
     existing_pos_exit_margin:      float = 0.02,  # Marge unter threshold → Exit-Kandidat
+    # ── Signalstärke-Filter ────────────────────────────────────────────────
+    # Misst, wie klar das Modell heute zwischen Gewinnern und Verlierern
+    # unterscheidet. Wenn alle Scores ähnlich → Signal ist "weak" → weniger
+    # oder gar nicht handeln. Unabhängig vom absoluten Score-Niveau.
+    use_signal_strength_filter: bool  = True,
+    # Variante A: Spread zwischen Top-1 Score und Median aller Scores
+    use_score_spread_filter:   bool  = True,
+    min_score_spread_top1_med: float = 0.002,  # ~0.2 Pp — anpassbar per Backtest
+    # Variante B: Standardabweichung der Scores im gesamten Universum
+    use_score_std_filter:      bool  = False,
+    min_score_std_universe:    float = 0.003,  # ~0.3 Pp
+    # Aktion wenn Signal schwach:
+    #   "no_new"   : keine neuen Positionen, bestehende normal managen
+    #   "reduce_n" : n_long um signal_filter_n_factor reduzieren
+    signal_filter_action:      str   = "no_new",
+    signal_filter_n_factor:    float = 0.5,    # N * 0.5 bei "reduce_n"
     # Optionale Pre-built Caches (werden intern aufgebaut wenn None)
     price_cache:      Optional[dict] = None,
     atr_cache:        Optional[dict] = None,
@@ -638,6 +654,16 @@ def run_backtest(
     equity_filter_on:  list[float] = []   # daily returns an Filter-aktiv Tagen
     equity_filter_off: list[float] = []   # daily returns an normalen Tagen
 
+    # ── Signalstärke-Filter Tracking ──────────────────────────────────────
+    sig_weak_days          = 0
+    sig_strong_days        = 0
+    sig_spreads:    list[float] = []   # score_spread pro Tag (Top1 - Median)
+    sig_stds:       list[float] = []   # score_std pro Tag
+    sig_weak_spreads: list[float] = []
+    sig_strong_spreads: list[float] = []
+    equity_sig_weak:  list[float] = []   # daily returns an weak-Tagen
+    equity_sig_strong: list[float] = []  # daily returns an strong-Tagen
+
     strategy_name = "Long-Short" if long_short else "Long-Only"
     stop_desc = (
         f"ATR-Trailing(period={atr_period}, k={atr_k})"
@@ -667,7 +693,16 @@ def run_backtest(
         f"vol_sizing={'OFF' if not use_vol_sizing else f'ON(risk={risk_per_trade:.2%})'}  "
         f"{dd_desc}"
     )
+    sig_desc = "OFF"
+    if use_signal_strength_filter:
+        parts = []
+        if use_score_spread_filter:
+            parts.append(f"spread>={min_score_spread_top1_med}")
+        if use_score_std_filter:
+            parts.append(f"std>={min_score_std_universe}")
+        sig_desc = f"ON({'+'.join(parts)}) action={signal_filter_action}"
     logger.info(f"  Filter: {filter_desc}")
+    logger.info(f"  Signal: {sig_desc}")
 
     def _close_position(asset: str, pos: dict, date, reason: str, regime: str) -> None:
         """Schließt eine Position, bucht Erlös und schreibt Trade-Log."""
@@ -849,6 +884,34 @@ def run_backtest(
             if not allow_new_entries:
                 filter_active_days += 1
                 filter_active_dates.append(str(date.date()))
+
+            # ── Signalstärke-Filter ────────────────────────────────────────
+            signal_weak_today = False
+            scores_arr = preds.values
+            score_top1 = float(scores_arr[0])  # preds ist absteigend sortiert
+            score_med  = float(np.median(scores_arr))
+            score_spread = score_top1 - score_med
+            score_std    = float(np.std(scores_arr, ddof=0))
+
+            sig_spreads.append(score_spread)
+            sig_stds.append(score_std)
+
+            if use_signal_strength_filter:
+                if use_score_spread_filter and score_spread < min_score_spread_top1_med:
+                    signal_weak_today = True
+                if use_score_std_filter and score_std < min_score_std_universe:
+                    signal_weak_today = True
+
+            if signal_weak_today:
+                sig_weak_days += 1
+                sig_weak_spreads.append(score_spread)
+                if signal_filter_action == "no_new":
+                    allow_new_entries = False
+                elif signal_filter_action == "reduce_n":
+                    n_long = max(1, int(n_long * signal_filter_n_factor))
+            else:
+                sig_strong_days += 1
+                sig_strong_spreads.append(score_spread)
 
             # ── ATR-Trailing-Stop täglich nachziehen (nur Long, nur nach oben) ──
             # Formel: stop_candidate = close - k * ATR
@@ -1075,6 +1138,10 @@ def run_backtest(
                     equity_filter_on.append(day_ret)
                 else:
                     equity_filter_off.append(day_ret)
+                if signal_weak_today:
+                    equity_sig_weak.append(day_ret)
+                else:
+                    equity_sig_strong.append(day_ret)
 
     # Letzte Positionen auflösen (Ende des Backtests)
     if positions and equity_dates:
@@ -1198,6 +1265,37 @@ def run_backtest(
                 f"std={std_off:.4f}%  ({len(equity_filter_off)} Tage)"
             )
 
+    # ── Signalstärke-Filter Reporting ──────────────────────────────────────
+    if use_signal_strength_filter:
+        total_sig_days = sig_weak_days + sig_strong_days
+        logger.success(f"  ── Signalstärke-Filter ───────────────────────────")
+        logger.success(
+            f"  Weak-Signal   : {sig_weak_days}/{total_sig_days} Tage "
+            f"({sig_weak_days/total_sig_days*100:.1f}%)" if total_sig_days > 0 else
+            "  Weak-Signal   : 0/0 Tage"
+        )
+        logger.success(
+            f"  Action        : {signal_filter_action}  "
+            f"(spread>={min_score_spread_top1_med}, std>={min_score_std_universe})"
+        )
+        if sig_spreads:
+            logger.success(
+                f"  Avg Spread    : {np.mean(sig_spreads)*100:.4f}%  "
+                f"(weak={np.mean(sig_weak_spreads)*100:.4f}%  "
+                f"strong={np.mean(sig_strong_spreads)*100:.4f}%)"
+                if sig_weak_spreads and sig_strong_spreads else
+                f"  Avg Spread    : {np.mean(sig_spreads)*100:.4f}%"
+            )
+        if sig_stds:
+            logger.success(f"  Avg Std       : {np.mean(sig_stds)*100:.4f}%")
+        if equity_sig_weak and equity_sig_strong:
+            avg_w = np.mean(equity_sig_weak) * 100
+            avg_s = np.mean(equity_sig_strong) * 100
+            logger.success(
+                f"  Avg DailyRet  : weak={avg_w:+.4f}%({len(equity_sig_weak)}d)  "
+                f"strong={avg_s:+.4f}%({len(equity_sig_strong)}d)"
+            )
+
     if use_dd_control and dd_mode_days > 0:
         logger.success(
             f"  DD-Control   : {dd_mode_days} Tage im Schutz-Modus  "
@@ -1264,6 +1362,24 @@ def run_backtest(
             'low_pred_exits':      stats_lowpred['n'],
             'avg_daily_ret_filter_on':  round(float(np.mean(equity_filter_on)) * 100, 4) if equity_filter_on else None,
             'avg_daily_ret_filter_off': round(float(np.mean(equity_filter_off)) * 100, 4) if equity_filter_off else None,
+        },
+        'signal_strength_filter': {
+            'enabled':              use_signal_strength_filter,
+            'spread_filter':        use_score_spread_filter,
+            'std_filter':           use_score_std_filter,
+            'min_spread':           min_score_spread_top1_med,
+            'min_std':              min_score_std_universe,
+            'action':               signal_filter_action,
+            'weak_days':            sig_weak_days,
+            'strong_days':          sig_strong_days,
+            'total_days':           sig_weak_days + sig_strong_days,
+            'pct_weak':             round(sig_weak_days / (sig_weak_days + sig_strong_days) * 100, 1) if (sig_weak_days + sig_strong_days) > 0 else 0.0,
+            'avg_spread':           round(float(np.mean(sig_spreads)) * 100, 4) if sig_spreads else 0.0,
+            'avg_std':              round(float(np.mean(sig_stds)) * 100, 4) if sig_stds else 0.0,
+            'avg_spread_weak':      round(float(np.mean(sig_weak_spreads)) * 100, 4) if sig_weak_spreads else None,
+            'avg_spread_strong':    round(float(np.mean(sig_strong_spreads)) * 100, 4) if sig_strong_spreads else None,
+            'avg_daily_ret_weak':   round(float(np.mean(equity_sig_weak)) * 100, 4) if equity_sig_weak else None,
+            'avg_daily_ret_strong': round(float(np.mean(equity_sig_strong)) * 100, 4) if equity_sig_strong else None,
         },
         # DD-Control Stats
         'dd_control': {

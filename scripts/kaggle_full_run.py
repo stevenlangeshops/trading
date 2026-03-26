@@ -422,12 +422,19 @@ def step_backtest(features, targets, asset_map, fold_results):
         use_dd_control        = False,
         hard_stop_pct         = 0.25,
         use_crash_protection  = False,
-        # Expected-Return-Filter
-        use_min_expected_return_filter = True,
-        min_expected_return_top       = 0.0,    # >= 0% pred_return noetig
+        # Expected-Return-Filter (wirkungslos bei Schwelle 0, bleibt als Tracking)
+        use_min_expected_return_filter = False,
+        min_expected_return_top       = 0.0,
         use_avg_topN_filter           = False,
-        min_avg_expected_return_topN  = 0.0,
-        existing_pos_exit_margin      = 0.02,   # Exit wenn pred < -2%
+        existing_pos_exit_margin      = 0.02,
+        # Signalstärke-Filter (NEU): Spread Top1 vs Median
+        use_signal_strength_filter    = True,
+        use_score_spread_filter       = True,
+        min_score_spread_top1_med     = 0.002,   # 0.2 Pp
+        use_score_std_filter          = False,
+        min_score_std_universe        = 0.003,
+        signal_filter_action          = "no_new",
+        signal_filter_n_factor        = 0.5,
     )
 
     # Nur Long-Only
