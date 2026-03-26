@@ -915,15 +915,9 @@ def step_train_v2(features, targets_multi, asset_map, cfg):
     cfg.checkpoint_dir = REPO_DIR / "checkpoints" / "v2_return_multi"
     cfg.checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
-    # CPU-Modus: reduzierte Parameter damit es in akzeptabler Zeit durchlaeuft
-    gpu_ok = os.environ.get("KAGGLE_GPU_OK", "0") == "1"
-    if not gpu_ok:
-        log_write("  v2 Modus: CPU — reduzierte Parameter (20 Ep, hidden=96)")
-        cfg.epochs     = 20
-        cfg.patience   = 5
-        cfg.hidden_dim = 96
-    else:
-        log_write("  v2 Modus: GPU — volle Parameter")
+    # Volle Parameter wie v1 Run G (50 Epochen, hidden=128)
+    log_write(f"  v2 Modus: {cfg.epochs} Ep, hidden={cfg.hidden_dim}, "
+              f"patience={cfg.patience}, seq_len={cfg.seq_len}")
 
     wf_result = train_walk_forward_v2(features, targets_multi, asset_map, cfg)
 
