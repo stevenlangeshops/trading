@@ -657,9 +657,9 @@ def step_pack_artifacts(result_a: dict, result_b: dict):
         "return_code":  0,
         "duration_min": round((time.time() - t0) / 60, 1),
         "long_only":  {k: v for k, v in result_a.items()
-                       if k not in ("equity", "trade_log", "equity_dates")},
+                       if k not in ("equity", "trade_log", "equity_dates", "daily_signals")},
         "long_short": {k: v for k, v in result_b.items()
-                       if k not in ("equity", "trade_log", "equity_dates")},
+                       if k not in ("equity", "trade_log", "equity_dates", "daily_signals")},
         "run_references": run_refs,
     }
     (WORKING / "kernel_summary.json").write_text(json.dumps(summary, indent=2))
@@ -915,6 +915,16 @@ def step_train_v2(features, targets_multi, asset_map, cfg):
     cfg.checkpoint_dir = REPO_DIR / "checkpoints" / "v2_return_multi"
     cfg.checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
+    # CPU-Modus: reduzierte Parameter damit es in akzeptabler Zeit durchlaeuft
+    gpu_ok = os.environ.get("KAGGLE_GPU_OK", "0") == "1"
+    if not gpu_ok:
+        log_write("  v2 Modus: CPU — reduzierte Parameter (20 Ep, hidden=96)")
+        cfg.epochs     = 20
+        cfg.patience   = 5
+        cfg.hidden_dim = 96
+    else:
+        log_write("  v2 Modus: GPU — volle Parameter")
+
     wf_result = train_walk_forward_v2(features, targets_multi, asset_map, cfg)
 
     wf_path = WORKING / "v2_walk_forward_results.json"
@@ -934,6 +944,10 @@ def step_train_v2(features, targets_multi, asset_map, cfg):
 def step_backtest_v2(features, targets_multi, asset_map, v2_fold_results, cfg, v1_result_a):
     """Schritt 12: Backtest für v2 + Vergleich mit v1 (Run G)."""
     log_write(f"\n{'='*60}\nSCHRITT 12: v2 Backtest [{elapsed()}]\n{'='*60}")
+
+    for _mod in list(sys.modules.keys()):
+        if _mod.startswith(("config_v2", "models_v2", "train_v2", "backtest_v2")):
+            del sys.modules[_mod]
 
     from backtest_v2_return_multi import (
         run_backtest_v2, build_v1_vs_v2_report, plot_v1_vs_v2,
@@ -964,11 +978,19 @@ def step_backtest_v2(features, targets_multi, asset_map, v2_fold_results, cfg, v
     with open(WORKING / "v2_daily_signals.json", "w") as f:
         json.dump(v2_result.get("daily_signals", []), f, indent=1)
 
-    # v1 vs v2 Vergleich
-    benchmark_report = build_v1_vs_v2_report(
-        v1_result=v1_result_a, v2_result=v2_result,
-        save_path=str(WORKING / "benchmark_v1_vs_v2_multi.json"),
-    )
+    # v1 vs v2 Vergleich (nur wenn v1-Daten vorhanden)
+    if v1_result_a and v1_result_a.get("total_return") is not None:
+        try:
+            build_v1_vs_v2_report(
+                v1_result=v1_result_a, v2_result=v2_result,
+                save_path=str(WORKING / "benchmark_v1_vs_v2_multi.json"),
+            )
+        except Exception as e:
+            log_write(f"  [WARN] v1 vs v2 report: {e}")
+    else:
+        log_write("  v1-Ergebnis nicht vorhanden — Vergleich uebersprungen")
+        # Run-G Referenzwerte stattdessen loggen
+        log_write("  Run G Referenz: Total Return +403.93%  Sharpe 0.784  MaxDD -55.48%")
 
     # Benchmarks
     benchmarks = {}
@@ -978,13 +1000,20 @@ def step_backtest_v2(features, targets_multi, asset_map, v2_fold_results, cfg, v
             equity_dates=v2_result.get("equity_dates", []),
             asset_map=asset_map, init_cash=10_000.0,
         )
+        for key in ("spy", "ew_bh", "ew_rebalanced"):
+            bm = benchmarks.get(key, {})
+            if bm.get("total_return") is not None:
+                log_write(f"  Benchmark {bm['label']:30s}  "
+                          f"Return: {bm['total_return']:+7.1f}%  "
+                          f"Sharpe: {bm.get('sharpe', 0):.3f}")
     except Exception as e:
         log_write(f"  [WARN] v2 benchmarks: {e}")
 
-    # Vergleichs-Plot
+    # Vergleichs-Plot (v2 standalone oder v1 vs v2)
     try:
         plot_v1_vs_v2(
-            v1_result=v1_result_a, v2_result=v2_result,
+            v1_result=v1_result_a if v1_result_a else {},
+            v2_result=v2_result,
             benchmarks=benchmarks,
             save_path=str(WORKING / "v1_vs_v2_equity.png"),
         )
@@ -998,20 +1027,50 @@ def main() -> int:
     _init_log()
     log_write(f"Trading Bot Full Pipeline | {time.strftime('%Y-%m-%d %H:%M:%S UTC')}")
     log_write(f"Log-Datei: {LOG_FILE}")
+
+    # ── Modus-Schalter ────────────────────────────────────────────────
+    # V2_ONLY = True  → v1 überspringen, nur v2_return_multi
+    # V2_MAX_ASSETS   → Asset-Limit für schnellen Testlauf (0 = alle)
+    V2_ONLY       = True
+    V2_MAX_ASSETS = 20   # 0 = alle Assets
+    # ──────────────────────────────────────────────────────────────────
+
     try:
         step_clone()
         step_check_cuda()
         step_install()
         step_copy_data()
+
+        # Features + Targets mit optionalem Asset-Limit
         features, targets = step_build_panel()
         asset_map         = step_build_asset_map(features)
 
-        # ── v1_rank (Run G) ───────────────────────────────────────────
-        fold_results = step_load_checkpoints(asset_map)
-        if fold_results is None:
-            fold_results = step_train(features, targets, asset_map)
+        if V2_MAX_ASSETS > 0 and len(asset_map) > V2_MAX_ASSETS:
+            log_write(f"\n  [v2 TEST] Asset-Limit: {V2_MAX_ASSETS} von {len(asset_map)} Assets")
+            import random
+            all_assets_list = sorted(asset_map.keys())
+            # SPY immer behalten (fuer Regime-Filter)
+            keep = {"SPY"} if "SPY" in asset_map else set()
+            remaining = [a for a in all_assets_list if a not in keep]
+            random.seed(42)
+            keep.update(random.sample(remaining, min(V2_MAX_ASSETS - len(keep), len(remaining))))
+            keep = sorted(keep)
+            # Features und Targets auf Subset filtern
+            idx_mask = features.index.get_level_values("asset").isin(keep)
+            features = features[idx_mask]
+            targets  = targets[idx_mask]
+            asset_map = {a: i + 1 for i, a in enumerate(keep)}
+            log_write(f"  [v2 TEST] {len(asset_map)} Assets ausgewaehlt: {', '.join(keep[:10])}...")
 
-        result_a, result_b = step_backtest(features, targets, asset_map, fold_results)
+        result_a = {}   # v1 Ergebnis (leer wenn V2_ONLY)
+        result_b = {}
+
+        if not V2_ONLY:
+            # ── v1_rank (Run G) ───────────────────────────────────────
+            fold_results = step_load_checkpoints(asset_map)
+            if fold_results is None:
+                fold_results = step_train(features, targets, asset_map)
+            result_a, result_b = step_backtest(features, targets, asset_map, fold_results)
 
         # ── v2_return_multi ───────────────────────────────────────────
         try:
@@ -1025,6 +1084,10 @@ def main() -> int:
             import traceback
             log_write(f"\n[v2 ERROR]\n{traceback.format_exc()}")
             v2_result = {}
+
+        # Pack: v2 Ergebnisse als result_a wenn V2_ONLY
+        if V2_ONLY and v2_result:
+            result_a = v2_result
 
         step_pack_artifacts(result_a, result_b)
         log_write(f"\n[DONE] Gesamtdauer: {elapsed()}")
