@@ -1449,17 +1449,27 @@ def plot_equity(
         fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 12))
 
         # ── Equity Kurven ─────────────────────────────────────────────────
-        dates_a = pd.to_datetime(result_a['equity_dates'])
-        dates_b = pd.to_datetime(result_b['equity_dates'])
-        eq_a    = np.array(result_a['equity'])
-        eq_b    = np.array(result_b['equity'])
+        has_a = result_a.get('equity_dates') and result_a.get('equity')
+        has_b = result_b.get('equity_dates') and result_b.get('equity')
 
-        ax1.plot(dates_a, eq_a / eq_a[0] * 100 - 100,
-                 label=f"Long-Only  ({result_a['total_return']:+.1f}%)",
-                 color='#2196F3', linewidth=2.5, zorder=5)
-        ax1.plot(dates_b, eq_b / eq_b[0] * 100 - 100,
-                 label=f"Long-Short ({result_b['total_return']:+.1f}%)",
-                 color='#4CAF50', linewidth=2.5, zorder=5)
+        if has_a:
+            dates_a = pd.to_datetime(result_a['equity_dates'])
+            eq_a    = np.array(result_a['equity'])
+            ax1.plot(dates_a, eq_a / eq_a[0] * 100 - 100,
+                     label=f"Long-Only  ({result_a['total_return']:+.1f}%)",
+                     color='#2196F3', linewidth=2.5, zorder=5)
+
+        if has_b:
+            dates_b = pd.to_datetime(result_b['equity_dates'])
+            eq_b    = np.array(result_b['equity'])
+            ax1.plot(dates_b, eq_b / eq_b[0] * 100 - 100,
+                     label=f"Long-Short ({result_b['total_return']:+.1f}%)",
+                     color='#4CAF50', linewidth=2.5, zorder=5)
+
+        if not has_a and not has_b:
+            logger.warning("plot_equity: Keine Equity-Daten vorhanden")
+            plt.close(fig)
+            return
 
         # Benchmarks einzeichnen
         bm_colors = {'spy': '#FF9800', 'ew_bh': '#9C27B0', 'ew_rebalanced': '#F44336'}
@@ -1486,14 +1496,19 @@ def plot_equity(
             peak = np.maximum.accumulate(arr)
             return (arr - peak) / (peak + 1e-9) * 100
 
-        ax2.fill_between(dates_a, drawdown(eq_a), 0, alpha=0.35, color='#2196F3',
-                         label=f"Long-Only  (MaxDD: {result_a['max_drawdown']:.1f}%)")
-        ax2.fill_between(dates_b, drawdown(eq_b), 0, alpha=0.35, color='#4CAF50',
-                         label=f"Long-Short (MaxDD: {result_b['max_drawdown']:.1f}%)")
+        if has_a:
+            ax2.fill_between(dates_a, drawdown(eq_a), 0, alpha=0.35, color='#2196F3',
+                             label=f"Long-Only  (MaxDD: {result_a['max_drawdown']:.1f}%)")
+        if has_b:
+            ax2.fill_between(dates_b, drawdown(eq_b), 0, alpha=0.35, color='#4CAF50',
+                             label=f"Long-Short (MaxDD: {result_b['max_drawdown']:.1f}%)")
         # SPY Drawdown als Referenz
         if benchmarks and benchmarks.get('spy', {}).get('equity'):
             eq_spy = np.array(benchmarks['spy']['equity'])
-            ax2.plot(bm_dates[:len(eq_spy)], drawdown(eq_spy),
+            bm_d = pd.to_datetime(benchmarks.get('dates', []))
+            if len(bm_d) == 0 and has_a:
+                bm_d = dates_a
+            ax2.plot(bm_d[:len(eq_spy)], drawdown(eq_spy),
                      color='#FF9800', linewidth=1.2, linestyle='--', alpha=0.8,
                      label=f"SPY (MaxDD: {benchmarks['spy'].get('max_drawdown', 0):.1f}%)")
         ax2.set_title('Drawdown-Vergleich', fontsize=12)
