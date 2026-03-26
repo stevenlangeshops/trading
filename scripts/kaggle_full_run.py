@@ -399,6 +399,13 @@ def step_train(features, targets, asset_map):
 def step_backtest(features, targets, asset_map, fold_results):
     log_write(f"\n{'='*60}\nSCHRITT 7: Backtest [{elapsed()}]\n{'='*60}")
 
+    # Modul-Cache leeren — ohne dies nutzt Python bei erneutem "Run All"
+    # die alte (gecachte) Version von strategy.backtest statt des frisch
+    # geklonten Codes. Typischer Fehler: "unexpected keyword argument".
+    for _mod in list(sys.modules.keys()):
+        if _mod.startswith(("strategy", "models", "features")):
+            del sys.modules[_mod]
+
     from strategy.backtest import (
         run_backtest, build_price_cache, build_atr_cache,
         plot_equity, compute_benchmarks
