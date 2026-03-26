@@ -494,6 +494,12 @@ def step_backtest(features, targets, asset_map, fold_results):
     except Exception as e:
         log_write(f"  [WARN] plot_equity: {e}")
 
+    try:
+        from strategy.backtest import plot_signals
+        plot_signals(result_a, save_path=str(WORKING / "signal_diagnostics.png"))
+    except Exception as e:
+        log_write(f"  [WARN] plot_signals: {e}")
+
     return result_a, result_b
 
 
@@ -514,6 +520,7 @@ def step_pack_artifacts(result_a: dict, result_b: dict):
         WORKING / "kernel_summary.json",
         WORKING / "crash_3d_analysis.json",
         WORKING / "daily_signals.json",
+        WORKING / "signal_diagnostics.png",
     ]
 
     # Checkpoints

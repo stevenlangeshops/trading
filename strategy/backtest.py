@@ -1663,6 +1663,105 @@ def plot_equity(
         logger.warning(f"Plot-Fehler: {e}")
 
 
+# ── Signal-Diagnose-Plot ──────────────────────────────────────────────────────
+
+def plot_signals(
+    result:    dict,
+    save_path: str = '/kaggle/working/signal_diagnostics.png',
+):
+    """
+    4-Panel Diagnose-Plot der täglichen Signale aus dem Backtest.
+
+    Panel 1: Equity-Kurve mit farblicher Markierung der weak-Signal-Phasen
+    Panel 2: Score Spread (Top1 - Median) mit Threshold-Linie
+    Panel 3: Score Std des Universums
+    Panel 4: Anzahl Positionen + Regime-Hintergrund
+    """
+    try:
+        import matplotlib
+        matplotlib.use('Agg')
+        import matplotlib.pyplot as plt
+        import matplotlib.dates as mdates
+        from matplotlib.patches import Patch
+
+        signals = result.get('daily_signals', [])
+        if not signals:
+            logger.warning("plot_signals: Keine daily_signals vorhanden")
+            return
+
+        dates    = pd.to_datetime([s['date'] for s in signals])
+        spread   = np.array([s['score_spread'] for s in signals]) * 100
+        std      = np.array([s['score_std'] for s in signals]) * 100
+        equity   = np.array([s['equity'] for s in signals])
+        n_pos    = np.array([s['n_positions'] for s in signals])
+        weak     = np.array([s['signal_weak'] for s in signals])
+        regimes  = [s.get('regime', 'n/a') for s in signals]
+
+        cfg = result.get('signal_strength_filter', {})
+        thresh_spread = cfg.get('min_spread', 0.002) * 100
+
+        fig, axes = plt.subplots(4, 1, figsize=(16, 16), sharex=True,
+                                 gridspec_kw={'height_ratios': [3, 2, 2, 1.5]})
+
+        # ── Panel 1: Equity + weak-Phasen ────────────────────────────────
+        ax = axes[0]
+        ax.plot(dates, equity, color='#1565C0', linewidth=1.5, label='Equity')
+        for i in range(len(dates)):
+            if weak[i]:
+                ax.axvspan(dates[i], dates[min(i+1, len(dates)-1)],
+                           alpha=0.15, color='red', linewidth=0)
+        ax.set_ylabel('Equity ($)')
+        ax.set_title('Equity-Kurve mit Weak-Signal-Phasen (rot hinterlegt)',
+                      fontsize=13, fontweight='bold')
+        ax.legend(loc='upper left')
+        ax.grid(True, alpha=0.3)
+
+        # ── Panel 2: Score Spread (Top1 - Median) ───────────────────────
+        ax = axes[1]
+        colors_spread = np.where(weak, '#E53935', '#43A047')
+        ax.bar(dates, spread, color=colors_spread, width=1.5, alpha=0.7)
+        ax.axhline(thresh_spread, color='#FF6F00', linewidth=2,
+                    linestyle='--', label=f'Threshold ({thresh_spread:.2f}%)')
+        ax.set_ylabel('Spread (%)')
+        ax.set_title('Score Spread: Top-1 minus Median', fontsize=12)
+        ax.legend(loc='upper right')
+        ax.grid(True, alpha=0.3)
+
+        # ── Panel 3: Score Std ───────────────────────────────────────────
+        ax = axes[2]
+        ax.fill_between(dates, std, alpha=0.4, color='#7B1FA2')
+        ax.plot(dates, std, color='#7B1FA2', linewidth=0.8)
+        ax.set_ylabel('Std (%)')
+        ax.set_title('Score-Standardabweichung im Universum', fontsize=12)
+        ax.grid(True, alpha=0.3)
+
+        # ── Panel 4: Positionen + Regime ─────────────────────────────────
+        ax = axes[3]
+        regime_colors = {'bull': '#C8E6C9', 'neutral': '#FFF9C4', 'bear': '#FFCDD2'}
+        for i in range(len(dates) - 1):
+            c = regime_colors.get(regimes[i], '#EEEEEE')
+            ax.axvspan(dates[i], dates[i+1], alpha=0.5, color=c, linewidth=0)
+        ax.bar(dates, n_pos, color='#37474F', width=1.5, alpha=0.8)
+        ax.set_ylabel('# Positionen')
+        ax.set_xlabel('Datum')
+        patches = [Patch(facecolor=c, label=r, alpha=0.5)
+                   for r, c in regime_colors.items()]
+        ax.legend(handles=patches, loc='upper right', fontsize=8)
+        ax.grid(True, alpha=0.3)
+
+        for a in axes:
+            a.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m'))
+            a.xaxis.set_major_locator(mdates.MonthLocator(interval=3))
+
+        plt.tight_layout()
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        plt.close(fig)
+        logger.success(f"Signal-Plot gespeichert: {save_path}")
+
+    except Exception as e:
+        logger.warning(f"plot_signals Fehler: {e}")
+
+
 # ── Hilfsfunktionen ───────────────────────────────────────────────────────────
 
 def _align_date_tz(date: pd.Timestamp, index: pd.DatetimeIndex) -> pd.Timestamp:
