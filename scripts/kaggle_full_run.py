@@ -1033,9 +1033,11 @@ def step_backtest_v2(features, targets_multi, asset_map, v2_fold_results, cfg, v
 
 # ── v2 Single-Horizon Pipeline Steps ─────────────────────────────────────────
 
-def step_train_single_horizons(features, asset_map):
-    """Schritt 20: Training 4 Single-Horizon Modelle (4d, 7d, 11d, 15d)."""
-    log_write(f"\n{'='*60}\nSCHRITT 20: Single-Horizon Training [{elapsed()}]\n{'='*60}")
+def step_train_single_horizons(features, asset_map, horizons=None):
+    """Schritt 20: Training Single-Horizon Modelle fuer ausgewaehlte Horizonte."""
+    if horizons is None:
+        horizons = [4, 7, 11, 15]
+    log_write(f"\n{'='*60}\nSCHRITT 20: Single-Horizon Training {horizons} [{elapsed()}]\n{'='*60}")
 
     for _mod in list(sys.modules.keys()):
         if _mod.startswith(("config_v2_single", "models_v2_single", "train_v2_single",
@@ -1045,7 +1047,7 @@ def step_train_single_horizons(features, asset_map):
     from train_v2_single_horizon import train_all_horizons
 
     raw_dir = REPO_DIR / "data" / "raw"
-    all_results = train_all_horizons(features, asset_map, raw_dir)
+    all_results = train_all_horizons(features, asset_map, raw_dir, horizons=horizons)
 
     for h, res in all_results.items():
         wf_path = WORKING / f"v2_{h}d_walk_forward.json"
@@ -1140,10 +1142,12 @@ def main() -> int:
     log_write(f"Log-Datei: {LOG_FILE}")
 
     # ── Modus-Schalter ────────────────────────────────────────────────
-    # SINGLE_HORIZON = True → v2 Single-Horizon-Vergleich (4/7/11/15d)
+    # SINGLE_HORIZON = True → v2 Single-Horizon-Vergleich
+    # SH_HORIZONS    → welche Horizonte in diesem Run (Batch 1: [4,7], Batch 2: [11,15])
     # RUN_V1         = False → v1 Training/Backtest ueberspringen
     # RUN_V2_MULTI   = False → v2/v2.1 Multi-Horizon ueberspringen
     SINGLE_HORIZON = True
+    SH_HORIZONS    = [4, 7]   # Batch 1: nur 4d + 7d (Batch 2 spaeter: [11, 15])
     RUN_V1         = False
     RUN_V2_MULTI   = False
     V2_MAX_ASSETS  = 0    # 0 = alle Assets (260 S&P 500)
@@ -1198,7 +1202,7 @@ def main() -> int:
         sh_bt = {}
         if SINGLE_HORIZON:
             try:
-                all_train_res = step_train_single_horizons(features, asset_map)
+                all_train_res = step_train_single_horizons(features, asset_map, SH_HORIZONS)
                 sh_bt = step_backtest_single_horizons(
                     features, asset_map, all_train_res, result_a,
                 )
