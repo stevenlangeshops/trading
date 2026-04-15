@@ -619,9 +619,16 @@ def step_pack_artifacts(result_a: dict, result_b: dict):
         WORKING / "v2_daily_signals.json",
         WORKING / "benchmark_v1_vs_v2_multi.json",
         WORKING / "v1_vs_v2_equity.png",
+        # v2.1_return_multi_heads Artefakte
+        WORKING / "v21_walk_forward_results.json",
+        WORKING / "v21_backtest_results.json",
+        WORKING / "v21_trade_log.json",
+        WORKING / "v21_daily_signals.json",
+        WORKING / "benchmark_v1_vs_v21_heads.json",
+        WORKING / "v1_vs_v21_equity.png",
     ]
 
-    # Checkpoints (v1 + v2)
+    # Checkpoints (v1 + v2 + v2.1)
     ckpt_dir = REPO_DIR / "checkpoints"
     if ckpt_dir.is_dir():
         collect += list(ckpt_dir.glob("*.pt"))
@@ -629,6 +636,9 @@ def step_pack_artifacts(result_a: dict, result_b: dict):
     ckpt_v2 = REPO_DIR / "checkpoints" / "v2_return_multi"
     if ckpt_v2.is_dir():
         collect += list(ckpt_v2.glob("*.pt"))
+    ckpt_v21 = REPO_DIR / "checkpoints" / "v2_1_return_multi_heads"
+    if ckpt_v21.is_dir():
+        collect += list(ckpt_v21.glob("*.pt"))
 
     tar_path = WORKING / "kaggle_artifacts.tar.gz"
     with tarfile.open(str(tar_path), "w:gz") as tf:
@@ -1017,6 +1027,136 @@ def step_backtest_v2(features, targets_multi, asset_map, v2_fold_results, cfg, v
     return v2_result
 
 
+# ── v2.1_return_multi_heads Pipeline Steps ───────────────────────────────────
+
+def step_build_multi_targets_v21(features, asset_map):
+    """Schritt 13: Multi-Horizon Targets fuer v2.1 berechnen (7d, 11d, 15d)."""
+    log_write(f"\n{'='*60}\nSCHRITT 13: v2.1 Multi-Horizon Targets [{elapsed()}]\n{'='*60}")
+
+    for _mod in list(sys.modules.keys()):
+        if _mod.startswith(("config_v2_1", "models_v2_1", "train_v2_1", "backtest_v2_1")):
+            del sys.modules[_mod]
+
+    from config_v2_1_return_multi_heads import V21Config
+    from train_v2_1_return_multi_heads import build_multi_targets_v21
+
+    cfg = V21Config()
+    raw_dir = REPO_DIR / "data" / "raw"
+
+    targets_multi = build_multi_targets_v21(
+        raw_dir=raw_dir, horizons=cfg.all_horizons,
+        asset_list=list(asset_map.keys()),
+    )
+    log_write(f"  v2.1 Targets: {len(targets_multi)} Zeilen, "
+              f"Horizonte={cfg.all_horizons}")
+    return targets_multi, cfg
+
+
+def step_train_v21(features, targets_multi, asset_map, cfg):
+    """Schritt 14: Walk-Forward Training fuer v2.1_return_multi_heads."""
+    log_write(f"\n{'='*60}\nSCHRITT 14: v2.1 Training [{elapsed()}]\n{'='*60}")
+
+    for _mod in list(sys.modules.keys()):
+        if _mod.startswith(("config_v2_1", "models_v2_1", "train_v2_1", "backtest_v2_1")):
+            del sys.modules[_mod]
+
+    from train_v2_1_return_multi_heads import train_walk_forward_v21
+
+    cfg.checkpoint_dir = REPO_DIR / "checkpoints" / "v2_1_return_multi_heads"
+    cfg.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+    log_write(f"  v2.1 Modus: {cfg.epochs} Ep, hidden={cfg.hidden_dim}, "
+              f"patience={cfg.patience}, seq_len={cfg.seq_len}")
+    log_write(f"  Loss: w_7d={cfg.w_ret_7d}  w_15d={cfg.w_ret_15d}  "
+              f"lambda_rank={cfg.lambda_rank}  w_rank_reg={cfg.w_rank_reg}")
+
+    wf_result = train_walk_forward_v21(features, targets_multi, asset_map, cfg)
+
+    wf_path = WORKING / "v21_walk_forward_results.json"
+    with open(wf_path, "w") as f:
+        json.dump(wf_result, f, indent=2, default=str)
+    log_write(f"  v21_walk_forward_results.json gespeichert")
+
+    return wf_result
+
+
+def step_backtest_v21(features, targets_multi, asset_map, v21_fold_results, cfg, v1_result_a):
+    """Schritt 15: Backtest fuer v2.1 + Vergleich mit v1 (Run G)."""
+    log_write(f"\n{'='*60}\nSCHRITT 15: v2.1 Backtest [{elapsed()}]\n{'='*60}")
+
+    for _mod in list(sys.modules.keys()):
+        if _mod.startswith(("config_v2_1", "models_v2_1", "train_v2_1", "backtest_v2_1")):
+            del sys.modules[_mod]
+
+    from backtest_v2_1_return_multi_heads import (
+        run_backtest_v21, build_v1_vs_v21_report, plot_v1_vs_v21,
+    )
+    from strategy.backtest import build_price_cache, compute_benchmarks
+
+    raw_dir = REPO_DIR / "data" / "raw"
+    all_assets = list(asset_map.keys())
+    if "SPY" not in all_assets:
+        all_assets.append("SPY")
+    price_cache = build_price_cache(all_assets, raw_dir=raw_dir)
+
+    v21_result = run_backtest_v21(
+        features=features, targets_multi=targets_multi,
+        fold_results=v21_fold_results, asset_map=asset_map,
+        cfg=cfg, price_cache=price_cache,
+    )
+
+    def slim(r):
+        return {k: v for k, v in r.items()
+                if k not in ("equity", "trade_log", "equity_dates", "daily_signals")}
+
+    with open(WORKING / "v21_backtest_results.json", "w") as f:
+        json.dump(slim(v21_result), f, indent=2)
+    with open(WORKING / "v21_trade_log.json", "w") as f:
+        json.dump(v21_result.get("trade_log", []), f, indent=2)
+    with open(WORKING / "v21_daily_signals.json", "w") as f:
+        json.dump(v21_result.get("daily_signals", []), f, indent=1)
+
+    if v1_result_a and v1_result_a.get("total_return") is not None:
+        try:
+            build_v1_vs_v21_report(
+                v1_result=v1_result_a, v21_result=v21_result,
+                save_path=str(WORKING / "benchmark_v1_vs_v21_heads.json"),
+            )
+        except Exception as e:
+            log_write(f"  [WARN] v1 vs v2.1 report: {e}")
+    else:
+        log_write("  v1-Ergebnis nicht vorhanden — Vergleich uebersprungen")
+        log_write("  Run G Referenz: Total Return +403.93%  Sharpe 0.784  MaxDD -55.48%")
+
+    benchmarks = {}
+    try:
+        benchmarks = compute_benchmarks(
+            price_cache=price_cache,
+            equity_dates=v21_result.get("equity_dates", []),
+            asset_map=asset_map, init_cash=10_000.0,
+        )
+        for key in ("spy", "ew_bh", "ew_rebalanced"):
+            bm = benchmarks.get(key, {})
+            if bm.get("total_return") is not None:
+                log_write(f"  Benchmark {bm['label']:30s}  "
+                          f"Return: {bm['total_return']:+7.1f}%  "
+                          f"Sharpe: {bm.get('sharpe', 0):.3f}")
+    except Exception as e:
+        log_write(f"  [WARN] v2.1 benchmarks: {e}")
+
+    try:
+        plot_v1_vs_v21(
+            v1_result=v1_result_a if v1_result_a else {},
+            v21_result=v21_result,
+            benchmarks=benchmarks,
+            save_path=str(WORKING / "v1_vs_v21_equity.png"),
+        )
+    except Exception as e:
+        log_write(f"  [WARN] v2.1 plot: {e}")
+
+    return v21_result
+
+
 def main() -> int:
     _init_log()
     log_write(f"Trading Bot Full Pipeline | {time.strftime('%Y-%m-%d %H:%M:%S UTC')}")
@@ -1027,6 +1167,8 @@ def main() -> int:
     # V2_MAX_ASSETS   → Asset-Limit für schnellen Testlauf (0 = alle)
     V2_ONLY       = True
     V2_MAX_ASSETS = 0    # 0 = alle Assets (260 S&P 500)
+    # V21 = True → v2.1_return_multi_heads ausfuehren
+    V21           = True
     # ──────────────────────────────────────────────────────────────────
 
     try:
@@ -1043,20 +1185,18 @@ def main() -> int:
             log_write(f"\n  [v2 TEST] Asset-Limit: {V2_MAX_ASSETS} von {len(asset_map)} Assets")
             import random
             all_assets_list = sorted(asset_map.keys())
-            # SPY immer behalten (fuer Regime-Filter)
             keep = {"SPY"} if "SPY" in asset_map else set()
             remaining = [a for a in all_assets_list if a not in keep]
             random.seed(42)
             keep.update(random.sample(remaining, min(V2_MAX_ASSETS - len(keep), len(remaining))))
             keep = sorted(keep)
-            # Features und Targets auf Subset filtern
             idx_mask = features.index.get_level_values("asset").isin(keep)
             features = features[idx_mask]
             targets  = targets[idx_mask]
             asset_map = {a: i + 1 for i, a in enumerate(keep)}
             log_write(f"  [v2 TEST] {len(asset_map)} Assets ausgewaehlt: {', '.join(keep[:10])}...")
 
-        result_a = {}   # v1 Ergebnis (leer wenn V2_ONLY)
+        result_a = {}
         result_b = {}
 
         if not V2_ONLY:
@@ -1067,6 +1207,7 @@ def main() -> int:
             result_a, result_b = step_backtest(features, targets, asset_map, fold_results)
 
         # ── v2_return_multi ───────────────────────────────────────────
+        v2_result = {}
         try:
             targets_multi, cfg_v2 = step_build_multi_targets(features, asset_map)
             v2_wf = step_train_v2(features, targets_multi, asset_map, cfg_v2)
@@ -1077,11 +1218,27 @@ def main() -> int:
         except Exception as v2_exc:
             import traceback
             log_write(f"\n[v2 ERROR]\n{traceback.format_exc()}")
-            v2_result = {}
 
-        # Pack: v2 Ergebnisse als result_a wenn V2_ONLY
-        if V2_ONLY and v2_result:
-            result_a = v2_result
+        # ── v2.1_return_multi_heads ───────────────────────────────────
+        v21_result = {}
+        if V21:
+            try:
+                targets_v21, cfg_v21 = step_build_multi_targets_v21(features, asset_map)
+                v21_wf = step_train_v21(features, targets_v21, asset_map, cfg_v21)
+                v21_result = step_backtest_v21(
+                    features, targets_v21, asset_map,
+                    v21_wf["fold_results"], cfg_v21, result_a,
+                )
+            except Exception as v21_exc:
+                import traceback
+                log_write(f"\n[v2.1 ERROR]\n{traceback.format_exc()}")
+
+        # Pack: bestes Modell als result_a wenn V2_ONLY
+        if V2_ONLY:
+            if v21_result:
+                result_a = v21_result
+            elif v2_result:
+                result_a = v2_result
 
         step_pack_artifacts(result_a, result_b)
         log_write(f"\n[DONE] Gesamtdauer: {elapsed()}")
