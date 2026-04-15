@@ -655,15 +655,26 @@ def step_pack_artifacts(result_a: dict, result_b: dict):
     sz = tar_path.stat().st_size // 1024
     log_write(f"  {tar_path.name}: {sz} KB, {len(seen)} Dateien")
 
+    # ── Horizon-Ergebnisse sammeln (falls vorhanden) ────────────────────────
+    horizon_summary = {}
+    for _h in [4, 7, 11, 15]:
+        bt_file = WORKING / f"v2_{_h}d_backtest.json"
+        wf_file = WORKING / f"v2_{_h}d_walk_forward.json"
+        if bt_file.exists():
+            try:
+                horizon_summary[f"v2_{_h}d"] = json.loads(bt_file.read_text())
+            except Exception:
+                pass
+        if wf_file.exists():
+            try:
+                horizon_summary[f"v2_{_h}d_training"] = json.loads(wf_file.read_text())
+            except Exception:
+                pass
+
     run_refs = {
         "run_g_long_only": {"total_return": 403.93, "max_drawdown": -55.48, "sharpe": 0.784,
                              "n_trades": 471,  "avg_hold_days": 14.8,
                              "note": "Baseline: reine Rotation + Hard-Stop, kein Filter"},
-        "run_h1_long_only": {"total_return": 335.25, "max_drawdown": -54.49, "sharpe": 0.724,
-                              "n_trades": 406, "avg_hold_days": 14.3,
-                              "note": "SPY-ATR Halbgas-Modus"},
-        "run_h2_signal_filter": {"total_return": -18.3, "max_drawdown": -41.99, "sharpe": -0.028,
-                                  "n_trades": 108, "note": "Signal-Spread-Filter, 86% aktiv"},
         "benchmarks":       {"spy_bh": "+60.6%", "ew_universe_bh": "+192.8%",
                               "ew_rebalanced": "+167.3%"},
     }
@@ -674,14 +685,22 @@ def step_pack_artifacts(result_a: dict, result_b: dict):
                        if k not in ("equity", "trade_log", "equity_dates", "daily_signals")},
         "long_short": {k: v for k, v in result_b.items()
                        if k not in ("equity", "trade_log", "equity_dates", "daily_signals")},
+        "horizon_results": horizon_summary,
         "run_references": run_refs,
     }
     (WORKING / "kernel_summary.json").write_text(json.dumps(summary, indent=2))
     (WORKING / "kaggle_cmd_exit_code.txt").write_text("0")
-    (WORKING / "kaggle_cmd_stdout_stderr.txt").write_text(
-        f"Pipeline erfolgreich in {summary['duration_min']} Minuten.\n"
-        f"Long-Only  Total Return: {result_a.get('total_return', '?')}%\n"
-    )
+
+    # Kurzfassung fuer stdout
+    lines = [f"Pipeline erfolgreich in {summary['duration_min']} Minuten."]
+    if result_a.get('total_return'):
+        lines.append(f"Best Model Total Return: {result_a.get('total_return', '?')}%")
+    for _h in [4, 7, 11, 15]:
+        key = f"v2_{_h}d"
+        if key in horizon_summary:
+            lines.append(f"  {key}: Return={horizon_summary[key].get('total_return','?')}%  "
+                         f"Sharpe={horizon_summary[key].get('sharpe','?')}")
+    (WORKING / "kaggle_cmd_stdout_stderr.txt").write_text("\n".join(lines) + "\n")
     log_write("\n" + json.dumps(summary, indent=2))
 
 
@@ -741,15 +760,21 @@ def step_persist_results():
     # Zu persistierende Dateien (bewusst kein .pt um Dataset-Größe gering zu halten;
     # das vollständige tar.gz enthält die Checkpoints)
     upload_files = [
-        "kaggle_artifacts.tar.gz",           # alles inkl. Checkpoints
-        "equity_curve.png",                  # Equity-Kurve mit Benchmarks
-        "kernel_summary.json",               # kompakte Ergebnis-Übersicht
-        "benchmarks.json",                   # SPY / EW-Vergleich
+        "kaggle_artifacts.tar.gz",
+        "kernel_summary.json",
+        "pipeline.log",
+        # v1 (falls vorhanden)
+        "equity_curve.png",
+        "benchmarks.json",
         "backtest_results_long_only.json",
-        "backtest_results_long_short.json",
         "walk_forward_results.json",
-        "pipeline.log",                      # vollständiges Prozess-Log
+        # Single-Horizon Ergebnisse
+        "benchmark_horizon_comparison.json",
+        "horizon_comparison_equity.png",
     ]
+    for _h in [4, 7, 11, 15]:
+        upload_files.append(f"v2_{_h}d_backtest.json")
+        upload_files.append(f"v2_{_h}d_walk_forward.json")
     copied = []
     for fname in upload_files:
         src = WORKING / fname
