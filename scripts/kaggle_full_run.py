@@ -619,16 +619,19 @@ def step_pack_artifacts(result_a: dict, result_b: dict):
         WORKING / "v2_daily_signals.json",
         WORKING / "benchmark_v1_vs_v2_multi.json",
         WORKING / "v1_vs_v2_equity.png",
-        # v2.1_return_multi_heads Artefakte
-        WORKING / "v21_walk_forward_results.json",
-        WORKING / "v21_backtest_results.json",
-        WORKING / "v21_trade_log.json",
-        WORKING / "v21_daily_signals.json",
-        WORKING / "benchmark_v1_vs_v21_heads.json",
-        WORKING / "v1_vs_v21_equity.png",
+        # v2 Single-Horizon Artefakte
+        WORKING / "benchmark_horizon_comparison.json",
+        WORKING / "horizon_comparison_equity.png",
     ]
 
-    # Checkpoints (v1 + v2 + v2.1)
+    # Single-Horizon Artefakte (v2_4d, v2_7d, v2_11d, v2_15d)
+    for _h in [4, 7, 11, 15]:
+        collect.append(WORKING / f"v2_{_h}d_walk_forward.json")
+        collect.append(WORKING / f"v2_{_h}d_backtest.json")
+        collect.append(WORKING / f"v2_{_h}d_trade_log.json")
+        collect.append(WORKING / f"v2_{_h}d_daily_signals.json")
+
+    # Checkpoints (v1 + v2 + single-horizon)
     ckpt_dir = REPO_DIR / "checkpoints"
     if ckpt_dir.is_dir():
         collect += list(ckpt_dir.glob("*.pt"))
@@ -636,9 +639,10 @@ def step_pack_artifacts(result_a: dict, result_b: dict):
     ckpt_v2 = REPO_DIR / "checkpoints" / "v2_return_multi"
     if ckpt_v2.is_dir():
         collect += list(ckpt_v2.glob("*.pt"))
-    ckpt_v21 = REPO_DIR / "checkpoints" / "v2_1_return_multi_heads"
-    if ckpt_v21.is_dir():
-        collect += list(ckpt_v21.glob("*.pt"))
+    for _h in [4, 7, 11, 15]:
+        ckpt_sh = REPO_DIR / "checkpoints" / f"v2_{_h}d"
+        if ckpt_sh.is_dir():
+            collect += list(ckpt_sh.glob("*.pt"))
 
     tar_path = WORKING / "kaggle_artifacts.tar.gz"
     with tarfile.open(str(tar_path), "w:gz") as tf:
@@ -1027,69 +1031,49 @@ def step_backtest_v2(features, targets_multi, asset_map, v2_fold_results, cfg, v
     return v2_result
 
 
-# ── v2.1_return_multi_heads Pipeline Steps ───────────────────────────────────
+# ── v2 Single-Horizon Pipeline Steps ─────────────────────────────────────────
 
-def step_build_multi_targets_v21(features, asset_map):
-    """Schritt 13: Multi-Horizon Targets fuer v2.1 berechnen (7d, 11d, 15d)."""
-    log_write(f"\n{'='*60}\nSCHRITT 13: v2.1 Multi-Horizon Targets [{elapsed()}]\n{'='*60}")
+def step_train_single_horizons(features, asset_map):
+    """Schritt 20: Training 4 Single-Horizon Modelle (4d, 7d, 11d, 15d)."""
+    log_write(f"\n{'='*60}\nSCHRITT 20: Single-Horizon Training [{elapsed()}]\n{'='*60}")
 
     for _mod in list(sys.modules.keys()):
-        if _mod.startswith(("config_v2_1", "models_v2_1", "train_v2_1", "backtest_v2_1")):
+        if _mod.startswith(("config_v2_single", "models_v2_single", "train_v2_single",
+                            "backtest_v2_single")):
             del sys.modules[_mod]
 
-    from config_v2_1_return_multi_heads import V21Config
-    from train_v2_1_return_multi_heads import build_multi_targets_v21
+    from train_v2_single_horizon import train_all_horizons
 
-    cfg = V21Config()
     raw_dir = REPO_DIR / "data" / "raw"
+    all_results = train_all_horizons(features, asset_map, raw_dir)
 
-    targets_multi = build_multi_targets_v21(
-        raw_dir=raw_dir, horizons=cfg.all_horizons,
-        asset_list=list(asset_map.keys()),
-    )
-    log_write(f"  v2.1 Targets: {len(targets_multi)} Zeilen, "
-              f"Horizonte={cfg.all_horizons}")
-    return targets_multi, cfg
+    for h, res in all_results.items():
+        wf_path = WORKING / f"v2_{h}d_walk_forward.json"
+        with open(wf_path, "w") as f:
+            safe = {k: v for k, v in res.items() if k != "fold_results"}
+            safe["fold_summary"] = [
+                {k: v for k, v in fr.items()}
+                for fr in res["fold_results"]
+            ]
+            json.dump(safe, f, indent=2, default=str)
+        log_write(f"  {wf_path.name} gespeichert (IC={res['mean_ic']:.4f})")
 
-
-def step_train_v21(features, targets_multi, asset_map, cfg):
-    """Schritt 14: Walk-Forward Training fuer v2.1_return_multi_heads."""
-    log_write(f"\n{'='*60}\nSCHRITT 14: v2.1 Training [{elapsed()}]\n{'='*60}")
-
-    for _mod in list(sys.modules.keys()):
-        if _mod.startswith(("config_v2_1", "models_v2_1", "train_v2_1", "backtest_v2_1")):
-            del sys.modules[_mod]
-
-    from train_v2_1_return_multi_heads import train_walk_forward_v21
-
-    cfg.checkpoint_dir = REPO_DIR / "checkpoints" / "v2_1_return_multi_heads"
-    cfg.checkpoint_dir.mkdir(parents=True, exist_ok=True)
-
-    log_write(f"  v2.1 Modus: {cfg.epochs} Ep, hidden={cfg.hidden_dim}, "
-              f"patience={cfg.patience}, seq_len={cfg.seq_len}")
-    log_write(f"  Loss: w_7d={cfg.w_ret_7d}  w_15d={cfg.w_ret_15d}  "
-              f"lambda_rank={cfg.lambda_rank}  w_rank_reg={cfg.w_rank_reg}")
-
-    wf_result = train_walk_forward_v21(features, targets_multi, asset_map, cfg)
-
-    wf_path = WORKING / "v21_walk_forward_results.json"
-    with open(wf_path, "w") as f:
-        json.dump(wf_result, f, indent=2, default=str)
-    log_write(f"  v21_walk_forward_results.json gespeichert")
-
-    return wf_result
+    return all_results
 
 
-def step_backtest_v21(features, targets_multi, asset_map, v21_fold_results, cfg, v1_result_a):
-    """Schritt 15: Backtest fuer v2.1 + Vergleich mit v1 (Run G)."""
-    log_write(f"\n{'='*60}\nSCHRITT 15: v2.1 Backtest [{elapsed()}]\n{'='*60}")
+def step_backtest_single_horizons(features, asset_map, all_train_results, v1_result_a):
+    """Schritt 21: Backtest + Benchmark-Report fuer alle Horizonte."""
+    log_write(f"\n{'='*60}\nSCHRITT 21: Single-Horizon Backtests [{elapsed()}]\n{'='*60}")
 
     for _mod in list(sys.modules.keys()):
-        if _mod.startswith(("config_v2_1", "models_v2_1", "train_v2_1", "backtest_v2_1")):
+        if _mod.startswith(("config_v2_single", "models_v2_single", "train_v2_single",
+                            "backtest_v2_single")):
             del sys.modules[_mod]
 
-    from backtest_v2_1_return_multi_heads import (
-        run_backtest_v21, build_v1_vs_v21_report, plot_v1_vs_v21,
+    from backtest_v2_single_horizon import (
+        backtest_all_horizons,
+        build_horizon_benchmark_report,
+        plot_horizon_comparison,
     )
     from strategy.backtest import build_price_cache, compute_benchmarks
 
@@ -1099,40 +1083,33 @@ def step_backtest_v21(features, targets_multi, asset_map, v21_fold_results, cfg,
         all_assets.append("SPY")
     price_cache = build_price_cache(all_assets, raw_dir=raw_dir)
 
-    v21_result = run_backtest_v21(
-        features=features, targets_multi=targets_multi,
-        fold_results=v21_fold_results, asset_map=asset_map,
-        cfg=cfg, price_cache=price_cache,
-    )
+    all_bt = backtest_all_horizons(features, all_train_results, asset_map, price_cache)
 
     def slim(r):
         return {k: v for k, v in r.items()
                 if k not in ("equity", "trade_log", "equity_dates", "daily_signals")}
 
-    with open(WORKING / "v21_backtest_results.json", "w") as f:
-        json.dump(slim(v21_result), f, indent=2)
-    with open(WORKING / "v21_trade_log.json", "w") as f:
-        json.dump(v21_result.get("trade_log", []), f, indent=2)
-    with open(WORKING / "v21_daily_signals.json", "w") as f:
-        json.dump(v21_result.get("daily_signals", []), f, indent=1)
+    for h, bt in all_bt.items():
+        with open(WORKING / f"v2_{h}d_backtest.json", "w") as f:
+            json.dump(slim(bt), f, indent=2)
+        with open(WORKING / f"v2_{h}d_trade_log.json", "w") as f:
+            json.dump(bt.get("trade_log", []), f, indent=2)
+        with open(WORKING / f"v2_{h}d_daily_signals.json", "w") as f:
+            json.dump(bt.get("daily_signals", []), f, indent=1)
 
-    if v1_result_a and v1_result_a.get("total_return") is not None:
-        try:
-            build_v1_vs_v21_report(
-                v1_result=v1_result_a, v21_result=v21_result,
-                save_path=str(WORKING / "benchmark_v1_vs_v21_heads.json"),
-            )
-        except Exception as e:
-            log_write(f"  [WARN] v1 vs v2.1 report: {e}")
-    else:
-        log_write("  v1-Ergebnis nicht vorhanden — Vergleich uebersprungen")
-        log_write("  Run G Referenz: Total Return +403.93%  Sharpe 0.784  MaxDD -55.48%")
+    build_horizon_benchmark_report(
+        all_bt_results=all_bt,
+        all_train_results=all_train_results,
+        v1_result=v1_result_a if v1_result_a else None,
+        save_path=str(WORKING / "benchmark_horizon_comparison.json"),
+    )
 
     benchmarks = {}
     try:
+        first_bt = next(iter(all_bt.values()))
         benchmarks = compute_benchmarks(
             price_cache=price_cache,
-            equity_dates=v21_result.get("equity_dates", []),
+            equity_dates=first_bt.get("equity_dates", []),
             asset_map=asset_map, init_cash=10_000.0,
         )
         for key in ("spy", "ew_bh", "ew_rebalanced"):
@@ -1142,19 +1119,19 @@ def step_backtest_v21(features, targets_multi, asset_map, v21_fold_results, cfg,
                           f"Return: {bm['total_return']:+7.1f}%  "
                           f"Sharpe: {bm.get('sharpe', 0):.3f}")
     except Exception as e:
-        log_write(f"  [WARN] v2.1 benchmarks: {e}")
+        log_write(f"  [WARN] benchmarks: {e}")
 
     try:
-        plot_v1_vs_v21(
-            v1_result=v1_result_a if v1_result_a else {},
-            v21_result=v21_result,
+        plot_horizon_comparison(
+            all_bt_results=all_bt,
+            v1_result=v1_result_a if v1_result_a else None,
             benchmarks=benchmarks,
-            save_path=str(WORKING / "v1_vs_v21_equity.png"),
+            save_path=str(WORKING / "horizon_comparison_equity.png"),
         )
     except Exception as e:
-        log_write(f"  [WARN] v2.1 plot: {e}")
+        log_write(f"  [WARN] horizon plot: {e}")
 
-    return v21_result
+    return all_bt
 
 
 def main() -> int:
@@ -1163,12 +1140,13 @@ def main() -> int:
     log_write(f"Log-Datei: {LOG_FILE}")
 
     # ── Modus-Schalter ────────────────────────────────────────────────
-    # V2_ONLY = True  → v1 überspringen, nur v2_return_multi
-    # V2_MAX_ASSETS   → Asset-Limit für schnellen Testlauf (0 = alle)
-    V2_ONLY       = True
-    V2_MAX_ASSETS = 0    # 0 = alle Assets (260 S&P 500)
-    # V21 = True → v2.1_return_multi_heads ausfuehren
-    V21           = True
+    # SINGLE_HORIZON = True → v2 Single-Horizon-Vergleich (4/7/11/15d)
+    # RUN_V1         = False → v1 Training/Backtest ueberspringen
+    # RUN_V2_MULTI   = False → v2/v2.1 Multi-Horizon ueberspringen
+    SINGLE_HORIZON = True
+    RUN_V1         = False
+    RUN_V2_MULTI   = False
+    V2_MAX_ASSETS  = 0    # 0 = alle Assets (260 S&P 500)
     # ──────────────────────────────────────────────────────────────────
 
     try:
@@ -1177,12 +1155,11 @@ def main() -> int:
         step_install()
         step_copy_data()
 
-        # Features + Targets mit optionalem Asset-Limit
         features, targets = step_build_panel()
         asset_map         = step_build_asset_map(features)
 
         if V2_MAX_ASSETS > 0 and len(asset_map) > V2_MAX_ASSETS:
-            log_write(f"\n  [v2 TEST] Asset-Limit: {V2_MAX_ASSETS} von {len(asset_map)} Assets")
+            log_write(f"\n  Asset-Limit: {V2_MAX_ASSETS} von {len(asset_map)} Assets")
             import random
             all_assets_list = sorted(asset_map.keys())
             keep = {"SPY"} if "SPY" in asset_map else set()
@@ -1194,51 +1171,44 @@ def main() -> int:
             features = features[idx_mask]
             targets  = targets[idx_mask]
             asset_map = {a: i + 1 for i, a in enumerate(keep)}
-            log_write(f"  [v2 TEST] {len(asset_map)} Assets ausgewaehlt: {', '.join(keep[:10])}...")
+            log_write(f"  {len(asset_map)} Assets ausgewaehlt: {', '.join(keep[:10])}...")
 
         result_a = {}
         result_b = {}
 
-        if not V2_ONLY:
-            # ── v1_rank (Run G) ───────────────────────────────────────
+        if RUN_V1:
             fold_results = step_load_checkpoints(asset_map)
             if fold_results is None:
                 fold_results = step_train(features, targets, asset_map)
             result_a, result_b = step_backtest(features, targets, asset_map, fold_results)
 
-        # ── v2_return_multi ───────────────────────────────────────────
-        v2_result = {}
-        try:
-            targets_multi, cfg_v2 = step_build_multi_targets(features, asset_map)
-            v2_wf = step_train_v2(features, targets_multi, asset_map, cfg_v2)
-            v2_result = step_backtest_v2(
-                features, targets_multi, asset_map,
-                v2_wf["fold_results"], cfg_v2, result_a,
-            )
-        except Exception as v2_exc:
-            import traceback
-            log_write(f"\n[v2 ERROR]\n{traceback.format_exc()}")
-
-        # ── v2.1_return_multi_heads ───────────────────────────────────
-        v21_result = {}
-        if V21:
+        if RUN_V2_MULTI:
             try:
-                targets_v21, cfg_v21 = step_build_multi_targets_v21(features, asset_map)
-                v21_wf = step_train_v21(features, targets_v21, asset_map, cfg_v21)
-                v21_result = step_backtest_v21(
-                    features, targets_v21, asset_map,
-                    v21_wf["fold_results"], cfg_v21, result_a,
+                targets_multi, cfg_v2 = step_build_multi_targets(features, asset_map)
+                v2_wf = step_train_v2(features, targets_multi, asset_map, cfg_v2)
+                step_backtest_v2(
+                    features, targets_multi, asset_map,
+                    v2_wf["fold_results"], cfg_v2, result_a,
                 )
-            except Exception as v21_exc:
+            except Exception as v2_exc:
                 import traceback
-                log_write(f"\n[v2.1 ERROR]\n{traceback.format_exc()}")
+                log_write(f"\n[v2 ERROR]\n{traceback.format_exc()}")
 
-        # Pack: bestes Modell als result_a wenn V2_ONLY
-        if V2_ONLY:
-            if v21_result:
-                result_a = v21_result
-            elif v2_result:
-                result_a = v2_result
+        # ── v2 Single-Horizon Vergleich (Hauptfokus) ──────────────────
+        sh_bt = {}
+        if SINGLE_HORIZON:
+            try:
+                all_train_res = step_train_single_horizons(features, asset_map)
+                sh_bt = step_backtest_single_horizons(
+                    features, asset_map, all_train_res, result_a,
+                )
+            except Exception as sh_exc:
+                import traceback
+                log_write(f"\n[SINGLE-HORIZON ERROR]\n{traceback.format_exc()}")
+
+        if not result_a and sh_bt:
+            best_h = max(sh_bt, key=lambda h: sh_bt[h].get('sharpe', 0))
+            result_a = sh_bt[best_h]
 
         step_pack_artifacts(result_a, result_b)
         log_write(f"\n[DONE] Gesamtdauer: {elapsed()}")
