@@ -93,13 +93,16 @@ def make_dataloaders_sh(
     seq_len:  int = 64,
     batch_size: int = 512,
 ) -> tuple[DataLoader, DataLoader]:
-    """Wrapper um CrossSectionalDataset (v1) — identischer Code."""
+    """Wrapper um CrossSectionalDataset (v1) mit Index-Alignment."""
+    common_idx = features.index.intersection(targets.index)
+    feat_aligned = features.loc[common_idx]
+    tgt_aligned  = targets.loc[common_idx]
     train_ds = CrossSectionalDataset(
-        features, targets, asset_map, seq_len,
+        feat_aligned, tgt_aligned, asset_map, seq_len,
         start_date=fold.train_start, end_date=fold.train_end,
     )
     val_ds = CrossSectionalDataset(
-        features, targets, asset_map, seq_len,
+        feat_aligned, tgt_aligned, asset_map, seq_len,
         start_date=fold.val_start, end_date=fold.val_end,
     )
     train_ld = DataLoader(train_ds, batch_size=batch_size, shuffle=True,
