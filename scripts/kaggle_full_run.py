@@ -1147,7 +1147,7 @@ def main() -> int:
     # RUN_V1         = False → v1 Training/Backtest ueberspringen
     # RUN_V2_MULTI   = False → v2/v2.1 Multi-Horizon ueberspringen
     SINGLE_HORIZON = True
-    SH_HORIZONS    = [4, 7]   # Batch 1: nur 4d + 7d (Batch 2 spaeter: [11, 15])
+    SH_HORIZONS    = [11, 15]  # Batch 2: 11d + 15d
     RUN_V1         = False
     RUN_V2_MULTI   = False
     V2_MAX_ASSETS  = 0    # 0 = alle Assets (260 S&P 500)
