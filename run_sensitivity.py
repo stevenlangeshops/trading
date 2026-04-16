@@ -464,7 +464,7 @@ def build_price_cache_local(asset_map: Dict[str, int], data_dir: str | Path) -> 
     assets = list(asset_map.keys())
     if 'SPY' not in assets:
         assets.append('SPY')
-    return build_price_cache(assets, raw_dir=str(data_dir))
+    return build_price_cache(assets, raw_dir=Path(data_dir))
 
 
 # ══════════════════════════════════════════════════════════════════════════════
