@@ -1169,10 +1169,15 @@ def main() -> int:
     # ── Modus-Schalter ────────────────────────────────────────────────
     # SINGLE_HORIZON = True → v2 Single-Horizon-Vergleich
     # SH_HORIZONS    → welche Horizonte in diesem Run (Batch 1: [4,7], Batch 2: [11,15])
+    # Optional: KAGGLE_SH_HORIZONS="11,15" setzen (z.B. im Notebook vor exec)
     # RUN_V1         = False → v1 Training/Backtest ueberspringen
     # RUN_V2_MULTI   = False → v2/v2.1 Multi-Horizon ueberspringen
     SINGLE_HORIZON = True
-    SH_HORIZONS    = [4, 7]   # Batch 1 (Wiederholung mit Fix)
+    _sh_env = os.environ.get("KAGGLE_SH_HORIZONS", "").strip()
+    if _sh_env:
+        SH_HORIZONS = [int(x.strip()) for x in _sh_env.split(",") if x.strip()]
+    else:
+        SH_HORIZONS = [11, 15]   # Default: Batch 2
     RUN_V1         = False
     RUN_V2_MULTI   = False
     V2_MAX_ASSETS  = 0    # 0 = alle Assets (260 S&P 500)
