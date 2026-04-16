@@ -448,10 +448,13 @@ def build_features_from_parquet(data_dir: str | Path) -> pd.DataFrame:
     """
     Baut das Feature-Panel aus dem Parquet-Verzeichnis auf.
     Identisch zu step_build_panel() in kaggle_full_run.py.
+
+    build_panel() liest RAW_DIR als Modul-Konstante, daher wird sie
+    vor dem Import-/Aufruf-Zeitpunkt überschrieben.
     """
-    sys.path.insert(0, str(Path(data_dir).parent.parent))
-    from features.engineer import build_panel
-    features, _ = build_panel(raw_dir=str(data_dir))
+    import features.engineer as eng
+    eng.RAW_DIR = Path(data_dir)
+    features, _ = eng.build_panel(timeframe="1d", horizon=11, min_rows=300)
     return features
 
 
