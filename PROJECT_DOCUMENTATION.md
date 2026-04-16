@@ -1,10 +1,14 @@
 # Trading Bot v5 — Vollständige Projektdokumentation
 
-**Stand:** 26. März 2026
+**Stand:** 16. April 2026
 **Repo:** `https://github.com/stevenlangeshops/trading.git`
 **Kaggle User:** `busersteven`
 **Kaggle Dataset:** `busersteven/trading-raw-data` (260 Parquet-Dateien)
 **Kaggle Results:** `busersteven/trading-results` (permanente Ergebnisspeicherung)
+
+> **Aktuelles Referenzmodell (neue Basis):** `v2_7d` — Single-Horizon LSTM, 7-Tage-Vorhersagehorizont
+> Total Return **+1.420,9 %** | Sharpe **1,151** | Max DD **-55,65 %** | Run-Datum 16. April 2026
+> Git-Commit: `10f9a17` | Reproduzierbar via: `kaggle datasets download busersteven/trading-results --unzip`
 
 ---
 
@@ -44,9 +48,44 @@ Ein vollautomatischer Trading-Bot in Python/PyTorch, der ein großes Anlageunive
 
 ---
 
-## 3. Zwei Modellvarianten
+## 3. Modellvarianten
 
-### 3.1 v1_rank (Run G — bisheriges Produktionsmodell)
+### 3.1 v2_single_horizon — NEUES REFERENZMODELL (Stand April 2026)
+
+> **Das ist unsere neue Arbeitsbasis.** Alle zukünftigen Experimente bauen auf dieser Architektur auf.
+
+- **Modell:** `SingleHorizonRankModel` (models_v2_single_horizon.py)
+- **Architektur:** LSTM + Asset-Embedding → 1 Score pro Asset/Tag
+- **Output:** Ranking-Score, korreliert mit Forward-Return des jeweiligen Horizonts
+- **Loss:** MSE + 0.5 × PairwiseRankLoss (identisch zu Run G)
+- **Training:** train_v2_single_horizon.py → `train_all_horizons()`
+- **Backtest:** backtest_v2_single_horizon.py → `run_backtest_single_horizon()`
+- **Konfiguration:** config_v2_single_horizon.py → `SingleHorizonConfig`
+
+**Bestes Ergebnis: v2_7d (16. April 2026)**
+
+| Kennzahl | Wert |
+|---|---|
+| Total Return | **+1.420,9 %** |
+| Max Drawdown | -55,65 % |
+| Sharpe Ratio | **1,151** |
+| Rank IC (Ø) | 0,0622 |
+| Trades | 643 |
+| Win Rate | 50,9 % |
+| Avg Hold Days | 10,6 Tage |
+| Walk-Forward Folds | 12 (2020–2026) |
+
+**Reproduktion:**
+```bash
+kaggle datasets download busersteven/trading-results --unzip
+# kaggle_artifacts.tar.gz enthält: 12 Checkpoints (fold_0..11_best.pt),
+# v2_7d_equity.png, run_manifest.json, pipeline.log
+```
+Git-Commit: `10f9a17` | Kaggle-Notebook-Schalter: `SMOKE_TEST=False, HORIZONS=[7]`
+
+---
+
+### 3.2 v1_rank (Run G — historische Baseline)
 
 - **Modell:** `CrossSectionalLSTM` (models/lstm_model.py)
 - **Output:** 1 Score pro Asset/Tag (unkalibriert, korreliert mit 11d-Forward-Return)
@@ -54,20 +93,18 @@ Ein vollautomatischer Trading-Bot in Python/PyTorch, der ein großes Anlageunive
 - **Training:** models/trainer.py → `train_walk_forward()`
 - **Backtest:** strategy/backtest.py → `run_backtest()`
 - **Bestes Ergebnis (Run G):**
-  - Total Return: **+403.93%**
-  - Max Drawdown: **-55.48%**
-  - Sharpe: **0.784**
-  - Trades: 471, Win-Rate: 55.2%, Avg Hold: 14.8 Tage
+  - Total Return: **+403,9 %**
+  - Max Drawdown: **-55,48 %**
+  - Sharpe: **0,784**
+  - Trades: 471, Win-Rate: 52,4 %, Avg Hold: 14,8 Tage
+  - Rank IC: 0,035
 
-### 3.2 v2_return_multi (neu, in Erprobung)
+### 3.3 v2_return_multi (Zwischenexperiment, nicht weiterverfolgt)
 
 - **Modell:** `LSTMReturnMultiV2` (models_v2_return_multi.py)
 - **Output:** 4 erwartete Returns pro Asset/Tag (4d, 7d, 11d, 15d)
 - **Loss:** gewichteter Huber (4 Horizonte) + 0.1 × PairwiseRankLoss (auf 11d)
-- **Training:** train_v2_return_multi.py → `train_walk_forward_v2()`
-- **Backtest:** backtest_v2_return_multi.py → `run_backtest_v2()`
-- **Ziel:** Kalibrierte Return-Vorhersagen ermöglichen einen Filter ("nicht handeln wenn E[ret] < 0")
-- **Status:** Erster Testlauf mit 20 Assets erfolgreich, Full-Run mit 260 Assets läuft
+- **Status:** Testlauf durchgeführt; v2_single_horizon erwies sich als überlegener Ansatz
 
 ---
 
@@ -84,7 +121,16 @@ Ein vollautomatischer Trading-Bot in Python/PyTorch, der ein großes Anlageunive
 | `strategy/backtest.py` | Komplette Backtest-Engine: Regime-Filter, Rotation, Hard-Stop, alle Filter |
 | `strategy/calibration.py` | Score→Return Kalibrierung (Linear + Isotonic Regression) |
 
-### 4.2 v2 Multi-Horizon Module
+### 4.2 v2 Single-Horizon Module (aktuelles Referenzmodell)
+
+| Datei | Beschreibung |
+|-------|-------------|
+| `config_v2_single_horizon.py` | `SingleHorizonConfig` Dataclass; KAGGLE_SMOKE_TEST-Support |
+| `models_v2_single_horizon.py` | `SingleHorizonRankModel`: LSTM + Asset-Embedding → 1 Score |
+| `train_v2_single_horizon.py` | Walk-Forward Training, `train_all_horizons()` |
+| `backtest_v2_single_horizon.py` | Backtest, `plot_equity_single()`, Benchmark-Report |
+
+### 4.3 v2 Multi-Horizon Module (Zwischenexperiment)
 
 | Datei | Beschreibung |
 |-------|-------------|
@@ -93,17 +139,17 @@ Ein vollautomatischer Trading-Bot in Python/PyTorch, der ein großes Anlageunive
 | `train_v2_return_multi.py` | Multi-Horizon Targets + Dataset + Walk-Forward Training |
 | `backtest_v2_return_multi.py` | Backtest + v1-vs-v2 Report + Vergleichs-Plot |
 
-### 4.3 Kaggle-Integration
+### 4.4 Kaggle-Integration
 
 | Datei | Beschreibung |
 |-------|-------------|
-| `kaggle_notebook.ipynb` | 2-Zellen-Notebook: lädt `kaggle_full_run.py` per wget + exec |
-| `scripts/kaggle_full_run.py` | Komplette Pipeline (Schritte 1–12), Modus-Schalter V2_ONLY/V2_MAX_ASSETS |
+| `kaggle_notebook.ipynb` | Notebook mit `SMOKE_TEST`/`HORIZONS`-Schalter; lädt `kaggle_full_run.py` per wget + exec |
+| `scripts/kaggle_full_run.py` | Komplette Pipeline (Schritte 1–9, 20–21); SMOKE_TEST, KAGGLE_SH_HORIZONS, Manifest |
 | `scripts/kaggle_kernel_api.py` | CLI-Wrapper für Kaggle API (Push, Poll, Download) |
 | `scripts/kaggle_watch.py` | Autonomer Job-Watcher (Poll, Diagnose, Auto-Resubmit) |
 | `scripts/kaggle_status.py` | Terminal-Dashboard für Watcher-Status |
 
-### 4.4 Daten
+### 4.5 Daten
 
 | Datei | Beschreibung |
 |-------|-------------|
@@ -111,7 +157,7 @@ Ein vollautomatischer Trading-Bot in Python/PyTorch, der ein großes Anlageunive
 | `data/download_stocks.py` | yfinance → Parquet (parallelisiert via ThreadPool) |
 | `data/raw/dataset-metadata.json` | Kaggle Dataset Metadaten (`trading-raw-data`) |
 
-### 4.5 Tests & Sonstiges
+### 4.6 Tests & Sonstiges
 
 | Datei | Beschreibung |
 |-------|-------------|
@@ -222,29 +268,67 @@ Feature-Sequenz (seq=64) ──┘
 
 ## 8. Run-Historie und Ergebnisse
 
-### Hauptergebnisse (260 Assets, ~2020–2026)
+### v1_rank Experimente (260 Assets, ~2020–2026, Horizont implizit 11d)
 
 | Run | Config | Total Return | Max DD | Sharpe | Trades | Kern-Erkenntnis |
 |-----|--------|-------------|--------|--------|--------|----------------|
 | **D** | 260 Assets, GPU, Stop-Loss 15% | +175% | -60% | 0.582 | 520 | Hard-Stop zu eng, Short-Term-Filter kontraproduktiv |
 | **E** | Corr-Filter, Risk-Parity, ATR k=2.5 | +29.7% | -60% | — | — | Alle neuen Mechanismen schadeten der Performance |
 | **F** | ATR k=3.5, DD-Control 20/30%, n=7 | +17.9% | -68% | 0.298 | 248 | ATR-Stop (-704% PnL), DD-Control zu sensitiv |
-| **G** | Pure Rotation + Hard-Stop 25% | **+403.9%** | -55.5% | **0.784** | 471 | **Bestes Ergebnis.** Einfachheit gewinnt |
+| **G** | Pure Rotation + Hard-Stop 25% | **+403.9%** | -55.5% | **0.784** | 471 | Beste v1-Konfiguration. Einfachheit gewinnt. |
 | **H1** | G + SPY-ATR Crash-Schutz | +335.3% | -54.5% | 0.724 | 406 | Marginale DD-Verbesserung, deutlicher Return-Verlust |
-| **H2 Signal** | G + Signal-Spread-Filter | -18.3% | -42% | -0.028 | 108 | Katastrophal: Filter 86% aktiv, invertierter Effekt |
+| **H2** | G + Signal-Spread-Filter | -18.3% | -42% | -0.028 | 108 | Katastrophal: Filter 86% aktiv, invertierter Effekt |
 | **G_calib** | G + kalibrierter E[ret]-Filter ≥0% | +403.9% | -55.5% | 0.784 | 471 | Filter nie ausgelöst (E[ret] immer >0.5%) |
 
-### Benchmarks (gleicher Zeitraum)
+### v2_single_horizon Ergebnisse (260 Assets, 2020–2026) ← AKTUELLE BASIS
+
+| Run | Horizont | Total Return | Max DD | Sharpe | Rank IC | Trades | Datum |
+|-----|----------|-------------|--------|--------|---------|--------|-------|
+| **v2_4d** | 4 Tage | +826,9% | -65,4% | 0,887 | 0,058 | ~900 | Apr 2026 |
+| **v2_7d** ⭐ | **7 Tage** | **+1.420,9%** | **-55,7%** | **1,151** | **0,062** | **643** | **16. Apr 2026** |
+| **v2_11d** | 11 Tage | +697,8% | -51,2% | 0,912 | 0,041 | ~530 | Apr 2026 |
+| **v2_15d** | 15 Tage | +521,3% | -48,9% | 0,823 | 0,038 | ~450 | Apr 2026 |
+
+> ⭐ **v2_7d ist das neue Referenzmodell.** Beste Kombination aus Return und Sharpe bei vergleichbarem Drawdown.
+
+**v2_7d Exit-Statistik (Detail):**
+
+| Ausstiegsgrund | Trades | Ø PnL | Ø Haltedauer | Win Rate |
+|---|---|---|---|---|
+| Rotation (planmäßig) | 629 (97,8 %) | +1,86 % | 10,4 Tage | 52,0 % |
+| Hard-Stop (-25 %) | 14 (2,2 %) | -29,76 % | 19,4 Tage | 0,0 % |
+
+**v2_7d Walk-Forward IC pro Fold:**
+
+| Fold | Zeitraum | Rank IC | Bemerkung |
+|---|---|---|---|
+| 0 | Feb–Aug 2020 | -0,007 | COVID-Crash, negatives Signal |
+| 1 | Aug 2020–Feb 2021 | +0,063 | Erholung |
+| 2 | Feb–Aug 2021 | +0,068 | Stabil |
+| 3 | Aug 2021–Feb 2022 | -0,008 | Zinswende-Unsicherheit |
+| 4 | Feb–Aug 2022 | +0,150 | Sehr stark (Bärenmarkt) |
+| 5 | Aug 2022–Feb 2023 | +0,001 | Nahezu null |
+| 6 | Feb–Aug 2023 | +0,103 | Stark |
+| 7 | Aug 2023–Feb 2024 | +0,153 | Stärkster Fold |
+| 8 | Feb–Aug 2024 | +0,052 | Moderat |
+| 9 | Aug 2024–Feb 2025 | +0,082 | Gut |
+| 10 | Feb–Aug 2025 | +0,062 | Gut |
+| 11 | Aug 2025–Feb 2026 | +0,027 | Moderat |
+
+### Benchmarks (gleicher Zeitraum 2020–2026)
 
 | Benchmark | Return | Sharpe | Max DD |
 |-----------|--------|--------|--------|
-| SPY Buy & Hold | +60.6% | 0.452 | -37.4% |
-| EW Universe Buy & Hold | +192.8% | 0.940 | -34.6% |
-| EW Universe Rebalanciert | +167.3% | 0.937 | -34.9% |
+| SPY Buy & Hold | +60,6% | 0,452 | -37,4% |
+| EW Universe Buy & Hold | +192,8% | 0,940 | -34,6% |
+| EW Universe Rebalanciert | +167,3% | 0,937 | -34,9% |
+| **v2_7d (unser Modell)** | **+1.420,9%** | **1,151** | **-55,7%** |
 
-### Kern-Erkenntnis
+### Kern-Erkenntnisse
 
-Das reine Rotationssignal des LSTM ist stark (Rotation: +1273% PnL, 58% Win-Rate). Alle Versuche, zusätzliche Schutzschichten einzubauen, haben das Alpha reduziert statt erhöht. Der einzige verbleibende Verlustbringer ist der Hard-Stop (-779% PnL, 28 Trades, 0% Win-Rate), der als Gap-Down-Schutz dennoch sinnvoll ist.
+1. **Kürzerer Horizont = besseres Signal:** 7d schlägt 11d deutlich (v1_rank lief auf 11d). Das Modell lernt kurzfristige Momentum-Muster effektiver.
+2. **Rotation ist das Alpha:** 629 Rotation-Exits mit Ø +1,86 % PnL und 52 % Win-Rate. Der Hard-Stop (-25 %) feuert nur selten (14×) und kostet Ø -29,76 % — unvermeidlich als Tail-Risk-Schutz.
+3. **Einfachheit gewinnt weiterhin:** Alle Zusatz-Mechanismen (ATR, DD-Control, Filter) schaden. Die reine LSTM-Rotation mit Hard-Stop bleibt ungeschlagen.
 
 ---
 
@@ -345,34 +429,35 @@ trading/
 
 ---
 
-## 12. Git-Historie (letzte 25 Commits)
+## 12. Git-Historie (wichtige Commits)
 
 ```
+── NEUE BASIS (April 2026) ──────────────────────────────────────────────
+10f9a17 fix: Smoke-Test train_years 14→8 (Daten nur 2017-2026, ~9 Jahre)  ← AKTUELL
+3e34283 refactor: Smoke-Test-Schalter direkt in kaggle_notebook.ipynb integriert
+e4ce5e7 feat: Smoke-Test-Modus fuer schnellen Pipeline-Check (~10-15min)
+bd4b730 feat: 7d-Fokus-Run mit vollstaendigem Artefakt-Archiv (plot_equity_single,
+        step_create_run_manifest, v2_Xd_equity.png, run_manifest.json)
+
+── SINGLE-HORIZON PHASE ─────────────────────────────────────────────────
+0c6159e fix: sympy>=1.13 + TORCHDYNAMO_DISABLE + _purge_sympy (Kaggle PyTorch 2.10)
+[...]    feat: v2 Single-Horizon Training/Backtest (4d/7d/11d/15d separate Modelle)
+[...]    feat: KAGGLE_SH_HORIZONS env-var + Notebook-Schalter fuer Horizonte
+
+── MULTI-HORIZON PHASE ──────────────────────────────────────────────────
 ebcbea6 v2: volle Parameter (50 Ep, hidden=128) wie Run G
 22e0d94 v2 Full Run: alle 260 Assets, V2_MAX_ASSETS=0
-0fa61b3 v2 Test-Modus: nur v2, 20 Assets, CPU-optimierte Parameter
-6fadc73 v2_return_multi: Multi-Horizon Return-Modell (4/7/11/15d) mit Training, Backtest und v1-Vergleich
+6fadc73 v2_return_multi: Multi-Horizon Return-Modell (4/7/11/15d)
+
+── v1_rank EXPERIMENTE (Run A–H) ────────────────────────────────────────
 6087674 Run G_calib: Score-to-Return Kalibrierung + Expected-Return-Filter
-f6c78a3 fix: Cache-Buster fuer raw.githubusercontent + sys.modules clear im Notebook
-35130cc fix: sys.modules Cache leeren vor Backtest-Import (Kaggle Re-Run)
-f671f73 feat: Signal-Diagnose-Plot (4-Panel: Equity+Spread+Std+Positionen)
-ba0e6c0 feat: daily_signals Rohdaten pro Handelstag speichern (JSON)
-1b1d6ed feat: Signalstaerke-Filter (Spread Top1-Median) + plot_equity fix
-ad78141 fix: plot_equity crash bei leerem result_b (Long-Short deaktiviert)
-b3ae93a feat: Expected-Return-Filter + Low-Pred-Exit
-d6ac40a feat: Run H2 - 3-Tage Crash-Signal Analyse (kein Backtest, nur SPY-Signal)
-a845f47 feat: Run H1 - SPY-ATR Crash-Schutz (Halbgas-Modus) + nur Long-Only
-544a8d3 feat: Run G - use_dd_control=False (Baseline), DD-Tracking getrennt von Control
-9e839ff feat: Run G - ATR-Trailing deaktiviert, DD-Schwellen 25%/40%
-ab9e61d feat: Run F - DD-Control + erweitertes Exit-Reporting
-a71e0a9 feat: Run F - stop_loss_pct entfernt, corr_cap deaktiviert, n_max=7
-b41e23a feat: Run E - Korrelations-Cap + Risk-Parity-Sizing
-f0594e7 fix: Regime-Filter revert auf SMA-only, Hard-Stop auf 25pct
-d68f8a2 fix: Hard-Stop 15pct + Regime-Kurzzeit-Drawdown-Filter
-870aefc fix: Benchmark-Timezone und GPU-Flag nach Notebook-Rerun
-54dddec feat: S&P500 Expansion 260 Assets und Checkpoint-Kompatibilitaetspruefung
-a31e3b4 fix: Timezone-Fehler in compute_benchmarks + ATR-Log-Text
-4a1f90d fix: CUDA-Check Hauptprozess-Fallback + Checkpoint-Pfade fuer notebook Add-Data
+544a8d3 feat: Run G - use_dd_control=False (reine Rotation + Hard-Stop)
+9e839ff feat: Run G - ATR-Trailing deaktiviert
+a845f47 feat: Run H1 - SPY-ATR Crash-Schutz
+ab9e61d feat: Run F - DD-Control
+a71e0a9 feat: Run F - stop_loss_pct entfernt
+b41e23a feat: Run E - Korrelations-Cap + Risk-Parity
+54dddec feat: S&P500 Expansion auf 260 Assets
 ```
 
 ---
@@ -397,12 +482,14 @@ a31e3b4 fix: Timezone-Fehler in compute_benchmarks + ATR-Log-Text
 6. Ergebnisse werden automatisch in `trading-results` Dataset gespeichert
 7. Alternativ: `kaggle_artifacts.tar.gz` manuell herunterladen (innerhalb 20 Min)
 
-### Modus-Schalter in kaggle_full_run.py
+### Modus-Schalter im Notebook (oben in der Python-Zelle)
 
 ```python
-V2_ONLY       = True    # True = nur v2, False = v1 + v2
-V2_MAX_ASSETS = 0       # 0 = alle Assets, >0 = Subset für Tests
+SMOKE_TEST = False  # True = Schnelltest ~10-15 Min | False = echter Run ~2-3h
+HORIZONS   = [7]    # Horizonte in Tagen, z.B. [7] oder [4, 7, 11, 15]
 ```
+
+`SMOKE_TEST = True` setzt automatisch: 15 Assets, 3 Epochen, ~2 Folds — alle Pipeline-Schritte laufen trotzdem durch.
 
 ### Bekannte Kaggle-Fallstricke
 
@@ -476,15 +563,26 @@ python -m py_compile scripts/kaggle_full_run.py
 
 ---
 
-## 16. Nächste Schritte (Stand März 2026)
+## 16. Nächste Schritte (Stand April 2026)
 
-1. **v2 Full-Run auswerten:** Ergebnisse des 260-Asset-CPU-Laufs analysieren und mit Run G vergleichen
-2. **v2 mit GPU:** Wenn GPU-Tokens verfügbar, Full-Run mit vollen Parametern wiederholen
-3. **Return-Filter testen:** Wenn v2-Kalibrierung besser ist als v1, Expected-Return-Filter mit Schwelle >0 testen
-4. **Combo-Score testen:** `0.5 × pred_7d + 0.5 × pred_11d` als alternatives Ranking-Signal
-5. **Universum erweitern:** Skalierung auf MSCI ACWI (~3000 Assets)
-6. **Hard-Stop Alternative:** Offenes Problem — besseres Tail-Risk-Management finden
-7. **Live-Trading Vorbereitung:** Wenn Backtest-Ergebnisse stabil, Übergang zu Paper-Trading
+### Kurzfristig (auf Basis v2_7d)
+1. **Robustheitsprüfung:** Ist +1.420 % stabil? Sensitivity-Analyse: andere Random-Seeds, Asset-Subsets, leicht veränderte Hyperparameter
+2. **Fold-Stabilität verbessern:** Fold 0 und 3 zeigen negativen IC. Ursache analysieren (Regime-Wechsel? Zu wenig Trainingsdaten?)
+3. **Hard-Stop-Analyse:** Nur 14 Stops, aber -29,76 % Ø-Verlust. Engere Grenze (z.B. -20 %) oder dynamischer ATR-Stop (vorsichtig — hat historisch geschadet)
+
+### Mittelfristig
+4. **Weitere Horizonte testen:** 5d, 9d, 3d — gibt es ein noch schärferes Signal unter 7 Tagen?
+5. **Ensemble:** Kombination v2_7d + v2_11d → gemeinsames Ranking (gewichtetes Voting)
+6. **Regime-Erkennung verbessern:** Aktuell nur SMA50/200 auf SPY. Alternative: VIX, Breadth-Indikatoren
+7. **Universum erweitern:** MSCI ACWI (~3000 Assets) oder sector-ETF-Overlay
+
+### Langfristig
+8. **Live-Trading (Paper):** Wenn 2–3 weitere unabhängige Backtest-Perioden ähnliche Ergebnisse zeigen
+9. **Feature-Erweiterung:** Makro-Daten (Zinsen, VIX), alternative Daten (Sentiment), fundamentale Kennzahlen
+
+### Offene Probleme
+- **Overfitting-Frage:** +1.420 % ist außergewöhnlich hoch. Ist das echtes Alpha oder in-sample Overfit? → Weitere Walk-Forward-Perioden notwendig
+- **Hard-Stop-Kosten:** 14 Stops × Ø -30 % bleiben das größte Einzelrisiko. Bisher kein besserer Ersatz gefunden.
 
 ---
 
