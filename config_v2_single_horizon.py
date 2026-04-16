@@ -74,11 +74,12 @@ def get_config(horizon: int) -> SingleHorizonConfig:
     cfg = SingleHorizonConfig(horizon=horizon)
 
     if os.environ.get("KAGGLE_SMOKE_TEST", "").strip() == "1":
-        # Smoke-Test: nur 2 Folds (~2 Walk-Forward-Schritte am Ende des Datensatzes)
-        # und 3 Epochen je Fold – alle Code-Pfade werden trotzdem durchlaufen.
+        # Smoke-Test: nur ~2 Folds und 3 Epochen je Fold.
+        # Daten gehen von 2017-2026 (~9 Jahre). Mit train_years=8 + step=0.5
+        # entstehen genau ~2 Folds (8.0-8.5 → val 2025-2025.5, 8.5-9 → val 2025.5-2026).
         cfg.epochs      = 3
         cfg.patience    = 99      # kein Early-Stopping; alle 3 Epochen laufen immer
-        cfg.train_years = 14.0    # bei 15 Jahren Daten → ca. 2 Folds
+        cfg.train_years = 8.0     # bei ~9 Jahren Daten → ca. 2 Folds
         cfg.batch_size  = 512
 
     return cfg
