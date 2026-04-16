@@ -17,8 +17,13 @@ Nutzung:
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Optional
+
+# PyTorch 2.10+ / Kaggle: AdamW kann torch._dynamo → sympy triggern; bei kaputtem sympy
+# (AttributeError: module 'sympy' has no attribute 'core') vor import torch setzen.
+os.environ.setdefault("TORCHDYNAMO_DISABLE", "1")
 
 import numpy as np
 import pandas as pd

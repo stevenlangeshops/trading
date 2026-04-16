@@ -33,6 +33,11 @@ import tarfile
 import time
 from pathlib import Path
 
+# Kaggle + PyTorch 2.10: Ohne das kann AdamW torch._dynamo → sympy ziehen; bei
+# kaputtem/alten system-sympy: AttributeError: module 'sympy' has no attribute 'core'
+# Muss gesetzt sein, bevor irgendwo `import torch` laeuft (z.B. train_*).
+os.environ.setdefault("TORCHDYNAMO_DISABLE", "1")
+
 WORKING  = Path("/kaggle/working")
 REPO_DIR = WORKING / "repo"
 # Kaggle-Dataset-Pfade — probiert alle bekannten Varianten.
@@ -223,12 +228,22 @@ def step_check_cuda():
 
 # ── Schritt 2: Abhaengigkeiten ────────────────────────────────────────────────
 
+def _purge_sympy_from_sys_modules() -> None:
+    """Nach pip-Upgrade: altes sympy kann in sys.modules haengen → dynamo bricht."""
+    for name in list(sys.modules.keys()):
+        if name == "sympy" or name.startswith("sympy."):
+            del sys.modules[name]
+
+
 def step_install():
     log_write(f"\n{'='*60}\nSCHRITT 2: Abhaengigkeiten [{elapsed()}]\n{'='*60}")
-    # Kaggle hat PyTorch vorinstalliert, wir brauchen nur ta + loguru + scipy
-    run([sys.executable, "-m", "pip", "install",
-         "ta==0.11.0", "loguru==0.7.2", "scipy",
+    # Kaggle: PyTorch 2.10+ zieht torch._dynamo → sympy; alte/broken sympy:
+    #   AttributeError: module 'sympy' has no attribute 'core'
+    # sympy>=1.13 + --upgrade; danach Cache leeren (siehe main nach step_install).
+    run([sys.executable, "-m", "pip", "install", "--upgrade",
+         "ta==0.11.0", "loguru==0.7.2", "scipy", "sympy>=1.13",
          "--quiet", "--no-warn-script-location"])
+    _purge_sympy_from_sys_modules()
 
 
 # ── Schritt 3: Parquet-Daten kopieren ────────────────────────────────────────
