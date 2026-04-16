@@ -1330,7 +1330,26 @@ def main() -> int:
     RUN_V1         = False
     RUN_V2_MULTI   = False
     V2_MAX_ASSETS  = 0    # 0 = alle Assets (260 S&P 500)
+
+    # ── Smoke-Test-Modus (KAGGLE_SMOKE_TEST=1) ────────────────────────
+    # Schneller End-to-End-Test: 15 Assets, 3 Epochen, ~2 Folds.
+    # Alle Pipeline-Schritte werden durchlaufen, aber stark verkleinert.
+    SMOKE_TEST = os.environ.get("KAGGLE_SMOKE_TEST", "").strip() == "1"
+    if SMOKE_TEST:
+        V2_MAX_ASSETS = 15
     # ──────────────────────────────────────────────────────────────────
+
+    if SMOKE_TEST:
+        log_write(
+            "\n" + "=" * 60 +
+            "\n  *** SMOKE-TEST-MODUS AKTIV ***" +
+            f"\n  Horizonte : {SH_HORIZONS}" +
+            "\n  Assets    : 15  (statt ~260)" +
+            "\n  Epochen   : 3   (statt 50, kein Early-Stopping)" +
+            "\n  Folds     : ~2  (statt 12, train_years=14)" +
+            "\n  Ziel      : vollstaendiger Pipeline-Durchlauf in ~10-15min" +
+            "\n" + "=" * 60
+        )
 
     try:
         step_clone()

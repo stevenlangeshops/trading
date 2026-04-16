@@ -6,8 +6,13 @@ Konfiguration fuer den Single-Horizon-Vergleich:
   strukturell identisch zu v1_rank, aber je mit eigenem Horizont.
 
 Ziel: empirisch den optimalen Einzelhorizont finden.
+
+Smoke-Test-Modus (KAGGLE_SMOKE_TEST=1):
+  Reduziert Epochen und Folds drastisch, damit die gesamte Pipeline
+  in ~10-15 Min durchlaeuft (statt 2-3h) und auf Fehler pruefbar ist.
 """
 
+import os
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -61,5 +66,19 @@ class SingleHorizonConfig:
 
 
 def get_config(horizon: int) -> SingleHorizonConfig:
-    """Gibt die Basis-Config fuer einen bestimmten Horizont zurueck."""
-    return SingleHorizonConfig(horizon=horizon)
+    """Gibt die Config fuer einen Horizont zurueck.
+
+    Wenn KAGGLE_SMOKE_TEST=1 gesetzt ist, werden Epochen und Folds
+    auf Minimalwerte reduziert (vollstaendiger Pipeline-Test in ~10-15min).
+    """
+    cfg = SingleHorizonConfig(horizon=horizon)
+
+    if os.environ.get("KAGGLE_SMOKE_TEST", "").strip() == "1":
+        # Smoke-Test: nur 2 Folds (~2 Walk-Forward-Schritte am Ende des Datensatzes)
+        # und 3 Epochen je Fold – alle Code-Pfade werden trotzdem durchlaufen.
+        cfg.epochs      = 3
+        cfg.patience    = 99      # kein Early-Stopping; alle 3 Epochen laufen immer
+        cfg.train_years = 14.0    # bei 15 Jahren Daten → ca. 2 Folds
+        cfg.batch_size  = 512
+
+    return cfg
