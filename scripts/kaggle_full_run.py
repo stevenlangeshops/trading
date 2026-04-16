@@ -637,6 +637,8 @@ def step_pack_artifacts(result_a: dict, result_b: dict):
         # v2 Single-Horizon Artefakte
         WORKING / "benchmark_horizon_comparison.json",
         WORKING / "horizon_comparison_equity.png",
+        # Reproduktions-Manifest (git-Hash, Versionen, Hyperparameter, Ergebnisse)
+        WORKING / "run_manifest.json",
     ]
 
     # Single-Horizon Artefakte (v2_4d, v2_7d, v2_11d, v2_15d)
@@ -645,6 +647,7 @@ def step_pack_artifacts(result_a: dict, result_b: dict):
         collect.append(WORKING / f"v2_{_h}d_backtest.json")
         collect.append(WORKING / f"v2_{_h}d_trade_log.json")
         collect.append(WORKING / f"v2_{_h}d_daily_signals.json")
+        collect.append(WORKING / f"v2_{_h}d_equity.png")   # Einzelchart pro Horizont
 
     # Checkpoints (v1 + v2 + single-horizon)
     ckpt_dir = REPO_DIR / "checkpoints"
@@ -721,6 +724,108 @@ def step_pack_artifacts(result_a: dict, result_b: dict):
 
 # ── Schritt 9: Ergebnisse in Kaggle Dataset persistieren ──────────────────────
 
+def step_create_run_manifest(sh_horizons: list[int], all_bt: dict, all_train: dict) -> dict:
+    """Erzeugt run_manifest.json: vollständige Reproduktions-Metadaten für diesen Run.
+
+    Enthält:
+      - Zeitstempel & git-Commit des geklonten Repos
+      - Python / torch / numpy / pandas Versionen
+      - Alle Hyperparameter (SingleHorizonConfig) pro Horizont
+      - Backtest-Metriken-Zusammenfassung pro Horizont
+      - Walk-Forward IC pro Horizont
+    """
+    log_write(f"\n{'='*60}\nManifest: Reproduktionsdaten sichern [{elapsed()}]\n{'='*60}")
+
+    # ── git-Commit des geklonten Repos ────────────────────────────────────────
+    git_hash = "unknown"
+    git_msg  = ""
+    try:
+        r = subprocess.run(
+            ["git", "-C", str(REPO_DIR), "log", "-1", "--format=%H %s"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if r.returncode == 0:
+            parts = r.stdout.strip().split(" ", 1)
+            git_hash = parts[0]
+            git_msg  = parts[1] if len(parts) > 1 else ""
+    except Exception as e:
+        log_write(f"  [WARN] git log: {e}")
+
+    # ── Laufzeit-Versionen ────────────────────────────────────────────────────
+    versions: dict = {"python": sys.version.split()[0]}
+    for pkg in ("torch", "numpy", "pandas", "scipy", "ta"):
+        try:
+            import importlib
+            mod = importlib.import_module(pkg)
+            versions[pkg] = getattr(mod, "__version__", "?")
+        except Exception:
+            versions[pkg] = "not installed"
+
+    # ── Hyperparameter pro Horizont ───────────────────────────────────────────
+    configs: dict = {}
+    try:
+        for _mod in list(sys.modules.keys()):
+            if _mod.startswith("config_v2_single"):
+                del sys.modules[_mod]
+        from config_v2_single_horizon import get_config
+        for h in sh_horizons:
+            cfg = get_config(h)
+            configs[f"v2_{h}d"] = {
+                k: v for k, v in vars(cfg).items()
+                if not k.startswith("_")
+            }
+    except Exception as e:
+        log_write(f"  [WARN] configs: {e}")
+
+    # ── Backtest-Ergebnisse (slim) ────────────────────────────────────────────
+    results: dict = {}
+    for h, bt in all_bt.items():
+        results[f"v2_{h}d"] = {
+            k: v for k, v in bt.items()
+            if k not in ("equity", "equity_dates", "trade_log", "daily_signals")
+        }
+
+    # ── Walk-Forward Metriken ─────────────────────────────────────────────────
+    training: dict = {}
+    for h, tr in all_train.items():
+        training[f"v2_{h}d"] = {
+            k: v for k, v in tr.items()
+            if k not in ("fold_results",)
+        }
+
+    # ── Notebook-Eingabe ──────────────────────────────────────────────────────
+    notebook_input = {
+        "KAGGLE_SH_HORIZONS": os.environ.get("KAGGLE_SH_HORIZONS", ""),
+        "sh_horizons":        sh_horizons,
+        "RUN_V1":             False,
+        "RUN_V2_MULTI":       False,
+        "TORCHDYNAMO_DISABLE": os.environ.get("TORCHDYNAMO_DISABLE", ""),
+        "pip_extra":          ["sympy>=1.13", "ta==0.11.0", "loguru==0.7.2", "scipy"],
+    }
+
+    manifest = {
+        "run_timestamp":   time.strftime("%Y-%m-%d %H:%M:%S UTC"),
+        "git_commit":      git_hash,
+        "git_commit_msg":  git_msg,
+        "repo_url":        "https://github.com/stevenlangeshops/trading",
+        "versions":        versions,
+        "notebook_input":  notebook_input,
+        "hyperparameters": configs,
+        "backtest_results":results,
+        "training_summary":training,
+        "reproduce_cmd": (
+            "kaggle datasets download busersteven/trading-results --unzip\n"
+            "# kaggle_artifacts.tar.gz enthält: Checkpoints (.pt), Charts (.png), "
+            "run_manifest.json, pipeline.log"
+        ),
+    }
+
+    out_path = WORKING / "run_manifest.json"
+    out_path.write_text(json.dumps(manifest, indent=2, default=str))
+    log_write(f"  run_manifest.json gespeichert (git={git_hash[:10]})")
+    return manifest
+
+
 def step_persist_results():
     """
     Lädt die wichtigsten Ergebnisse in ein permanentes Kaggle Dataset hoch,
@@ -786,10 +891,13 @@ def step_persist_results():
         # Single-Horizon Ergebnisse
         "benchmark_horizon_comparison.json",
         "horizon_comparison_equity.png",
+        # Reproduktions-Manifest und Einzelcharts
+        "run_manifest.json",
     ]
     for _h in [4, 7, 11, 15]:
         upload_files.append(f"v2_{_h}d_backtest.json")
         upload_files.append(f"v2_{_h}d_walk_forward.json")
+        upload_files.append(f"v2_{_h}d_equity.png")
     copied = []
     for fname in upload_files:
         src = WORKING / fname
@@ -1173,6 +1281,33 @@ def step_backtest_single_horizons(features, asset_map, all_train_results, v1_res
     except Exception as e:
         log_write(f"  [WARN] horizon plot: {e}")
 
+    # Einzelner Equity-Chart pro Horizont (sauber, mit Benchmarks + Metriken)
+    try:
+        from backtest_v2_single_horizon import plot_equity_single
+        import subprocess as _sp
+        import platform as _pl
+
+        run_id = ""
+        try:
+            _r = _sp.run(
+                ["git", "-C", str(REPO_DIR), "log", "-1", "--format=%h"],
+                capture_output=True, text=True, timeout=5,
+            )
+            if _r.returncode == 0:
+                run_id = _r.stdout.strip()
+        except Exception:
+            pass
+
+        for h, bt in all_bt.items():
+            plot_equity_single(
+                bt_result=bt,
+                benchmarks=benchmarks,
+                run_id=run_id,
+                save_path=str(WORKING / f"v2_{h}d_equity.png"),
+            )
+    except Exception as e:
+        log_write(f"  [WARN] plot_equity_single: {e}")
+
     return all_bt
 
 
@@ -1243,7 +1378,8 @@ def main() -> int:
                 log_write(f"\n[v2 ERROR]\n{traceback.format_exc()}")
 
         # ── v2 Single-Horizon Vergleich (Hauptfokus) ──────────────────
-        sh_bt = {}
+        sh_bt         = {}
+        all_train_res = {}
         if SINGLE_HORIZON:
             try:
                 all_train_res = step_train_single_horizons(features, asset_map, SH_HORIZONS)
@@ -1257,6 +1393,13 @@ def main() -> int:
         if not result_a and sh_bt:
             best_h = max(sh_bt, key=lambda h: sh_bt[h].get('sharpe', 0))
             result_a = sh_bt[best_h]
+
+        # ── Reproduktions-Manifest (muss vor pack_artifacts laufen) ───────────
+        if SINGLE_HORIZON and sh_bt:
+            try:
+                step_create_run_manifest(SH_HORIZONS, sh_bt, all_train_res)
+            except Exception as mf_exc:
+                log_write(f"  [WARN] run_manifest: {mf_exc}")
 
         step_pack_artifacts(result_a, result_b)
         log_write(f"\n[DONE] Gesamtdauer: {elapsed()}")

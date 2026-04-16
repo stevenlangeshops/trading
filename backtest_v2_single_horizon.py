@@ -493,3 +493,118 @@ def plot_horizon_comparison(
 
     except Exception as e:
         logger.warning(f"Plot-Fehler: {e}")
+
+
+# ── Equity-Chart: einzelner Horizont mit Benchmarks ──────────────────────────
+
+def plot_equity_single(
+    bt_result:  dict,
+    benchmarks: Optional[dict] = None,
+    run_id:     str            = "",
+    save_path:  str            = "v2_7d_equity.png",
+):
+    """Detaillierter Equity-Chart für einen einzelnen Horizont.
+
+    Zeigt oben die kumulativen Returns (Portfolio vs. SPY vs. EW-Universe)
+    und unten den Drawdown.  Metriken werden als Text-Box eingeblendet.
+    """
+    try:
+        import matplotlib
+        matplotlib.use('Agg')
+        import matplotlib.pyplot as plt
+        import matplotlib.ticker as mticker
+        from matplotlib.gridspec import GridSpec
+
+        h           = bt_result.get('horizon', '?')
+        tag         = bt_result.get('strategy', f'v2_{h}d')
+        dates       = bt_result.get('equity_dates', [])
+        eq          = bt_result.get('equity', [])
+        trade_log   = bt_result.get('trade_log', [])
+
+        if not dates or not eq:
+            logger.warning(f"plot_equity_single: keine Equity-Daten für {tag}")
+            return
+
+        eq_plot = eq[1:] if len(eq) > len(dates) else eq
+        ret_pct = [(e / eq_plot[0] - 1) * 100 for e in eq_plot]
+
+        eq_arr  = np.array(eq_plot)
+        peaks   = np.maximum.accumulate(eq_arr)
+        dd_pct  = (eq_arr - peaks) / peaks * 100
+
+        title_tag = f"{tag}  |  {run_id}" if run_id else tag
+
+        fig = plt.figure(figsize=(16, 10))
+        gs  = GridSpec(2, 1, figure=fig, height_ratios=[3, 1], hspace=0.08)
+
+        ax_eq = fig.add_subplot(gs[0])
+        ax_dd = fig.add_subplot(gs[1], sharex=ax_eq)
+
+        # ── Portfolio ─────────────────────────────────────────────────────────
+        ax_eq.plot(dates, ret_pct, color='#1565C0', linewidth=2.2,
+                   label=f"{tag}  {bt_result.get('total_return', 0):+.1f}%")
+
+        # ── Benchmarks ────────────────────────────────────────────────────────
+        bm_styles = {
+            'spy':          ('#FFA000', '--', 'SPY Buy & Hold'),
+            'ew_bh':        ('#7B1FA2', ':',  'EW-Universe Buy & Hold'),
+            'ew_rebalanced':('#388E3C', '-.', 'EW-Universe rebalanciert'),
+        }
+        if benchmarks:
+            for key, (color, ls, lbl) in bm_styles.items():
+                bm = benchmarks.get(key, {})
+                bm_eq   = bm.get('equity', [])
+                bm_dts  = bm.get('dates',  [])
+                if not bm_eq or not bm_dts:
+                    continue
+                bm_ret = [(e / bm_eq[0] - 1) * 100 for e in bm_eq]
+                n = min(len(bm_dts), len(bm_ret))
+                ax_eq.plot(bm_dts[:n], bm_ret[:n],
+                           color=color, linestyle=ls, linewidth=1.4,
+                           label=f"{lbl}  {bm.get('total_return', 0):+.1f}%")
+
+        # ── Metriken-Box ──────────────────────────────────────────────────────
+        wins = [t for t in trade_log if t.get('pnl_pct', 0) > 0]
+        n_tr = len(trade_log)
+        wr   = len(wins) / n_tr * 100 if n_tr else 0
+        ah   = np.mean([t['hold_days'] for t in trade_log]) if trade_log else 0
+
+        info = (
+            f"Horizont   : {h}d\n"
+            f"Return     : {bt_result.get('total_return', 0):+.2f}%\n"
+            f"Max DD     : {bt_result.get('max_drawdown', 0):.2f}%\n"
+            f"Sharpe     : {bt_result.get('sharpe', 0):.3f}\n"
+            f"Trades     : {n_tr}\n"
+            f"Win Rate   : {wr:.1f}%\n"
+            f"Avg Hold   : {ah:.1f}d"
+        )
+        ax_eq.text(
+            0.01, 0.98, info,
+            transform=ax_eq.transAxes, va='top', fontsize=9,
+            fontfamily='monospace',
+            bbox=dict(facecolor='white', alpha=0.8, edgecolor='#ccc', boxstyle='round,pad=0.4'),
+        )
+
+        ax_eq.set_title(f"Equity-Kurve: {title_tag}", fontsize=13, fontweight='bold')
+        ax_eq.set_ylabel("Kumulativer Return (%)")
+        ax_eq.legend(loc='upper left', fontsize=9)
+        ax_eq.grid(True, alpha=0.25)
+        ax_eq.yaxis.set_major_formatter(mticker.FuncFormatter(lambda x, _: f"{x:+.0f}%"))
+        plt.setp(ax_eq.get_xticklabels(), visible=False)
+
+        # ── Drawdown ──────────────────────────────────────────────────────────
+        ax_dd.fill_between(dates, dd_pct, 0, alpha=0.35, color='#C62828',
+                           label=f"MaxDD {dd_pct.min():.1f}%")
+        ax_dd.plot(dates, dd_pct, color='#C62828', linewidth=0.8)
+        ax_dd.set_ylabel("Drawdown (%)")
+        ax_dd.set_xlabel("Datum")
+        ax_dd.legend(loc='lower left', fontsize=8)
+        ax_dd.grid(True, alpha=0.25)
+        ax_dd.yaxis.set_major_formatter(mticker.FuncFormatter(lambda x, _: f"{x:.0f}%"))
+
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        plt.close(fig)
+        logger.success(f"Equity-Chart gespeichert: {save_path}")
+
+    except Exception as e:
+        logger.warning(f"plot_equity_single Fehler: {e}")
