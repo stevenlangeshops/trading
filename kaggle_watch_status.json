@@ -1,0 +1,10 @@
+{
+  "kernel_id": "busersteven/trading-bot-v5-fullrun",
+  "state": "COMPLETE",
+  "retries": 1,
+  "gpu_incompatible": 0,
+  "last_log": "Traceback (most recent call last):\n  File \"/usr/local/lib/python3.12/dist-packages/torch/__init__.py\", line 300, in _load_global_deps\n    ctypes.CDLL(global_deps_lib_path, mode=ctypes.RTLD_GLOBAL)\n  File \"/usr/lib/python3.12/ctypes/__init__.py\", line 379, in __init__\n    self._handle = _dlopen(self._name, mode)\n                   ^^^^^^^^^^^^^^^^^^^^^^^^^\nOSError: libcudart.so.11.0: cannot open shared object file: No such file or directory\n\nDuring handling of the above exception, another exception occurred:\n\nTraceback (most recent call last):\n  File \"/kaggle/src/script.py\", line 466, in main\n    fold_results      = step_train(features, targets, asset_map)\n                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/kaggle/src/script.py\", line 309, in step_train\n    from models.trainer import train_walk_forward\n  File \"/kaggle/working/repo/models/trainer.py\", line 25, in <module>\n    import torch\n  File \"/usr/local/lib/python3.12/dist-packages/torch/__init__.py\", line 366, in <module>\n    _load_global_deps()\n  File \"/usr/local/lib/python3.12/dist-packages/torch/__init__.py\", line 325, in _load_global_deps\n    ctypes.CDLL(global_deps_lib_path, mode=ctypes.RTLD_GLOBAL)\n  File \"/usr/lib/python3.12/ctypes/__init__.py\", line 379, in __init__\n    self._handle = _dlopen(self._name, mode)\n                   ^^^^^^^^^^^^^^^^^^^^^^^^^\nOSError: libcudart.so.11.0: cannot open shared object file: No such file or directory\n",
+  "diagnosis": "Unbekannter Fehler",
+  "updated_at": "2026-03-24T11:03:05Z",
+  "run_dir": "C:\\steven\\trading_v5\\trading\\kaggle_kernel_runs\\busersteven__trading-bot-v5-fullrun\\20260324-120204"
+}
