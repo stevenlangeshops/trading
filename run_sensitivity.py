@@ -1144,11 +1144,19 @@ def main() -> None:
     logger.info("═" * 60)
     logger.info("  Phase 3: Rolling Rank-IC")
     logger.info("═" * 60)
-    daily_ic = compute_daily_ic(score_cache, price_cache, horizon=args.horizon)
-    rolling_ic_report(daily_ic, window=60, label=f'v2_{args.horizon}d')
-    plot_rolling_ic(daily_ic, window=60, save_path=args.ic_plot,
-                    label=f'v2_{args.horizon}d')
-    logger.success(f"IC-Chart gespeichert: {args.ic_plot}")
+    try:
+        daily_ic = compute_daily_ic(score_cache, price_cache, horizon=args.horizon)
+        if daily_ic.empty:
+            logger.warning("IC-Berechnung ergab 0 Tage – Chart wird übersprungen.")
+        else:
+            rolling_ic_report(daily_ic, window=60, label=f'v2_{args.horizon}d')
+            plot_rolling_ic(daily_ic, window=60, save_path=args.ic_plot,
+                            label=f'v2_{args.horizon}d')
+            logger.success(f"IC-Chart gespeichert: {args.ic_plot}")
+    except Exception as exc:
+        logger.error(f"Phase 3 fehlgeschlagen (Grid-Search-Ergebnisse sind trotzdem gültig): {exc}")
+        import traceback
+        traceback.print_exc()
 
 
 if __name__ == '__main__':
