@@ -1494,6 +1494,10 @@ def main() -> None:
     logger.info("═" * 60)
     logger.info("  Sensitivitätsanalyse – Portfolio-Layer Grid Search")
     logger.info("═" * 60)
+    logger.info(f"  --policy-compare : {args.policy_compare}")
+    logger.info(f"  --score-cache    : {args.score_cache}")
+    logger.info(f"  --skip-grid-search: {args.skip_grid_search}")
+    logger.info(f"  --horizon        : {args.horizon}")
 
     # ── Artefakte laden ───────────────────────────────────────────────────────
     fold_results = load_walk_forward_json(args.walk_json)
