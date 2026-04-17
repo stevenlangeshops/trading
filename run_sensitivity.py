@@ -523,7 +523,10 @@ def _period_metrics(equity: list, dates: list, start: str, end: str) -> Optional
     """Berechnet Return / MaxDD / Sharpe für eine Zeitscheibe der Equity-Kurve."""
     ts  = pd.Timestamp(start)
     te  = pd.Timestamp(end)
-    idx = [(i, d) for i, d in enumerate(dates) if ts <= d <= te]
+    # Timestamps tz-normalisieren: falls dates tz-aware sind, tz entfernen
+    def _strip_tz(t):
+        return t.tz_localize(None) if (isinstance(t, pd.Timestamp) and t.tzinfo is not None) else t
+    idx = [(i, d) for i, d in enumerate(dates) if ts <= _strip_tz(d) <= te]
     if len(idx) < 5:
         return None
     positions = [i for i, _ in idx]
