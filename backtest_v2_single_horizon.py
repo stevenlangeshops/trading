@@ -4,8 +4,9 @@ backtest_v2_single_horizon.py
 Backtest + Benchmark-Report fuer den Single-Horizon-Vergleich.
 
 Pro Horizont (4/7/11/15d):
-  - Identische Strategie wie Run G (Long-Only, Rotation, Hard-Stop 25%)
+  - Identische Strategie (Long-Only, Rotation, Hard-Stop 20%)
   - Ranking nach SingleHorizonRankModel-Score
+  - Rolling Rank-IC Monitor (Fenster 5/10/15/20/30/40/50/60 Tage)
 
 Am Ende: Vergleichstabelle v1_rank vs. alle v2-Horizonte + Equity-Plot.
 """
@@ -29,6 +30,183 @@ from strategy.backtest import (
     adaptive_n,
     _get_price,
 )
+
+# ── Rolling-IC-Fenster ────────────────────────────────────────────────────────
+IC_WINDOWS = [5, 10, 15, 20, 30, 40, 50, 60]
+
+
+# ── Rank-IC Hilfsfunktionen ───────────────────────────────────────────────────
+
+def compute_daily_rank_ic(
+    scores: pd.Series,
+    future_returns: pd.Series,
+    min_pairs: int = 10,
+) -> float:
+    """
+    Berechnet den täglichen Rank-IC (Spearman-Korrelation) zwischen
+    Modell-Scores und realisierten Forward-Returns für einen Tag t.
+
+    Parameters
+    ----------
+    scores         : pd.Series  [asset → score]   Modell-Vorhersage am Tag t
+    future_returns : pd.Series  [asset → return]  7-Tage-Forward-Return ab t
+    min_pairs      : int        Mindestanzahl gültiger Paare (sonst NaN)
+
+    Returns
+    -------
+    float  Spearman-IC ∈ [-1, 1]  oder  NaN bei zu wenig Daten
+    """
+    from scipy.stats import spearmanr
+
+    common = scores.index.intersection(future_returns.dropna().index)
+    if len(common) < min_pairs:
+        return float('nan')
+    corr, _ = spearmanr(scores[common].values, future_returns[common].values)
+    return float(corr) if not np.isnan(corr) else float('nan')
+
+
+def _build_ic_series(
+    score_log:   list[tuple],   # [(date, pd.Series[asset→score])]
+    price_cache: dict,
+    horizon:     int,
+    windows:     list[int] = IC_WINDOWS,
+) -> dict:
+    """
+    Berechnet IC-Zeitreihe + Rolling-ICs für alle OOS-Tage.
+
+    Strategie:
+      1. Preismatrix (date × asset) aufbauen – vektorisiert.
+      2. Forward-Return-Matrix per shift(-horizon).
+      3. Pro Tag: Spearman zwischen Score und Forward-Return.
+      4. Rolling-ICs für alle Fenster in `windows`.
+
+    Returns
+    -------
+    dict mit:
+      'ic'        : pd.Series(index=date, values=ic)
+      'rolling'   : {w: pd.Series}
+      'records'   : list[dict]  (für JSON-Export)
+    """
+    if not score_log:
+        return {'ic': pd.Series(dtype=float), 'rolling': {}, 'records': []}
+
+    from scipy.stats import spearmanr
+
+    all_dates  = [d for d, _ in score_log]
+    all_assets = sorted({a for _, s in score_log for a in s.index})
+
+    # ── Preismatrix ───────────────────────────────────────────────────────────
+    # Vollständige Handelsdaten für alle Assets sammeln
+    all_price_dates = sorted({
+        d for ps in price_cache.values() if ps is not None
+        for d in ps.index
+    })
+    full_price_df = pd.DataFrame(index=all_price_dates, columns=all_assets, dtype=float)
+    for asset in all_assets:
+        ps = price_cache.get(asset)
+        if ps is None:
+            continue
+        ps_clean = ps[~ps.index.duplicated(keep='last')].sort_index()
+        full_price_df[asset] = ps_clean.reindex(all_price_dates, method='ffill')
+
+    # Forward-Return-Matrix: Preis in `horizon` Handelstagen / Preis heute - 1
+    fwd_ret_df = (full_price_df.shift(-horizon) / full_price_df - 1)
+
+    # ── Täglicher IC ─────────────────────────────────────────────────────────
+    ic_values: dict[pd.Timestamp, float] = {}
+    for date, scores in score_log:
+        # Datum normalisieren (tz-strip)
+        ts = date.tz_localize(None) if (hasattr(date, 'tzinfo') and date.tzinfo) else date
+        if ts not in fwd_ret_df.index:
+            # nächsten verfügbaren Handelstag suchen
+            later = [d for d in fwd_ret_df.index if d >= ts]
+            if not later:
+                continue
+            ts = later[0]
+        fwd_row = fwd_ret_df.loc[ts]
+        common  = scores.index.intersection(fwd_row.dropna().index)
+        if len(common) < 10:
+            continue
+        corr, _ = spearmanr(scores[common].values, fwd_row[common].values)
+        if not np.isnan(corr):
+            ic_values[ts] = float(corr)
+
+    ic = pd.Series(ic_values).sort_index()
+
+    # ── Rolling-ICs ──────────────────────────────────────────────────────────
+    rolling: dict[int, pd.Series] = {}
+    for w in windows:
+        rolling[w] = ic.rolling(window=w, min_periods=1).mean()
+
+    # ── Records für JSON/CSV ──────────────────────────────────────────────────
+    records = []
+    for ts in ic.index:
+        rec = {'date': str(ts.date()), 'ic': round(float(ic[ts]), 6)}
+        for w in windows:
+            rec[f'ic_roll_{w}'] = round(float(rolling[w][ts]), 6)
+        records.append(rec)
+
+    return {'ic': ic, 'rolling': rolling, 'records': records}
+
+
+def _log_ic_summary(ic: pd.Series, rolling: dict[int, pd.Series], tag: str) -> None:
+    """Gibt IC-Statistiken als Log-Zusammenfassung aus."""
+    if ic.empty:
+        logger.warning(f"[{tag}] IC-Zeitreihe leer – keine IC-Statistiken verfügbar.")
+        return
+
+    n_neg   = (ic < 0).sum()
+    pct_neg = n_neg / len(ic) * 100
+
+    logger.info("─" * 60)
+    logger.info(f"[{tag}] Rolling Rank-IC Monitor  (HARD_STOP_PCT=0.20)")
+    logger.info("─" * 60)
+    logger.info(f"[{tag}]   Tage gesamt      : {len(ic)}")
+    logger.info(f"[{tag}]   IC Median        : {ic.median():+.4f}")
+    logger.info(f"[{tag}]   IC Mean          : {ic.mean():+.4f}")
+    logger.info(f"[{tag}]   IC Std           : {ic.std():.4f}")
+    logger.info(f"[{tag}]   Tage IC < 0      : {n_neg} ({pct_neg:.1f}%)")
+    for w in [20, 60]:
+        if w in rolling and not rolling[w].empty:
+            r = rolling[w]
+            pct_neg_r = (r < 0).sum() / len(r) * 100
+            logger.info(f"[{tag}]   Roll-{w:2d} Median  : {r.median():+.4f}  "
+                        f"(Tage < 0: {pct_neg_r:.1f}%)")
+    # Jahres-ICs
+    logger.info(f"[{tag}]   Jahres-IC:")
+    for year, grp in ic.groupby(ic.index.year):
+        logger.info(f"[{tag}]     {year}: Ø={grp.mean():+.4f}  Median={grp.median():+.4f}  "
+                    f"n={len(grp)}")
+    logger.info("─" * 60)
+
+
+def save_ic_artifacts(
+    ic_data:  dict,
+    horizon:  int,
+    out_dir:  str | Path,
+) -> tuple[Path, Path]:
+    """
+    Speichert IC-Zeitreihe als JSON und CSV.
+
+    Returns
+    -------
+    (json_path, csv_path)
+    """
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    stem     = f"rolling_ic_v2_{horizon}d"
+    json_path = out_dir / f"{stem}.json"
+    csv_path  = out_dir / f"{stem}.csv"
+
+    json_path.write_text(json.dumps(ic_data['records'], indent=2))
+
+    if ic_data['records']:
+        df = pd.DataFrame(ic_data['records'])
+        df.to_csv(csv_path, index=False)
+
+    logger.success(f"IC-Artefakte gespeichert: {json_path.name}, {csv_path.name}")
+    return json_path, csv_path
 
 
 # ── Modell laden ──────────────────────────────────────────────────────────────
@@ -111,9 +289,12 @@ def run_backtest_single_horizon(
     trade_log = []
     equity_dates  = []
     daily_signals: list[dict] = []
+    score_log:    list[tuple] = []   # [(date, ranking_series)] für IC-Berechnung
 
     logger.info(f"[{tag} Backtest] Long-Only  n_max={cfg.n_max}  "
-                f"rotation_buffer={cfg.rotation_buffer}  hard_stop={cfg.hard_stop_pct*100:.0f}%")
+                f"rotation_buffer={cfg.rotation_buffer}  "
+                f"hard_stop={cfg.hard_stop_pct*100:.0f}%  "
+                f"[HARD_STOP_PCT={cfg.hard_stop_pct:.2f}]")
 
     def _pos_val(positions, pc, dt):
         val = 0.0
@@ -165,6 +346,8 @@ def run_backtest_single_horizon(
             n_long = adaptive_n(regime, cfg.n_max, cfg.n_mid, cfg.n_min)
 
             ranking = predict_cross_section(model, features, asset_map, date, cfg.seq_len, device)
+            if len(ranking) >= 2:
+                score_log.append((date, ranking.copy()))   # OOS-Scores für IC sammeln
             if len(ranking) < 2:
                 equity_dates.append(date)
                 equity.append(cash + _pos_val(positions, price_cache, date))
@@ -264,16 +447,26 @@ def run_backtest_single_horizon(
     logger.success("═" * 60)
     logger.success(f"[{tag}] BACKTEST: Long-Only")
     logger.success("═" * 60)
-    logger.success(f"[{tag}]   Total Return : {total_return:+.2f}%")
-    logger.success(f"[{tag}]   Max Drawdown : {max_dd:.2f}%")
-    logger.success(f"[{tag}]   Sharpe Ratio : {sharpe:.3f}")
-    logger.success(f"[{tag}]   Trades       : {n_trades}")
-    logger.success(f"[{tag}]   Win Rate     : {win_rate:.1f}%")
-    logger.success(f"[{tag}]   Avg Hold Days: {avg_hold:.1f}")
+    logger.success(f"[{tag}]   HARD_STOP_PCT  : {cfg.hard_stop_pct:.2f}  ({cfg.hard_stop_pct*100:.0f}%)")
+    logger.success(f"[{tag}]   Total Return   : {total_return:+.2f}%")
+    logger.success(f"[{tag}]   Max Drawdown   : {max_dd:.2f}%")
+    logger.success(f"[{tag}]   Sharpe Ratio   : {sharpe:.3f}")
+    logger.success(f"[{tag}]   Trades         : {n_trades}")
+    logger.success(f"[{tag}]   Win Rate       : {win_rate:.1f}%")
+    logger.success(f"[{tag}]   Avg Hold Days  : {avg_hold:.1f}")
     for reason, st in exit_stats.items():
         logger.success(f"[{tag}]   {reason:15s}: n={st['n']:4d}  pnl={st['pnl_sum']:+.0f}%  "
                        f"avg={st['pnl_avg']:+.1f}%  hold={st['hold_avg']:.1f}d  win={st['win_pct']:.0f}%")
     logger.success("═" * 60)
+
+    # ── Rolling Rank-IC Monitor ────────────────────────────────────────────────
+    logger.info(f"[{tag}] Rolling Rank-IC berechnen ({len(score_log)} OOS-Tage) ...")
+    try:
+        ic_data = _build_ic_series(score_log, price_cache, horizon=cfg.horizon)
+        _log_ic_summary(ic_data['ic'], ic_data['rolling'], tag)
+    except Exception as exc:
+        logger.warning(f"[{tag}] IC-Berechnung fehlgeschlagen: {exc}")
+        ic_data = {'ic': pd.Series(dtype=float), 'rolling': {}, 'records': []}
 
     return {
         'strategy':      tag,
@@ -289,6 +482,7 @@ def run_backtest_single_horizon(
         'equity_dates':  equity_dates,
         'trade_log':     trade_log,
         'daily_signals': daily_signals,
+        'ic_data':       ic_data,        # Rolling-IC-Zeitreihe
     }
 
 

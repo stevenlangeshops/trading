@@ -51,7 +51,7 @@ class SingleHorizonConfig:
     n_max:           int   = 7
     n_mid:           int   = 3
     n_min:           int   = 1
-    hard_stop_pct:   float = 0.25
+    hard_stop_pct:   float = 0.20
     rotation_buffer: int   = 3
     fees:            float = 0.001
     init_cash:       float = 10_000.0

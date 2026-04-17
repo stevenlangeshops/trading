@@ -647,7 +647,9 @@ def step_pack_artifacts(result_a: dict, result_b: dict):
         collect.append(WORKING / f"v2_{_h}d_backtest.json")
         collect.append(WORKING / f"v2_{_h}d_trade_log.json")
         collect.append(WORKING / f"v2_{_h}d_daily_signals.json")
-        collect.append(WORKING / f"v2_{_h}d_equity.png")   # Einzelchart pro Horizont
+        collect.append(WORKING / f"v2_{_h}d_equity.png")
+        collect.append(WORKING / f"rolling_ic_v2_{_h}d.json")   # Rolling-IC-Monitor
+        collect.append(WORKING / f"rolling_ic_v2_{_h}d.csv")
 
     # Checkpoints (v1 + v2 + single-horizon)
     ckpt_dir = REPO_DIR / "checkpoints"
@@ -1239,6 +1241,8 @@ def step_backtest_single_horizons(features, asset_map, all_train_results, v1_res
         return {k: v for k, v in r.items()
                 if k not in ("equity", "trade_log", "equity_dates", "daily_signals")}
 
+    from backtest_v2_single_horizon import save_ic_artifacts
+
     for h, bt in all_bt.items():
         with open(WORKING / f"v2_{h}d_backtest.json", "w") as f:
             json.dump(slim(bt), f, indent=2)
@@ -1246,6 +1250,14 @@ def step_backtest_single_horizons(features, asset_map, all_train_results, v1_res
             json.dump(bt.get("trade_log", []), f, indent=2)
         with open(WORKING / f"v2_{h}d_daily_signals.json", "w") as f:
             json.dump(bt.get("daily_signals", []), f, indent=1)
+        # Rolling-IC-Artefakt speichern
+        ic_data = bt.get("ic_data", {})
+        if ic_data.get("records"):
+            try:
+                save_ic_artifacts(ic_data, horizon=h, out_dir=WORKING)
+                log_write(f"  IC-Artefakt gespeichert: rolling_ic_v2_{h}d.json/.csv")
+            except Exception as ic_exc:
+                log_write(f"  [WARN] IC-Artefakt: {ic_exc}")
 
     build_horizon_benchmark_report(
         all_bt_results=all_bt,

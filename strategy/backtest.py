@@ -489,7 +489,7 @@ def run_backtest(
     # normale Rücksetzer, die der ATR-Trailing-Stop besser handhabt.
     # Analyse zeigt: 15% Hard-Stop verursachte -545% PnL-Drain durch zu
     # frühe Exits von Positionen, die via ATR/Rotation besser geendet hätten.
-    hard_stop_pct:     float = 0.25,   # 25% Hard-Stop — nur Gap-Schutz
+    hard_stop_pct:     float = 0.20,   # 20% Hard-Stop
     rotation_buffer:  int   = 3,      # Run F: 3 statt 2 — weniger unnötige Rotationen
     # Regime-Filter
     use_regime:       bool  = True,   # Adaptives N aktivieren

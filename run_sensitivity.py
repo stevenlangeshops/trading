@@ -61,7 +61,7 @@ class PortfolioParams:
     n_mid:           int   = 3       # fix: Bull/Bear-Skalierung relativ zu n_max
     n_min:           int   = 1       # fix
     rotation_buffer: int   = 3
-    hard_stop_pct:   float = 0.25
+    hard_stop_pct:   float = 0.20
     fees:            float = 0.001
     init_cash:       float = 10_000.0
 
@@ -866,7 +866,7 @@ def full_tearsheet(
     """
     # ── Referenz-Equity ───────────────────────────────────────────────────────
     ref_row = df[(df['n_max'] == 7) & (df['rotation_buffer'] == 3) &
-                 (df['hard_stop_pct'] == 0.25) & (df['fees'] == 0.001)]
+                 (df['hard_stop_pct'] == 0.20) & (df['fees'] == 0.001)]
     ref_params = PortfolioParams()   # defaults = Referenz
     if not ref_row.empty:
         r = ref_row.iloc[0]
@@ -929,7 +929,7 @@ def print_summary(
 
     # Referenz-Ergebnis (n_max=7, rb=3, hs=0.25, fees=0.001)
     ref = df[(df['n_max'] == 7) & (df['rotation_buffer'] == 3) &
-             (df['hard_stop_pct'] == 0.25) & (df['fees'] == 0.001)]
+             (df['hard_stop_pct'] == 0.20) & (df['fees'] == 0.001)]
     if not ref.empty:
         r = ref.iloc[0]
         print(f"\n  Referenz (n7/rb3/hs25%/f0.1%): "
