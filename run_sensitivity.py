@@ -231,10 +231,105 @@ def _adaptive_n(regime: str, n_max: int, n_mid: int, n_min: int) -> int:
     return {'bull': n_max, 'neutral': n_mid, 'bear': n_min}.get(regime, n_mid)
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# Policy-Engine: IC- und SPY-basierte n_max-Reduktion
+# ══════════════════════════════════════════════════════════════════════════════
+
+POLICIES = ("IC20", "IC30", "IC40", "SPY200")
+
+def _ic_df_lookup(ic_df: pd.DataFrame, date: pd.Timestamp, col: str) -> float:
+    """Sicherer IC-Lookup mit Datum-Normalisierung (tz-strip, ffill)."""
+    ts = date.tz_localize(None) if (hasattr(date, 'tzinfo') and date.tzinfo) else date
+    if ts in ic_df.index:
+        return float(ic_df.loc[ts, col])
+    # nächster verfügbarer Wert davor (forward-fill)
+    before = ic_df.index[ic_df.index <= ts]
+    if len(before) == 0:
+        return float('nan')
+    return float(ic_df.loc[before[-1], col])
+
+
+def get_effective_n_max(
+    date:       pd.Timestamp,
+    base_n_max: int,
+    policy:     Optional[str],
+    ic_df:      Optional[pd.DataFrame],
+    spy_sma200: Optional[pd.Series],
+    spy_prices: Optional[pd.Series],
+    reduced_n:  int = 3,
+) -> tuple[int, bool]:
+    """
+    Berechnet den effektiven n_max für einen Handelstag gemäß Policy.
+
+    Parameters
+    ----------
+    date        : Handelstag
+    base_n_max  : Standard n_max aus PortfolioParams (z.B. 7)
+    policy      : None | "IC20" | "IC30" | "IC40" | "SPY200"
+    ic_df       : DataFrame mit Spalten ic_roll_20, ic_roll_30, ic_roll_40
+    spy_sma200  : pd.Series mit vorberechneter 200-Tage-SMA auf SPY
+    spy_prices  : pd.Series mit SPY-Schlusskursen
+    reduced_n   : n_max wenn Trigger aktiv (Default 3)
+
+    Returns
+    -------
+    (n_max_eff, trigger_active)
+    """
+    if policy is None:
+        return base_n_max, False
+
+    if policy in ("IC20", "IC30", "IC40"):
+        if ic_df is None:
+            return base_n_max, False
+        col_map = {"IC20": "ic_roll_20", "IC30": "ic_roll_30", "IC40": "ic_roll_40"}
+        col = col_map[policy]
+        if col not in ic_df.columns:
+            return base_n_max, False
+        val = _ic_df_lookup(ic_df, date, col)
+        if np.isnan(val):
+            return base_n_max, False
+        triggered = val < 0
+        return (reduced_n if triggered else base_n_max), triggered
+
+    if policy == "SPY200":
+        if spy_prices is None or spy_sma200 is None:
+            return base_n_max, False
+        ts = date.tz_localize(None) if (hasattr(date, 'tzinfo') and date.tzinfo) else date
+        # SPY-Kurs am/vor diesem Tag
+        past_spy = spy_prices[spy_prices.index <= ts]
+        if past_spy.empty:
+            return base_n_max, False
+        spy_close = float(past_spy.iloc[-1])
+        past_sma  = spy_sma200[spy_sma200.index <= ts]
+        if past_sma.empty or np.isnan(past_sma.iloc[-1]):
+            return base_n_max, False
+        sma_val   = float(past_sma.iloc[-1])
+        triggered = spy_close < sma_val
+        return (reduced_n if triggered else base_n_max), triggered
+
+    return base_n_max, False
+
+
+def build_ic_df(daily_ic: pd.Series, rolling_map: dict) -> pd.DataFrame:
+    """
+    Baut ic_df aus compute_daily_ic() + rolling_ic_report() Ergebnis.
+
+    Returns
+    -------
+    pd.DataFrame mit Index=date, Spalten: ic, ic_roll_5, ..., ic_roll_60
+    """
+    df = pd.DataFrame({'ic': daily_ic})
+    for w, series in rolling_map.items():
+        df[f'ic_roll_{w}'] = series
+    return df.sort_index()
+
+
 def run_portfolio(
     score_cache: ScoreCache,
     price_cache: dict,
     params:      PortfolioParams,
+    policy:      Optional[str]           = None,
+    ic_df:       Optional[pd.DataFrame]  = None,
 ) -> dict:
     """
     Führt die Portfolio-Simulation auf dem Score-Cache durch.
@@ -242,17 +337,30 @@ def run_portfolio(
     Keine Modell-Operationen – reine Execution-Logik.
     Identisch zur Run-G-Strategie: Long-Only, Rotation, Hard-Stop.
 
+    Parameters
+    ----------
+    policy : None | "IC20" | "IC30" | "IC40" | "SPY200"
+        Steuert ob und wie n_max täglich angepasst wird.
+    ic_df  : DataFrame mit Spalten ic_roll_20/30/40 (für IC*-Policies)
+
     Returns
     -------
-    dict mit Backtest-Metriken + equity/equity_dates für Plots.
+    dict mit Backtest-Metriken + equity/equity_dates + days_n_max_reduced.
     """
     spy_prices = price_cache.get('SPY')
+
+    # SPY 200-Tage-SMA einmalig vorberechnen (für SPY200-Policy)
+    spy_sma200: Optional[pd.Series] = None
+    if policy == "SPY200" and spy_prices is not None:
+        spy_clean  = spy_prices[~spy_prices.index.duplicated(keep='last')].sort_index()
+        spy_sma200 = spy_clean.rolling(200, min_periods=100).mean()
 
     cash      = params.init_cash
     positions: dict = {}
     equity        = [params.init_cash]
     equity_dates  = []
     trade_log: list[dict] = []
+    days_n_max_reduced = 0   # Tage, an denen Policy n_max reduziert hat
 
     sorted_dates = sorted(score_cache.keys())
 
@@ -281,7 +389,24 @@ def run_portfolio(
             pos['hold_days'] = pos.get('hold_days', 0) + 1
 
         regime = _get_regime(spy_prices, date)
-        n_long = _adaptive_n(regime, params.n_max, params.n_mid, params.n_min)
+
+        # Policy: n_max ggf. reduzieren
+        n_max_eff, triggered = get_effective_n_max(
+            date=date, base_n_max=params.n_max, policy=policy,
+            ic_df=ic_df, spy_sma200=spy_sma200, spy_prices=spy_prices,
+        )
+        if triggered:
+            days_n_max_reduced += 1
+        # n_mid / n_min proportional skalieren wenn Policy aktiv
+        if triggered and n_max_eff < params.n_max:
+            scale  = n_max_eff / params.n_max
+            n_mid_ = max(1, round(params.n_mid * scale))
+            n_min_ = max(1, round(params.n_min * scale))
+        else:
+            n_mid_ = params.n_mid
+            n_min_ = params.n_min
+
+        n_long = _adaptive_n(regime, n_max_eff, n_mid_, n_min_)
 
         # Hard-Stop
         to_close = []
@@ -355,16 +480,17 @@ def run_portfolio(
     stops     = [t for t in trade_log if t['exit_reason'] == 'hard_stop']
 
     return {
-        'total_return': round(total_return, 2),
-        'max_drawdown':  round(max_dd, 2),
-        'sharpe':        round(sharpe, 3),
-        'n_trades':      n_trades,
-        'win_rate':      round(win_rate, 1),
-        'avg_hold_days': round(avg_hold, 1),
-        'n_hard_stops':  len(stops),
-        'equity':        equity,
-        'equity_dates':  equity_dates,
-        'trade_log':     trade_log,
+        'total_return':       round(total_return, 2),
+        'max_drawdown':       round(max_dd, 2),
+        'sharpe':             round(sharpe, 3),
+        'n_trades':           n_trades,
+        'win_rate':           round(win_rate, 1),
+        'avg_hold_days':      round(avg_hold, 1),
+        'n_hard_stops':       len(stops),
+        'days_n_max_reduced': days_n_max_reduced,
+        'equity':             equity,
+        'equity_dates':       equity_dates,
+        'trade_log':          trade_log,
     }
 
 
@@ -943,6 +1069,222 @@ def full_tearsheet(
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# Policy-Vergleich: Baseline vs. A1/A2/A3/B
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _subperiod_dd(equity: list, dates: list, start: str, end: str) -> float:
+    """Maximaler Drawdown in einem Subzeitraum (für Policy-Report)."""
+    m = _period_metrics(equity, dates, start, end)
+    return m['max_drawdown'] if m else float('nan')
+
+
+def _subperiod_ret(equity: list, dates: list, start: str, end: str) -> float:
+    """Total Return in einem Subzeitraum."""
+    m = _period_metrics(equity, dates, start, end)
+    return m['total_return'] if m else float('nan')
+
+
+def policy_comparison(
+    score_cache:  ScoreCache,
+    price_cache:  dict,
+    daily_ic:     pd.Series,
+    rolling_map:  dict,
+    base_params:  Optional[PortfolioParams] = None,
+    save_path:    Optional[str] = None,
+) -> pd.DataFrame:
+    """
+    Führt 5 Backtests durch (Baseline + A1 + A2 + A3 + B) und vergleicht.
+
+    Policies
+    --------
+    Baseline  : Kein IC/SPY-Filter
+    A1 IC20   : n_max → 3 wenn ic_roll_20 < 0
+    A2 IC30   : n_max → 3 wenn ic_roll_30 < 0
+    A3 IC40   : n_max → 3 wenn ic_roll_40 < 0
+    B  SPY200 : n_max → 3 wenn SPY-Close < SMA200
+
+    Returns
+    -------
+    pd.DataFrame mit allen Metriken inkl. Subperioden 2022/2025
+    """
+    if base_params is None:
+        base_params = PortfolioParams()
+
+    ic_df = build_ic_df(daily_ic, rolling_map)
+
+    runs = [
+        ("Baseline", None),
+        ("A1_IC20",  "IC20"),
+        ("A2_IC30",  "IC30"),
+        ("A3_IC40",  "IC40"),
+        ("B_SPY200", "SPY200"),
+    ]
+
+    total_days = len(sorted(score_cache.keys()))
+    rows = []
+
+    logger.info("═" * 70)
+    logger.info("  Policy-Vergleich: Baseline vs. A1 / A2 / A3 / B")
+    logger.info(f"  base_params: n_max={base_params.n_max}  rb={base_params.rotation_buffer}"
+                f"  hs={base_params.hard_stop_pct:.0%}  fees={base_params.fees:.3%}")
+    logger.info("═" * 70)
+
+    for run_name, policy in runs:
+        logger.info(f"  Run {run_name:12s} (policy={policy}) ...")
+        res = run_portfolio(score_cache, price_cache, base_params,
+                            policy=policy, ic_df=ic_df)
+
+        eq  = res['equity']
+        eqd = res['equity_dates']
+        pct_reduced = res['days_n_max_reduced'] / total_days * 100 if total_days else 0
+
+        row = {
+            'run':               run_name,
+            'policy':            policy or 'None',
+            'sharpe':            res['sharpe'],
+            'total_return_%':    res['total_return'],
+            'max_drawdown_%':    res['max_drawdown'],
+            'n_trades':          res['n_trades'],
+            'win_rate_%':        res['win_rate'],
+            'avg_hold_days':     res['avg_hold_days'],
+            'n_hard_stops':      res['n_hard_stops'],
+            'days_n_max_reduced': res['days_n_max_reduced'],
+            'pct_days_reduced':  round(pct_reduced, 1),
+            # Subperioden
+            'ret_2022_%':        round(_subperiod_ret(eq, eqd, '2022-01-01', '2022-12-31'), 1),
+            'dd_2022_%':         round(_subperiod_dd(eq, eqd, '2022-01-01', '2022-12-31'), 1),
+            'ret_2023_%':        round(_subperiod_ret(eq, eqd, '2023-01-01', '2023-12-31'), 1),
+            'ret_2024_%':        round(_subperiod_ret(eq, eqd, '2024-01-01', '2024-12-31'), 1),
+            'ret_2025_%':        round(_subperiod_ret(eq, eqd, '2025-01-01', '2025-12-31'), 1),
+            'dd_2025_%':         round(_subperiod_dd(eq, eqd, '2025-01-01', '2025-12-31'), 1),
+        }
+        rows.append(row)
+        logger.info(f"    Sharpe={row['sharpe']:.3f}  Return={row['total_return_%']:+.1f}%  "
+                    f"MaxDD={row['max_drawdown_%']:.1f}%  "
+                    f"DD-2022={row['dd_2022_%']:.1f}%  DD-2025={row['dd_2025_%']:.1f}%  "
+                    f"n_max_red={row['pct_days_reduced']:.1f}%")
+
+    df = pd.DataFrame(rows).set_index('run')
+
+    # ── Konsolen-Report ───────────────────────────────────────────────────────
+    W = 130
+    print("\n" + "═" * W)
+    print("  POLICY-VERGLEICH: Baseline vs. A1(IC20) / A2(IC30) / A3(IC40) / B(SPY200)")
+    print(f"  Basis: n_max={base_params.n_max} rb={base_params.rotation_buffer} "
+          f"hs={base_params.hard_stop_pct:.0%} fees={base_params.fees:.3%}  "
+          f"→ n_max_reduziert auf 3 wenn Trigger aktiv")
+    print("═" * W)
+    cols_main = ['policy','sharpe','total_return_%','max_drawdown_%',
+                 'n_trades','win_rate_%','avg_hold_days','n_hard_stops',
+                 'days_n_max_reduced','pct_days_reduced']
+    print(df[cols_main].to_string())
+    print("\n" + "─" * W)
+    print("  SUBPERIODEN-ANALYSE")
+    print("─" * W)
+    cols_sub = ['policy','ret_2022_%','dd_2022_%','ret_2023_%','ret_2024_%',
+                'ret_2025_%','dd_2025_%']
+    print(df[cols_sub].to_string())
+    print("═" * W)
+
+    # Baseline-Differenzen
+    base = df.loc['Baseline']
+    print("\n  DELTA vs. Baseline:")
+    print(f"  {'Run':12s}  {'ΔSharpe':>8s}  {'ΔReturn':>10s}  {'ΔMaxDD':>8s}  "
+          f"{'ΔDD-2022':>10s}  {'ΔDD-2025':>10s}")
+    for run_name, row in df.iterrows():
+        if run_name == 'Baseline':
+            continue
+        print(f"  {run_name:12s}  "
+              f"{row['sharpe'] - base['sharpe']:>+8.3f}  "
+              f"{row['total_return_%'] - base['total_return_%']:>+10.1f}%  "
+              f"{row['max_drawdown_%'] - base['max_drawdown_%']:>+8.1f}%  "
+              f"{row['dd_2022_%'] - base['dd_2022_%']:>+10.1f}%  "
+              f"{row['dd_2025_%'] - base['dd_2025_%']:>+10.1f}%")
+    print("═" * W)
+
+    if save_path:
+        df.reset_index().to_csv(save_path, index=False)
+        logger.success(f"Policy-Report gespeichert: {save_path}")
+
+    return df
+
+
+def plot_policy_equity(
+    score_cache:  ScoreCache,
+    price_cache:  dict,
+    policy_df:    pd.DataFrame,
+    daily_ic:     pd.Series,
+    rolling_map:  dict,
+    base_params:  Optional[PortfolioParams] = None,
+    save_path:    str = "policy_equity.png",
+) -> None:
+    """Equity-Kurven aller 5 Policy-Runs in einem Chart."""
+    try:
+        import matplotlib
+        matplotlib.use('Agg')
+        import matplotlib.pyplot as plt
+        import matplotlib.dates as mdates
+
+        if base_params is None:
+            base_params = PortfolioParams()
+
+        ic_df = build_ic_df(daily_ic, rolling_map)
+        runs  = [("Baseline", None), ("A1_IC20","IC20"), ("A2_IC30","IC30"),
+                 ("A3_IC40","IC40"), ("B_SPY200","SPY200")]
+        colors = ['#212121', '#1565C0', '#0288D1', '#00796B', '#E65100']
+        lws    = [2.5, 1.6, 1.6, 1.6, 1.8]
+        lstyles = ['-', '--', '--', '--', '-.']
+
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(16, 10),
+                                        gridspec_kw={'height_ratios': [3, 1]})
+        fig.suptitle("Policy-Vergleich: Baseline vs. IC20 / IC30 / IC40 / SPY200",
+                     fontsize=13, fontweight='bold')
+
+        for (run_name, policy), color, lw, ls in zip(runs, colors, lws, lstyles):
+            res = run_portfolio(score_cache, price_cache, base_params,
+                                policy=policy, ic_df=ic_df)
+            eq  = np.array(res['equity'][1:])
+            eqd = res['equity_dates']
+            ret = (eq / eq[0] - 1) * 100
+            dd  = (eq - np.maximum.accumulate(eq)) / np.maximum.accumulate(eq) * 100
+            sharpe = policy_df.loc[run_name, 'sharpe'] if run_name in policy_df.index else 0
+            tot    = policy_df.loc[run_name, 'total_return_%'] if run_name in policy_df.index else 0
+            ax1.plot(eqd, ret, color=color, linewidth=lw, linestyle=ls,
+                     label=f"{run_name}  S={sharpe:.3f}  {tot:+.0f}%")
+            ax2.fill_between(eqd, dd, 0, alpha=0.35, color=color)
+            ax2.plot(eqd, dd, color=color, linewidth=0.7, alpha=0.8)
+
+        # Jahrstrennlinien
+        all_dates = sorted(score_cache.keys())
+        if all_dates:
+            for yr in range(all_dates[0].year + 1, all_dates[-1].year + 2):
+                for ax in (ax1, ax2):
+                    ax.axvline(pd.Timestamp(f'{yr}-01-01'), color='gray',
+                               linewidth=0.5, linestyle='--', alpha=0.4)
+
+        ax1.axhline(0, color='black', linewidth=0.6)
+        ax1.set_ylabel("Kumulativer Return (%)")
+        ax1.legend(loc='upper left', fontsize=9)
+        ax1.grid(True, alpha=0.2)
+        ax1.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m'))
+        plt.setp(ax1.get_xticklabels(), visible=False)
+
+        ax2.axhline(0, color='black', linewidth=0.6)
+        ax2.set_ylabel("Drawdown (%)")
+        ax2.set_xlabel("Datum")
+        ax2.grid(True, alpha=0.2)
+        ax2.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m'))
+
+        plt.tight_layout()
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        plt.close(fig)
+        logger.success(f"Policy-Equity-Chart gespeichert: {save_path}")
+    except Exception as e:
+        import traceback
+        logger.warning(f"plot_policy_equity Fehler: {e}\n{traceback.format_exc()}")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # Ausgabe & Visualisierung
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -1123,10 +1465,16 @@ def parse_args() -> argparse.Namespace:
                    help='Pfad zur Score-Cache .parquet Datei. '
                         'Falls vorhanden: laden statt neu berechnen. '
                         'Falls nicht vorhanden: berechnen und speichern.')
-    p.add_argument('--horizon',    type=int, default=7,
+    p.add_argument('--horizon',        type=int, default=7,
                    help='Vorhersage-Horizont in Handelstagen')
-    p.add_argument('--top-n',      type=int, default=15,
+    p.add_argument('--top-n',          type=int, default=15,
                    help='Anzahl Top-Ergebnisse in der Ausgabe')
+    p.add_argument('--policy-compare', action='store_true', default=False,
+                   help='Policy-Vergleich Baseline/A1/A2/A3/B ausführen')
+    p.add_argument('--policy-csv',     default='policy_comparison.csv',
+                   help='Ausgabe-CSV für Policy-Vergleich')
+    p.add_argument('--policy-plot',    default='policy_equity.png',
+                   help='Ausgabe-PNG für Policy-Equity-Chart')
     p.add_argument('--device',     default=None,
                    help='cuda oder cpu (auto-detect wenn leer)')
     p.add_argument('--repo-dir',   default='.',
@@ -1192,6 +1540,8 @@ def main() -> None:
     logger.info("═" * 60)
     logger.info("  Phase 3: Rolling Rank-IC")
     logger.info("═" * 60)
+    daily_ic    = pd.Series(dtype=float)
+    rolling_map = {}
     try:
         daily_ic = compute_daily_ic(score_cache, price_cache, horizon=args.horizon)
         if daily_ic.empty:
@@ -1203,15 +1553,45 @@ def main() -> None:
                             save_path=args.ic_plot, label=f'v2_{args.horizon}d')
             logger.success(f"IC-Chart gespeichert: {args.ic_plot}")
 
-            # IC-Zeitreihe + alle Rolling-Fenster als JSON + CSV speichern
             ic_json_path = str(Path(args.ic_plot).with_name(
                 f"rolling_ic_v2_{args.horizon}d.json"))
             save_ic_json(daily_ic, rolling_map,
                          save_path=ic_json_path, windows=IC_WINDOWS)
     except Exception as exc:
-        logger.error(f"Phase 3 fehlgeschlagen (Grid-Search-Ergebnisse sind trotzdem gültig): {exc}")
+        logger.error(f"Phase 3 fehlgeschlagen: {exc}")
         import traceback
         traceback.print_exc()
+
+    # ── Phase 4: Policy-Vergleich (optional) ─────────────────────────────────
+    if args.policy_compare:
+        logger.info("═" * 60)
+        logger.info("  Phase 4: Policy-Vergleich (Baseline / A1 / A2 / A3 / B)")
+        logger.info("═" * 60)
+        try:
+            if daily_ic.empty:
+                logger.error("Policy-Vergleich benötigt IC-Daten (Phase 3 fehlgeschlagen).")
+            else:
+                policy_df = policy_comparison(
+                    score_cache=score_cache,
+                    price_cache=price_cache,
+                    daily_ic=daily_ic,
+                    rolling_map=rolling_map,
+                    base_params=PortfolioParams(),
+                    save_path=args.policy_csv,
+                )
+                plot_policy_equity(
+                    score_cache=score_cache,
+                    price_cache=price_cache,
+                    policy_df=policy_df,
+                    daily_ic=daily_ic,
+                    rolling_map=rolling_map,
+                    base_params=PortfolioParams(),
+                    save_path=args.policy_plot,
+                )
+        except Exception as exc:
+            logger.error(f"Phase 4 fehlgeschlagen: {exc}")
+            import traceback
+            traceback.print_exc()
 
 
 if __name__ == '__main__':
