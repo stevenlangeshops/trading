@@ -72,6 +72,7 @@ class PortfolioParams:
 
 # Score-Cache-Typ: Datum → pd.Series (asset → score, absteigend)
 ScoreCache = Dict[pd.Timestamp, pd.Series]
+IC_WINDOWS = [5, 10, 15, 20, 30, 40, 50, 60]
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -797,9 +798,6 @@ def plot_rolling_ic(
     except Exception as e:
         import traceback
         logger.warning(f"plot_rolling_ic Fehler: {e}\n{traceback.format_exc()}")
-
-
-IC_WINDOWS = [5, 10, 15, 20, 30, 40, 50, 60]
 
 
 def rolling_ic_report(
