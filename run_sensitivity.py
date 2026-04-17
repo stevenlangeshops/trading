@@ -716,25 +716,24 @@ def subperiod_report(
     if periods is None:
         periods = DEFAULT_PERIODS
 
-    hdr = f"  SUBPERIODEN-ANALYSE{f'  [{label}]' if label else ''}"
-    print("\n" + "─" * 80)
-    print(hdr)
-    print("─" * 80)
-    print(f"  {'Phase':<42} {'Return':>8}  {'MaxDD':>7}  {'Sharpe':>7}  {'Tage':>5}")
-    print("  " + "─" * 75)
+    hdr = f"SUBPERIODEN-ANALYSE{f'  [{label}]' if label else ''}"
+    logger.info("─" * 72)
+    logger.info(hdr)
+    logger.info(f"  {'Phase':<42} {'Return':>8}  {'MaxDD':>7}  {'Sharpe':>7}  {'Tage':>5}")
+    logger.info("  " + "─" * 65)
 
     for name, start, end in periods:
         m = _period_metrics(equity, equity_dates, start, end)
         if m is None:
-            print(f"  {name:<42} {'–':>8}  {'–':>7}  {'–':>7}  {'–':>5}")
+            logger.info(f"  {name:<42} {'–':>8}  {'–':>7}  {'–':>7}  {'–':>5}")
         else:
-            print(f"  {name:<42} "
-                  f"{m['return']:>+7.1f}%  "
-                  f"{m['max_dd']:>6.1f}%  "
-                  f"{m['sharpe']:>7.3f}  "
-                  f"{m['n_days']:>5d}")
+            logger.info(f"  {name:<42} "
+                        f"{m['return']:>+7.1f}%  "
+                        f"{m['max_dd']:>6.1f}%  "
+                        f"{m['sharpe']:>7.3f}  "
+                        f"{m['n_days']:>5d}")
 
-    print("─" * 80)
+    logger.info("─" * 72)
 
 
 def compute_daily_ic(
@@ -1313,33 +1312,35 @@ def print_summary(
     Wenn score_cache und price_cache übergeben werden, wird zusätzlich
     das vollständige Tearsheet berechnet (Subperioden + Rolling IC).
     """
-    print("\n" + "═" * 100)
-    print("  SENSITIVITÄTSANALYSE — TOP-Ergebnisse nach Sharpe")
-    print("═" * 100)
+    logger.info("═" * 80)
+    logger.info("  SENSITIVITAETSANALYSE - TOP-Ergebnisse nach Sharpe")
+    logger.info("═" * 80)
     display_cols = ['n_max', 'rotation_buffer', 'hard_stop_pct', 'fees',
                     'sharpe', 'total_return_%', 'max_drawdown_%',
                     'n_trades', 'win_rate_%', 'avg_hold_days', 'n_hard_stops']
     top = df[display_cols].head(top_n)
-    print(top.to_string(
+    for line in top.to_string(
         float_format=lambda x: f"{x:+.2f}" if isinstance(x, float) else str(x),
-    ))
-    print("═" * 100)
+    ).splitlines():
+        logger.info(line)
+    logger.info("═" * 80)
 
-    # Referenz-Ergebnis (n_max=7, rb=3, hs=0.25, fees=0.001)
+    # Referenz-Ergebnis (n_max=7, rb=3, hs=0.20, fees=0.001)
     ref = df[(df['n_max'] == 7) & (df['rotation_buffer'] == 3) &
              (df['hard_stop_pct'] == 0.20) & (df['fees'] == 0.001)]
     if not ref.empty:
         r = ref.iloc[0]
-        print(f"\n  Referenz (n7/rb3/hs25%/f0.1%): "
-              f"Rang {ref.index[0]}  |  "
-              f"Sharpe={r['sharpe']:.3f}  "
-              f"Return={r['total_return_%']:+.1f}%  "
-              f"MaxDD={r['max_drawdown_%']:.1f}%")
+        logger.info(f"  Referenz (n7/rb3/hs20%/f0.1%): "
+                    f"Rang {ref.index[0]}  |  "
+                    f"Sharpe={r['sharpe']:.3f}  "
+                    f"Return={r['total_return_%']:+.1f}%  "
+                    f"MaxDD={r['max_drawdown_%']:.1f}%")
 
-    print("\n  Parameter-Sensitivität (Ø Sharpe je Wert):")
+    logger.info("  Parameter-Sensitivitaet (Sharpe je Wert):")
     for col in ['n_max', 'rotation_buffer', 'hard_stop_pct', 'fees']:
-        print(f"  {col:18s}: " +
-              "  ".join(f"{v}→{df[df[col]==v]['sharpe'].mean():.3f}" for v in sorted(df[col].unique())))
+        logger.info(f"  {col:18s}: " +
+                    "  ".join(f"{v}->{df[df[col]==v]['sharpe'].mean():.3f}"
+                               for v in sorted(df[col].unique())))
 
     # ── Erweitertes Tearsheet (optional) ─────────────────────────────────────
     if score_cache is not None and price_cache is not None:
