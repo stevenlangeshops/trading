@@ -1075,13 +1075,13 @@ def full_tearsheet(
 def _subperiod_dd(equity: list, dates: list, start: str, end: str) -> float:
     """Maximaler Drawdown in einem Subzeitraum (für Policy-Report)."""
     m = _period_metrics(equity, dates, start, end)
-    return m['max_drawdown'] if m else float('nan')
+    return m['max_dd'] if m else float('nan')
 
 
 def _subperiod_ret(equity: list, dates: list, start: str, end: str) -> float:
     """Total Return in einem Subzeitraum."""
     m = _period_metrics(equity, dates, start, end)
-    return m['total_return'] if m else float('nan')
+    return m['return'] if m else float('nan')
 
 
 def policy_comparison(
