@@ -1198,45 +1198,45 @@ def policy_comparison(
     df = pd.DataFrame(rows).set_index('run')
 
     # ── Konsolen-Report ───────────────────────────────────────────────────────
-    W = 130
-    print("\n" + "═" * W)
-    print("  POLICY-VERGLEICH: Baseline vs. A1(IC20) / A2(IC30) / A3(IC40) / B(SPY200)")
-    print(f"  Basis: n_max={base_params.n_max} rb={base_params.rotation_buffer} "
-          f"hs={base_params.hard_stop_pct:.0%} fees={base_params.fees:.3%}  "
-          f"→ n_max_reduziert auf 3 wenn Trigger aktiv")
-    print("═" * W)
+    import sys
+    W = 110
+    logger.info("Policy-Report wird gedruckt ...")
+    lines = []
+    lines.append("\n" + "=" * W)
+    lines.append("  POLICY-VERGLEICH: Baseline vs. A1(IC20) / A2(IC30) / A3(IC40) / B(SPY200)")
+    lines.append(f"  n_max={base_params.n_max} rb={base_params.rotation_buffer} "
+                 f"hs={base_params.hard_stop_pct:.0%} fees={base_params.fees:.3%}  "
+                 f"→ n_max auf 3 wenn Trigger aktiv")
+    lines.append("=" * W)
     cols_main = ['policy','sharpe','total_return_%','max_drawdown_%',
-                 'n_trades','win_rate_%','avg_hold_days','n_hard_stops',
-                 'days_n_max_reduced','pct_days_reduced']
-    print(df[cols_main].to_string())
-    print("\n" + "─" * W)
-    print("  SUBPERIODEN-ANALYSE")
-    print("─" * W)
+                 'n_trades','win_rate_%','avg_hold_days','pct_days_reduced']
+    lines.append(df[cols_main].to_string())
+    lines.append("-" * W)
+    lines.append("  SUBPERIODEN")
     cols_sub = ['policy','ret_2022_%','dd_2022_%','ret_2023_%','ret_2024_%',
                 'ret_2025_%','dd_2025_%']
-    print(df[cols_sub].to_string())
-    print("═" * W)
-
-    # Baseline-Differenzen
-    base = df.loc['Baseline']
-    print("\n  DELTA vs. Baseline:")
-    print(f"  {'Run':12s}  {'ΔSharpe':>8s}  {'ΔReturn':>10s}  {'ΔMaxDD':>8s}  "
-          f"{'ΔDD-2022':>10s}  {'ΔDD-2025':>10s}")
+    lines.append(df[cols_sub].to_string())
+    lines.append("-" * W)
+    base_row = df.loc['Baseline']
+    lines.append(f"  {'Run':12s}  {'dSharpe':>8s}  {'dReturn':>10s}  {'dMaxDD':>8s}  "
+                 f"{'dDD-2022':>10s}  {'dDD-2025':>10s}")
     for run_name, row in df.iterrows():
         if run_name == 'Baseline':
             continue
-        print(f"  {run_name:12s}  "
-              f"{row['sharpe'] - base['sharpe']:>+8.3f}  "
-              f"{row['total_return_%'] - base['total_return_%']:>+10.1f}%  "
-              f"{row['max_drawdown_%'] - base['max_drawdown_%']:>+8.1f}%  "
-              f"{row['dd_2022_%'] - base['dd_2022_%']:>+10.1f}%  "
-              f"{row['dd_2025_%'] - base['dd_2025_%']:>+10.1f}%")
-    print("═" * W)
+        lines.append(f"  {run_name:12s}  "
+                     f"{row['sharpe'] - base_row['sharpe']:>+8.3f}  "
+                     f"{row['total_return_%'] - base_row['total_return_%']:>+10.1f}%  "
+                     f"{row['max_drawdown_%'] - base_row['max_drawdown_%']:>+8.1f}%  "
+                     f"{row['dd_2022_%'] - base_row['dd_2022_%']:>+10.1f}%  "
+                     f"{row['dd_2025_%'] - base_row['dd_2025_%']:>+10.1f}%")
+    lines.append("=" * W)
+    print("\n".join(lines), flush=True)
 
     if save_path:
         df.reset_index().to_csv(save_path, index=False)
         logger.success(f"Policy-Report gespeichert: {save_path}")
 
+    logger.info("policy_comparison abgeschlossen.")
     return df, equity_map
 
 
@@ -1258,15 +1258,17 @@ def plot_policy_equity(
         import matplotlib.pyplot as plt
         import matplotlib.dates as mdates
 
+        logger.info("plot_policy_equity: Chart wird erstellt ...")
+
         run_order = ["Baseline", "A1_IC20", "A2_IC30", "A3_IC40", "B_SPY200"]
         colors  = ['#212121', '#1565C0', '#0288D1', '#00796B', '#E65100']
         lws     = [2.5, 1.6, 1.6, 1.6, 1.8]
         lstyles = ['-', '--', '--', '--', '-.']
 
-        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(16, 10),
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 8),
                                         gridspec_kw={'height_ratios': [3, 1]})
         fig.suptitle("Policy-Vergleich: Baseline vs. IC20 / IC30 / IC40 / SPY200",
-                     fontsize=13, fontweight='bold')
+                     fontsize=12, fontweight='bold')
 
         for run_name, color, lw, ls in zip(run_order, colors, lws, lstyles):
             if run_name not in equity_map:
@@ -1277,33 +1279,32 @@ def plot_policy_equity(
             dd  = (eq - np.maximum.accumulate(eq)) / np.maximum.accumulate(eq) * 100
             sharpe = policy_df.loc[run_name, 'sharpe'] if run_name in policy_df.index else 0
             tot    = policy_df.loc[run_name, 'total_return_%'] if run_name in policy_df.index else 0
-            ax1.plot(eqd, ret, color=color, linewidth=lw, linestyle=ls,
-                     label=f"{run_name}  S={sharpe:.3f}  {tot:+.0f}%")
-            ax2.fill_between(eqd, dd, 0, alpha=0.35, color=color)
-            ax2.plot(eqd, dd, color=color, linewidth=0.7, alpha=0.8)
+            label  = f"{run_name}  S={sharpe:.3f}  {tot:+.0f}%"
+            ax1.plot(eqd, ret, color=color, linewidth=lw, linestyle=ls, label=label)
+            # Drawdown nur als Linie (kein fill_between – zu langsam bei 1500 Punkten)
+            ax2.plot(eqd, dd, color=color, linewidth=lw * 0.6, linestyle=ls, alpha=0.85)
 
-        # Jahrstrennlinien
+        # Jahrstrennlinien (nur als axvline – schnell)
         if all_dates:
             for yr in range(all_dates[0].year + 1, all_dates[-1].year + 2):
                 for ax in (ax1, ax2):
                     ax.axvline(pd.Timestamp(f'{yr}-01-01'), color='gray',
-                               linewidth=0.5, linestyle='--', alpha=0.4)
+                               linewidth=0.5, linestyle=':', alpha=0.5)
 
         ax1.axhline(0, color='black', linewidth=0.6)
         ax1.set_ylabel("Kumulativer Return (%)")
-        ax1.legend(loc='upper left', fontsize=9)
-        ax1.grid(True, alpha=0.2)
-        ax1.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m'))
+        ax1.legend(loc='upper left', fontsize=8, framealpha=0.7)
+        ax1.grid(True, alpha=0.15)
         plt.setp(ax1.get_xticklabels(), visible=False)
 
         ax2.axhline(0, color='black', linewidth=0.6)
         ax2.set_ylabel("Drawdown (%)")
         ax2.set_xlabel("Datum")
-        ax2.grid(True, alpha=0.2)
-        ax2.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m'))
+        ax2.grid(True, alpha=0.15)
 
+        logger.info("plot_policy_equity: savefig ...")
         plt.tight_layout()
-        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        plt.savefig(save_path, dpi=120, bbox_inches='tight')
         plt.close(fig)
         logger.success(f"Policy-Equity-Chart gespeichert: {save_path}")
     except Exception as e:
