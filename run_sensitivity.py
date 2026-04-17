@@ -103,6 +103,10 @@ def load_score_cache(path: str) -> ScoreCache:
     """
     df = pd.read_parquet(path)
     df.index = pd.to_datetime(df.index)
+    # UTC-Timezone entfernen → alle date-Keys sind tz-naive (konsistent mit
+    # build_score_cache() und allen Vergleichen im Backtest-Loop).
+    if hasattr(df.index, 'tz') and df.index.tz is not None:
+        df.index = df.index.tz_localize(None)
     cache: ScoreCache = {}
     for ts, row in df.iterrows():
         valid = row.dropna()
@@ -1146,6 +1150,7 @@ def policy_comparison(
 
     total_days = len(sorted(score_cache.keys()))
     rows = []
+    equity_map: dict = {}   # {run_name: (equity_list, equity_dates_list)}
 
     logger.info("═" * 70)
     logger.info("  Policy-Vergleich: Baseline vs. A1 / A2 / A3 / B")
@@ -1160,6 +1165,7 @@ def policy_comparison(
 
         eq  = res['equity']
         eqd = res['equity_dates']
+        equity_map[run_name] = (eq, eqd)   # für Chart merken – kein zweiter Backtest nötig
         pct_reduced = res['days_n_max_reduced'] / total_days * 100 if total_days else 0
 
         row = {
@@ -1230,33 +1236,30 @@ def policy_comparison(
         df.reset_index().to_csv(save_path, index=False)
         logger.success(f"Policy-Report gespeichert: {save_path}")
 
-    return df
+    return df, equity_map
 
 
 def plot_policy_equity(
-    score_cache:  ScoreCache,
-    price_cache:  dict,
     policy_df:    pd.DataFrame,
-    daily_ic:     pd.Series,
-    rolling_map:  dict,
-    base_params:  Optional[PortfolioParams] = None,
+    equity_map:   dict,
+    all_dates:    list,
     save_path:    str = "policy_equity.png",
 ) -> None:
-    """Equity-Kurven aller 5 Policy-Runs in einem Chart."""
+    """
+    Equity-Kurven aller 5 Policy-Runs in einem Chart.
+
+    Nutzt vorberechnete equity_map aus policy_comparison() –
+    kein zweiter Backtest-Lauf nötig.
+    """
     try:
         import matplotlib
         matplotlib.use('Agg')
         import matplotlib.pyplot as plt
         import matplotlib.dates as mdates
 
-        if base_params is None:
-            base_params = PortfolioParams()
-
-        ic_df = build_ic_df(daily_ic, rolling_map)
-        runs  = [("Baseline", None), ("A1_IC20","IC20"), ("A2_IC30","IC30"),
-                 ("A3_IC40","IC40"), ("B_SPY200","SPY200")]
-        colors = ['#212121', '#1565C0', '#0288D1', '#00796B', '#E65100']
-        lws    = [2.5, 1.6, 1.6, 1.6, 1.8]
+        run_order = ["Baseline", "A1_IC20", "A2_IC30", "A3_IC40", "B_SPY200"]
+        colors  = ['#212121', '#1565C0', '#0288D1', '#00796B', '#E65100']
+        lws     = [2.5, 1.6, 1.6, 1.6, 1.8]
         lstyles = ['-', '--', '--', '--', '-.']
 
         fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(16, 10),
@@ -1264,11 +1267,11 @@ def plot_policy_equity(
         fig.suptitle("Policy-Vergleich: Baseline vs. IC20 / IC30 / IC40 / SPY200",
                      fontsize=13, fontweight='bold')
 
-        for (run_name, policy), color, lw, ls in zip(runs, colors, lws, lstyles):
-            res = run_portfolio(score_cache, price_cache, base_params,
-                                policy=policy, ic_df=ic_df)
-            eq  = np.array(res['equity'][1:])
-            eqd = res['equity_dates']
+        for run_name, color, lw, ls in zip(run_order, colors, lws, lstyles):
+            if run_name not in equity_map:
+                continue
+            eq_list, eqd = equity_map[run_name]
+            eq  = np.array(eq_list[1:])
             ret = (eq / eq[0] - 1) * 100
             dd  = (eq - np.maximum.accumulate(eq)) / np.maximum.accumulate(eq) * 100
             sharpe = policy_df.loc[run_name, 'sharpe'] if run_name in policy_df.index else 0
@@ -1279,7 +1282,6 @@ def plot_policy_equity(
             ax2.plot(eqd, dd, color=color, linewidth=0.7, alpha=0.8)
 
         # Jahrstrennlinien
-        all_dates = sorted(score_cache.keys())
         if all_dates:
             for yr in range(all_dates[0].year + 1, all_dates[-1].year + 2):
                 for ax in (ax1, ax2):
@@ -1614,7 +1616,7 @@ def main() -> None:
             if daily_ic.empty:
                 logger.error("Policy-Vergleich benötigt IC-Daten (Phase 3 fehlgeschlagen).")
             else:
-                policy_df = policy_comparison(
+                policy_df, equity_map = policy_comparison(
                     score_cache=score_cache,
                     price_cache=price_cache,
                     daily_ic=daily_ic,
@@ -1622,13 +1624,11 @@ def main() -> None:
                     base_params=PortfolioParams(),
                     save_path=args.policy_csv,
                 )
+                # Chart nutzt vorberechnete Equity-Kurven – kein zweiter Backtest-Lauf
                 plot_policy_equity(
-                    score_cache=score_cache,
-                    price_cache=price_cache,
                     policy_df=policy_df,
-                    daily_ic=daily_ic,
-                    rolling_map=rolling_map,
-                    base_params=PortfolioParams(),
+                    equity_map=equity_map,
+                    all_dates=sorted(score_cache.keys()),
                     save_path=args.policy_plot,
                 )
         except Exception as exc:
