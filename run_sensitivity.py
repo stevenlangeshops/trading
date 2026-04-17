@@ -237,16 +237,26 @@ def _adaptive_n(regime: str, n_max: int, n_mid: int, n_min: int) -> int:
 
 POLICIES = ("IC20", "IC30", "IC40", "SPY200")
 
+def _strip_tz_index(idx: pd.Index) -> pd.Index:
+    """Entfernt Timezone-Info aus einem DatetimeIndex (tz-aware → tz-naive)."""
+    if hasattr(idx, 'tz') and idx.tz is not None:
+        return idx.tz_localize(None)
+    return idx
+
+
 def _ic_df_lookup(ic_df: pd.DataFrame, date: pd.Timestamp, col: str) -> float:
     """Sicherer IC-Lookup mit Datum-Normalisierung (tz-strip, ffill)."""
-    ts = date.tz_localize(None) if (hasattr(date, 'tzinfo') and date.tzinfo) else date
-    if ts in ic_df.index:
-        return float(ic_df.loc[ts, col])
+    ts  = date.tz_localize(None) if (hasattr(date, 'tzinfo') and date.tzinfo) else date
+    idx = _strip_tz_index(ic_df.index)
+    if ts in idx:
+        pos = idx.get_loc(ts)
+        return float(ic_df.iloc[pos][col])
     # nächster verfügbarer Wert davor (forward-fill)
-    before = ic_df.index[ic_df.index <= ts]
+    before = idx[idx <= ts]
     if len(before) == 0:
         return float('nan')
-    return float(ic_df.loc[before[-1], col])
+    pos = idx.get_loc(before[-1])
+    return float(ic_df.iloc[pos][col])
 
 
 def get_effective_n_max(
@@ -321,7 +331,11 @@ def build_ic_df(daily_ic: pd.Series, rolling_map: dict) -> pd.DataFrame:
     df = pd.DataFrame({'ic': daily_ic})
     for w, series in rolling_map.items():
         df[f'ic_roll_{w}'] = series
-    return df.sort_index()
+    df = df.sort_index()
+    # Timezone entfernen damit Vergleiche mit tz-naive Score-Cache-Dates funktionieren
+    if hasattr(df.index, 'tz') and df.index.tz is not None:
+        df.index = df.index.tz_localize(None)
+    return df
 
 
 def run_portfolio(
