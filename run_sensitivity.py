@@ -75,6 +75,44 @@ ScoreCache = Dict[pd.Timestamp, pd.Series]
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# Score-Cache persistieren / laden
+# ══════════════════════════════════════════════════════════════════════════════
+
+def save_score_cache(score_cache: ScoreCache, path: str) -> None:
+    """
+    Speichert den Score-Cache als Parquet-Datei.
+
+    Format: DataFrame mit DatetimeIndex (Tage) und Asset-Spalten.
+    NaN = kein Score für dieses Asset an diesem Tag.
+    """
+    df = pd.DataFrame(score_cache).T          # Transpose: index=Datum, cols=Assets
+    df.index.name = 'date'
+    df.sort_index(inplace=True)
+    df.to_parquet(path, compression='zstd')
+    size_mb = Path(path).stat().st_size / 1024 / 1024
+    logger.success(f"Score-Cache gespeichert: {path}  ({size_mb:.1f} MB, "
+                   f"{len(df)} Tage, {len(df.columns)} Assets)")
+
+
+def load_score_cache(path: str) -> ScoreCache:
+    """
+    Lädt einen zuvor gespeicherten Score-Cache aus einer Parquet-Datei.
+    Gibt ein dict[pd.Timestamp, pd.Series] zurück – identisch mit dem
+    Rückgabewert von build_score_cache().
+    """
+    df = pd.read_parquet(path)
+    df.index = pd.to_datetime(df.index)
+    cache: ScoreCache = {}
+    for ts, row in df.iterrows():
+        valid = row.dropna()
+        if not valid.empty:
+            cache[ts] = valid
+    logger.success(f"Score-Cache geladen: {path}  "
+                   f"({len(cache)} Tage, {len(df.columns)} Assets)")
+    return cache
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # Phase 1: Score-Cache aus Checkpoints aufbauen
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -1031,8 +1069,12 @@ def parse_args() -> argparse.Namespace:
                    help='Ausgabe-CSV')
     p.add_argument('--plot',       default='sensitivity_top_equity.png',
                    help='Ausgabe-PNG (Top-5 Equity-Kurven)')
-    p.add_argument('--ic-plot',    default='rolling_ic.png',
+    p.add_argument('--ic-plot',     default='rolling_ic.png',
                    help='Ausgabe-PNG (Rolling Rank-IC Chart)')
+    p.add_argument('--score-cache', default=None,
+                   help='Pfad zur Score-Cache .parquet Datei. '
+                        'Falls vorhanden: laden statt neu berechnen. '
+                        'Falls nicht vorhanden: berechnen und speichern.')
     p.add_argument('--horizon',    type=int, default=7,
                    help='Vorhersage-Horizont in Handelstagen')
     p.add_argument('--top-n',      type=int, default=15,
@@ -1071,9 +1113,16 @@ def main() -> None:
     logger.info("Price-Cache aufbauen ...")
     price_cache = build_price_cache_local(asset_map, args.data_dir)
 
-    # ── Phase 1: Score-Cache (einmalig) ──────────────────────────────────────
-    score_cache = build_score_cache(features, fold_results, asset_map,
-                                    device=args.device)
+    # ── Phase 1: Score-Cache (einmalig oder aus Datei laden) ─────────────────
+    cache_path = args.score_cache
+    if cache_path and Path(cache_path).exists():
+        logger.info(f"Score-Cache aus Datei laden: {cache_path}")
+        score_cache = load_score_cache(cache_path)
+    else:
+        score_cache = build_score_cache(features, fold_results, asset_map,
+                                        device=args.device)
+        if cache_path:
+            save_score_cache(score_cache, cache_path)
 
     # ── Phase 2: Grid Search + Plots ─────────────────────────────────────────
     df = grid_search(score_cache, price_cache)
