@@ -54,6 +54,9 @@ from loguru import logger
 # Datenstrukturen
 # ══════════════════════════════════════════════════════════════════════════════
 
+MEGA_CAP_7 = ['AAPL', 'MSFT', 'NVDA', 'AMZN', 'GOOGL', 'META', 'TSLA']
+
+
 @dataclass
 class PortfolioParams:
     """Alle variablen Portfolio-Parameter für eine Grid-Search-Zelle."""
@@ -64,10 +67,16 @@ class PortfolioParams:
     hard_stop_pct:   float = 0.20
     fees:            float = 0.001
     init_cash:       float = 10_000.0
+    # Universum-Blacklist: diese Tickers werden beim Ranking übersprungen.
+    # Existierende Positionen darin laufen bis Hard-Stop / Rotation aus.
+    exclude_tickers: List[str] = field(default_factory=list)
 
     def label(self) -> str:
-        return (f"n{self.n_max}_rb{self.rotation_buffer}_"
+        base = (f"n{self.n_max}_rb{self.rotation_buffer}_"
                 f"hs{int(self.hard_stop_pct*100)}_f{int(self.fees*10000)}")
+        if self.exclude_tickers:
+            base += f"_ex{len(self.exclude_tickers)}"
+        return base
 
 
 # Score-Cache-Typ: Datum → pd.Series (asset → score, absteigend)
@@ -399,8 +408,17 @@ def run_portfolio(
             'hold_days':   pos.get('hold_days', 0),
         })
 
+    # Blacklist einmalig als Set vorberechnen (O(1) Lookup pro Tag)
+    _blacklist: set = set(params.exclude_tickers) if params.exclude_tickers else set()
+
     for date in sorted_dates:
         ranking = score_cache[date]
+
+        # Universum-Filter: Blacklisted Ticker aus dem Ranking entfernen.
+        # Das Modell hat sie bereits gescort – wir ignorieren sie nur bei der
+        # Portfolio-Konstruktion. Bestehende Positionen darin laufen normal aus.
+        if _blacklist:
+            ranking = ranking[~ranking.index.isin(_blacklist)]
 
         # Hold-Days inkrementieren
         for pos in positions.values():
@@ -1489,6 +1507,12 @@ def parse_args() -> argparse.Namespace:
                    help='Ausgabe-CSV für Policy-Vergleich')
     p.add_argument('--policy-plot',    default='policy_equity.png',
                    help='Ausgabe-PNG für Policy-Equity-Chart')
+    # Universum-Robustheit
+    p.add_argument('--exclude-tickers', nargs='+', default=[],
+                   metavar='TICKER',
+                   help='Ticker aus dem Ranking ausschliessen (z.B. AAPL MSFT NVDA)')
+    p.add_argument('--no-mega-cap', action='store_true', default=False,
+                   help=f'Shortcut: schliesst Mag-7 aus ({", ".join(MEGA_CAP_7)})')
     p.add_argument('--device',     default=None,
                    help='cuda oder cpu (auto-detect wenn leer)')
     p.add_argument('--repo-dir',   default='.',
@@ -1510,6 +1534,13 @@ def main() -> None:
     if str(repo_dir) not in sys.path:
         sys.path.insert(0, str(repo_dir))
 
+    # --no-mega-cap ist ein Shortcut für --exclude-tickers mit Mag-7
+    exclude_tickers: List[str] = list(args.exclude_tickers)
+    if args.no_mega_cap:
+        for t in MEGA_CAP_7:
+            if t not in exclude_tickers:
+                exclude_tickers.append(t)
+
     logger.info("═" * 60)
     logger.info("  Sensitivitätsanalyse – Portfolio-Layer Grid Search")
     logger.info("═" * 60)
@@ -1517,6 +1548,8 @@ def main() -> None:
     logger.info(f"  --score-cache    : {args.score_cache}")
     logger.info(f"  --skip-grid-search: {args.skip_grid_search}")
     logger.info(f"  --horizon        : {args.horizon}")
+    if exclude_tickers:
+        logger.info(f"  --exclude-tickers: {exclude_tickers}")
 
     # ── Artefakte laden ───────────────────────────────────────────────────────
     fold_results = load_walk_forward_json(args.walk_json)
@@ -1626,6 +1659,76 @@ def main() -> None:
                 )
         except Exception as exc:
             logger.error(f"Phase 4 fehlgeschlagen: {exc}")
+            import traceback
+            traceback.print_exc()
+
+    # ── Phase 5: Universum-Robustheit (optional) ─────────────────────────────
+    if exclude_tickers:
+        logger.info("═" * 60)
+        logger.info("  Phase 5: Universum-Robustheit")
+        logger.info(f"  Blacklist ({len(exclude_tickers)} Ticker): {exclude_tickers}")
+        logger.info("═" * 60)
+        try:
+            base_params = PortfolioParams()
+            ex_params   = PortfolioParams(exclude_tickers=exclude_tickers)
+
+            logger.info("  Run Full-Universe ...")
+            res_full = run_portfolio(score_cache, price_cache, base_params)
+
+            logger.info(f"  Run Ex-{len(exclude_tickers)}-Tickers ...")
+            res_ex   = run_portfolio(score_cache, price_cache, ex_params)
+
+            def _fmt(res: dict, label: str) -> str:
+                return (
+                    f"  {label:<22} "
+                    f"Sharpe={res['sharpe']:+.3f}  "
+                    f"Return={res['return']:+.1f}%  "
+                    f"MaxDD={res['max_dd']:+.1f}%  "
+                    f"Trades={res['n_trades']}"
+                )
+
+            logger.info("─" * 60)
+            logger.info(_fmt(res_full, "Full-Universe"))
+            logger.info(_fmt(res_ex,   f"Ex-{len(exclude_tickers)}-Tickers"))
+            delta_sharpe = res_ex['sharpe']  - res_full['sharpe']
+            delta_ret    = res_ex['return']  - res_full['return']
+            delta_dd     = res_ex['max_dd']  - res_full['max_dd']
+            logger.info(
+                f"  {'Delta':<22} "
+                f"Sharpe={delta_sharpe:+.3f}  "
+                f"Return={delta_ret:+.1f}%  "
+                f"MaxDD={delta_dd:+.1f}%"
+            )
+            logger.info("─" * 60)
+
+            # Subperioden-Vergleich
+            for label, year_start, year_end in [
+                ("2022 (Bärenmarkt)", "2022-01-01", "2022-12-31"),
+                ("2025+",            "2025-01-01", "2026-12-31"),
+            ]:
+                dd_full = _subperiod_dd(res_full['equity'], res_full['equity_dates'],
+                                        year_start, year_end)
+                dd_ex   = _subperiod_dd(res_ex['equity'],   res_ex['equity_dates'],
+                                        year_start, year_end)
+                logger.info(
+                    f"  MaxDD {label:<18} "
+                    f"Full={dd_full:+.1f}%  "
+                    f"Ex={dd_ex:+.1f}%  "
+                    f"Delta={dd_ex-dd_full:+.1f}%"
+                )
+
+            # CSV-Export
+            robustness_csv = str(Path(args.policy_csv).with_name("universe_robustness.csv"))
+            pd.DataFrame([
+                {**{'run': 'Full-Universe',            'exclude': ''},
+                 **{k: res_full[k] for k in ('sharpe','return','max_dd','n_trades','win_rate','avg_hold_days')}},
+                {**{'run': f'Ex-{len(exclude_tickers)}-Tickers', 'exclude': ','.join(exclude_tickers)},
+                 **{k: res_ex[k]   for k in ('sharpe','return','max_dd','n_trades','win_rate','avg_hold_days')}},
+            ]).to_csv(robustness_csv, index=False)
+            logger.success(f"  Robustness-CSV gespeichert: {robustness_csv}")
+
+        except Exception as exc:
+            logger.error(f"Phase 5 fehlgeschlagen: {exc}")
             import traceback
             traceback.print_exc()
 
