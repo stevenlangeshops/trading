@@ -664,16 +664,19 @@ def compute_daily_ic(
 
 
 def plot_rolling_ic(
-    daily_ic:  pd.Series,
-    window:    int = 60,
-    save_path: str = "rolling_ic.png",
-    label:     str = "",
+    daily_ic:    pd.Series,
+    rolling_map: dict[int, pd.Series] | None = None,
+    windows:     list[int] = IC_WINDOWS,
+    save_path:   str = "rolling_ic.png",
+    label:       str = "",
+    # Rückwärtskompatibilität
+    window:      int = 60,
 ) -> None:
     """
     Zeichnet einen 3-Panel-Chart:
-      1. Täglicher Rank-IC (Balken, grün/rot)
-      2. Rollierender Median-IC (60-Tage-Linie)
-      3. Kumulativer IC (zeigt langfristigen Trend)
+      1. Täglicher IC (Balken) + Rolling-IC-Linien für alle Fenster
+      2. Monatlicher Ø-IC (Balken) mit Jahres-Durchschnitt
+      3. Kumulativer IC (Langzeit-Trend)
     """
     try:
         import matplotlib
@@ -681,66 +684,72 @@ def plot_rolling_ic(
         import matplotlib.pyplot as plt
         import matplotlib.dates as mdates
         from matplotlib.gridspec import GridSpec
+        import matplotlib.cm as cm
 
         if daily_ic.empty:
             logger.warning("plot_rolling_ic: keine IC-Daten.")
             return
 
-        roll    = daily_ic.rolling(window=window, min_periods=max(5, window // 4))
-        roll_md = roll.median()
-        roll_mn = roll.mean()
-        cumic   = daily_ic.cumsum()
+        # Rolling-Map erzeugen falls nicht übergeben
+        if rolling_map is None:
+            rolling_map = {w: daily_ic.rolling(w, min_periods=max(1, w // 4)).mean()
+                           for w in windows}
 
-        fig = plt.figure(figsize=(16, 11))
-        gs  = GridSpec(3, 1, figure=fig, hspace=0.35,
-                       height_ratios=[2.5, 2.5, 1.5])
+        cumic = daily_ic.cumsum()
 
+        fig = plt.figure(figsize=(16, 12))
+        gs  = GridSpec(3, 1, figure=fig, hspace=0.38,
+                       height_ratios=[3.0, 2.5, 1.5])
         title_sfx = f" — {label}" if label else ""
 
-        # ── Panel 1: Täglicher IC (Balken) + Rolling-Median ──────────────────
+        # ── Panel 1: Täglicher IC + alle Rolling-Linien ───────────────────────
         ax1 = fig.add_subplot(gs[0])
-        colors = ['#2E7D32' if v >= 0 else '#C62828' for v in daily_ic]
+        colors_bar = ['#2E7D32' if v >= 0 else '#C62828' for v in daily_ic]
         ax1.bar(daily_ic.index, daily_ic.values,
-                color=colors, alpha=0.55, width=1.5, label='Täglicher IC')
-        ax1.plot(roll_md.index, roll_md.values,
-                 color='#1565C0', linewidth=2.0,
-                 label=f'Rolling Median-IC ({window}d)')
-        ax1.plot(roll_mn.index, roll_mn.values,
-                 color='#FF6F00', linewidth=1.2, linestyle='--',
-                 label=f'Rolling Ø-IC ({window}d)')
-        ax1.axhline(0, color='black', linewidth=0.8, linestyle='-')
-        ax1.axhline(daily_ic.median(), color='#1565C0', linewidth=0.8,
-                    linestyle=':', alpha=0.6,
+                color=colors_bar, alpha=0.35, width=1.5, label='Täglicher IC')
+
+        # Farbpalette für Rolling-Linien (kurze=warm, lange=kalt)
+        cmap   = cm.get_cmap('RdYlBu_r', len(windows))
+        lws    = [0.8, 0.9, 1.0, 1.2, 1.4, 1.6, 1.8, 2.2]   # Fenster aufsteigend
+        for i, w in enumerate(windows):
+            r = rolling_map.get(w)
+            if r is None:
+                continue
+            ax1.plot(r.index, r.values,
+                     color=cmap(i), linewidth=lws[i],
+                     label=f'Roll-{w}d', alpha=0.85)
+
+        ax1.axhline(0, color='black', linewidth=0.9)
+        ax1.axhline(daily_ic.median(), color='navy', linewidth=0.8,
+                    linestyle=':', alpha=0.5,
                     label=f'Gesamt-Median: {daily_ic.median():+.4f}')
 
-        # Jahrstrennlinien
-        for yr in range(daily_ic.index[0].year + 1, daily_ic.index[-1].year + 1):
-            ax1.axvline(pd.Timestamp(f'{yr}-01-01'), color='gray',
-                        linewidth=0.6, linestyle='--', alpha=0.4)
-
-        # Negative Phasen grau hinterlegen
+        # Negative Phasen rot hinterlegen
         neg = daily_ic < 0
-        in_neg = False
-        neg_start = None
+        in_neg, neg_start = False, None
         for dt, is_neg in neg.items():
             if is_neg and not in_neg:
-                neg_start = dt
-                in_neg = True
+                neg_start, in_neg = dt, True
             elif not is_neg and in_neg:
-                ax1.axvspan(neg_start, dt, alpha=0.07, color='red')
+                ax1.axvspan(neg_start, dt, alpha=0.06, color='red')
                 in_neg = False
         if in_neg:
-            ax1.axvspan(neg_start, daily_ic.index[-1], alpha=0.07, color='red')
+            ax1.axvspan(neg_start, daily_ic.index[-1], alpha=0.06, color='red')
 
-        ax1.set_title(f"Täglicher & Rolling Rank-IC (Spearman){title_sfx}",
-                      fontsize=13, fontweight='bold')
+        for yr in range(daily_ic.index[0].year + 1, daily_ic.index[-1].year + 1):
+            ax1.axvline(pd.Timestamp(f'{yr}-01-01'), color='gray',
+                        linewidth=0.5, linestyle='--', alpha=0.4)
+
+        ax1.set_title(f"Täglicher & Rolling Rank-IC (Spearman){title_sfx}  "
+                      f"[Fenster: {windows}]",
+                      fontsize=12, fontweight='bold')
         ax1.set_ylabel("Rank IC")
-        ax1.legend(loc='upper left', fontsize=8)
+        ax1.legend(loc='upper left', fontsize=7, ncol=3)
         ax1.grid(True, alpha=0.2)
         ax1.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m'))
         plt.setp(ax1.get_xticklabels(), visible=False)
 
-        # ── Panel 2: Jährliche IC-Heatmap (Monats-Auflösung) ─────────────────
+        # ── Panel 2: Monatlicher Ø-IC ─────────────────────────────────────────
         ax2 = fig.add_subplot(gs[1])
         monthly = daily_ic.resample('ME').mean()
         ax2.bar(monthly.index, monthly.values,
@@ -750,14 +759,11 @@ def plot_rolling_ic(
         for yr in range(daily_ic.index[0].year + 1, daily_ic.index[-1].year + 1):
             ax2.axvline(pd.Timestamp(f'{yr}-01-01'), color='gray',
                         linewidth=0.6, linestyle='--', alpha=0.4)
-
-        # Jahres-Ø als Text
         for yr, grp in daily_ic.groupby(daily_ic.index.year):
             mid = pd.Timestamp(f'{yr}-07-01')
-            ax2.text(mid, ax2.get_ylim()[1] * 0.85 if ax2.get_ylim()[1] != 0 else 0.02,
-                     f'{grp.mean():+.3f}', ha='center', fontsize=7.5,
-                     color='#333', fontweight='bold')
-
+            ax2.text(mid, 0.02, f'{grp.mean():+.3f}',
+                     ha='center', fontsize=7.5, color='#333', fontweight='bold',
+                     transform=ax2.get_xaxis_transform())
         ax2.set_title("Monatlicher Ø-IC (mit Jahres-Durchschnitt)", fontsize=11)
         ax2.set_ylabel("Ø IC")
         ax2.legend(loc='upper left', fontsize=8)
@@ -770,13 +776,13 @@ def plot_rolling_ic(
         ax3.plot(cumic.index, cumic.values,
                  color='#6A1B9A', linewidth=1.8, label='Kumulativer IC')
         ax3.fill_between(cumic.index, cumic.values, 0,
-                         where=(cumic > 0), alpha=0.15, color='#2E7D32')
+                         where=(cumic >= 0), alpha=0.15, color='#2E7D32')
         ax3.fill_between(cumic.index, cumic.values, 0,
                          where=(cumic < 0), alpha=0.15, color='#C62828')
         ax3.axhline(0, color='black', linewidth=0.8)
         for yr in range(daily_ic.index[0].year + 1, daily_ic.index[-1].year + 1):
             ax3.axvline(pd.Timestamp(f'{yr}-01-01'), color='gray',
-                        linewidth=0.6, linestyle='--', alpha=0.4)
+                        linewidth=0.5, linestyle='--', alpha=0.4)
         ax3.set_title("Kumulativer IC (Langzeit-Trend)", fontsize=11)
         ax3.set_ylabel("Kum. IC")
         ax3.set_xlabel("Datum")
@@ -789,32 +795,28 @@ def plot_rolling_ic(
         logger.success(f"Rolling-IC-Chart gespeichert: {save_path}")
 
     except Exception as e:
-        logger.warning(f"plot_rolling_ic Fehler: {e}")
+        import traceback
+        logger.warning(f"plot_rolling_ic Fehler: {e}\n{traceback.format_exc()}")
+
+
+IC_WINDOWS = [5, 10, 15, 20, 30, 40, 50, 60]
 
 
 def rolling_ic_report(
     daily_ic: pd.Series,
-    window:   int = 60,
+    windows:  list[int] = IC_WINDOWS,
     label:    str = "",
-) -> None:
+) -> dict[int, pd.Series]:
     """
-    Druckt Rolling-IC-Statistiken:
-      - Median Rolling IC (60-Tage-Fenster)
-      - % der Tage mit IC < 0
-      - Längste zusammenhängende Phase mit negativem IC (in Tagen)
+    Berechnet und druckt Rolling-IC-Statistiken für alle Fenster in `windows`.
 
-    Parameters
-    ----------
-    daily_ic : pd.Series(date → ic_wert) aus compute_daily_ic()
-    window   : Rollierendes Fenster in Handelstagen
-    label    : optionale Kopfzeile
+    Returns
+    -------
+    dict {window: pd.Series(rolling_mean_ic)}
     """
     if daily_ic.empty:
         print("\n  [WARN] Keine IC-Daten verfügbar.")
-        return
-
-    rolling = daily_ic.rolling(window=window, min_periods=max(5, window // 4))
-    roll_median = rolling.median()
+        return {}
 
     pct_negative = (daily_ic < 0).mean() * 100
 
@@ -828,17 +830,26 @@ def rolling_ic_report(
         else:
             cur_streak  = 0
 
-    hdr = f"  ROLLING RANK-IC  (Fenster={window} Tage){f'  [{label}]' if label else ''}"
+    hdr = f"  ROLLING RANK-IC{f'  [{label}]' if label else ''}"
     print("\n" + "─" * 80)
     print(hdr)
     print("─" * 80)
     print(f"  Tage mit IC-Daten             : {len(daily_ic):>6d}")
     print(f"  Ø täglicher IC                : {daily_ic.mean():>+.4f}")
     print(f"  Median täglicher IC           : {daily_ic.median():>+.4f}")
-    print(f"  Median Rolling-IC ({window}d)      : {roll_median.dropna().median():>+.4f}")
     print(f"  % Tage mit IC < 0             : {pct_negative:>6.1f}%")
     print(f"  Längste negative Streak       : {max_streak:>6d} Tage")
     print(f"  IC-Stabilitäts-Score          : {(100 - pct_negative):.1f}% positive Tage")
+
+    # Rolling-IC für alle Fenster
+    rolling_map: dict[int, pd.Series] = {}
+    print(f"\n  Rolling-IC Mediane pro Fenster:")
+    for w in windows:
+        r = daily_ic.rolling(window=w, min_periods=max(1, w // 4)).mean()
+        rolling_map[w] = r
+        pct_neg_r = (r < 0).mean() * 100
+        print(f"    Fenster {w:>3d}d: Median={r.dropna().median():>+.4f}  "
+              f"Ø={r.dropna().mean():>+.4f}  Tage<0={pct_neg_r:.1f}%")
 
     # Jahres-Aufschlüsselung des IC
     print(f"\n  Jährlicher Ø IC:")
@@ -847,6 +858,41 @@ def rolling_ic_report(
         bar     = "█" * bar_len
         print(f"    {yr}: {grp.mean():>+.4f}  {bar}")
     print("─" * 80)
+    return rolling_map
+
+
+def save_ic_json(
+    daily_ic:    pd.Series,
+    rolling_map: dict[int, pd.Series],
+    save_path:   str,
+    windows:     list[int] = IC_WINDOWS,
+) -> None:
+    """
+    Speichert IC-Zeitreihe + alle Rolling-IC-Fenster als JSON und CSV.
+
+    Format (JSON):
+    [{"date": "2020-02-10", "ic": 0.12,
+      "ic_roll_5": ..., "ic_roll_10": ..., ..., "ic_roll_60": ...}, ...]
+    """
+    records = []
+    for ts in daily_ic.index:
+        rec = {'date': str(ts.date()), 'ic': round(float(daily_ic[ts]), 6)}
+        for w in windows:
+            key = f'ic_roll_{w}'
+            val = rolling_map.get(w)
+            rec[key] = round(float(val[ts]), 6) if val is not None and ts in val.index else None
+        records.append(rec)
+
+    # JSON
+    json_path = Path(save_path)
+    json_path.write_text(json.dumps(records, indent=2))
+
+    # CSV (gleicher Pfad, andere Endung)
+    csv_path = json_path.with_suffix('.csv')
+    pd.DataFrame(records).to_csv(csv_path, index=False)
+
+    logger.success(f"IC-Artefakt gespeichert: {json_path.name}  ({len(records)} Tage, "
+                   f"{len(windows)} Rolling-Fenster)")
 
 
 def full_tearsheet(
@@ -886,15 +932,16 @@ def full_tearsheet(
     )
 
     # ── 2. Rolling Rank-IC ────────────────────────────────────────────────────
-    logger.info("Rolling Rank-IC berechnen (dauert ~1-2 Min) ...")
+    logger.info("Rolling Rank-IC berechnen ...")
     daily_ic = compute_daily_ic(score_cache, price_cache, horizon=horizon)
-    rolling_ic_report(daily_ic, window=ic_window, label=f"v2_{horizon}d")
+    rolling_map = rolling_ic_report(daily_ic, windows=IC_WINDOWS,
+                                    label=f"v2_{horizon}d")
 
     # ── 3. IC-Chart ───────────────────────────────────────────────────────────
     ic_plot = str(Path("rolling_ic.png"))   # wird in main() überschrieben
-    plot_rolling_ic(daily_ic, window=ic_window,
+    plot_rolling_ic(daily_ic, rolling_map=rolling_map, windows=IC_WINDOWS,
                     save_path=ic_plot, label=f"v2_{horizon}d")
-    return daily_ic
+    return daily_ic, rolling_map
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1152,10 +1199,17 @@ def main() -> None:
         if daily_ic.empty:
             logger.warning("IC-Berechnung ergab 0 Tage – Chart wird übersprungen.")
         else:
-            rolling_ic_report(daily_ic, window=60, label=f'v2_{args.horizon}d')
-            plot_rolling_ic(daily_ic, window=60, save_path=args.ic_plot,
-                            label=f'v2_{args.horizon}d')
+            rolling_map = rolling_ic_report(daily_ic, windows=IC_WINDOWS,
+                                            label=f'v2_{args.horizon}d')
+            plot_rolling_ic(daily_ic, rolling_map=rolling_map, windows=IC_WINDOWS,
+                            save_path=args.ic_plot, label=f'v2_{args.horizon}d')
             logger.success(f"IC-Chart gespeichert: {args.ic_plot}")
+
+            # IC-Zeitreihe + alle Rolling-Fenster als JSON + CSV speichern
+            ic_json_path = str(Path(args.ic_plot).with_name(
+                f"rolling_ic_v2_{args.horizon}d.json"))
+            save_ic_json(daily_ic, rolling_map,
+                         save_path=ic_json_path, windows=IC_WINDOWS)
     except Exception as exc:
         logger.error(f"Phase 3 fehlgeschlagen (Grid-Search-Ergebnisse sind trotzdem gültig): {exc}")
         import traceback
