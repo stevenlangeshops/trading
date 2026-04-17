@@ -1682,17 +1682,17 @@ def main() -> None:
                 return (
                     f"  {label:<22} "
                     f"Sharpe={res['sharpe']:+.3f}  "
-                    f"Return={res['return']:+.1f}%  "
-                    f"MaxDD={res['max_dd']:+.1f}%  "
+                    f"Return={res['total_return']:+.1f}%  "
+                    f"MaxDD={res['max_drawdown']:+.1f}%  "
                     f"Trades={res['n_trades']}"
                 )
 
             logger.info("─" * 60)
             logger.info(_fmt(res_full, "Full-Universe"))
             logger.info(_fmt(res_ex,   f"Ex-{len(exclude_tickers)}-Tickers"))
-            delta_sharpe = res_ex['sharpe']  - res_full['sharpe']
-            delta_ret    = res_ex['return']  - res_full['return']
-            delta_dd     = res_ex['max_dd']  - res_full['max_dd']
+            delta_sharpe = res_ex['sharpe']       - res_full['sharpe']
+            delta_ret    = res_ex['total_return'] - res_full['total_return']
+            delta_dd     = res_ex['max_drawdown'] - res_full['max_drawdown']
             logger.info(
                 f"  {'Delta':<22} "
                 f"Sharpe={delta_sharpe:+.3f}  "
@@ -1720,10 +1720,14 @@ def main() -> None:
             # CSV-Export
             robustness_csv = str(Path(args.policy_csv).with_name("universe_robustness.csv"))
             pd.DataFrame([
-                {**{'run': 'Full-Universe',            'exclude': ''},
-                 **{k: res_full[k] for k in ('sharpe','return','max_dd','n_trades','win_rate','avg_hold_days')}},
-                {**{'run': f'Ex-{len(exclude_tickers)}-Tickers', 'exclude': ','.join(exclude_tickers)},
-                 **{k: res_ex[k]   for k in ('sharpe','return','max_dd','n_trades','win_rate','avg_hold_days')}},
+                {'run': 'Full-Universe', 'exclude': '',
+                 'sharpe': res_full['sharpe'], 'total_return_%': res_full['total_return'],
+                 'max_drawdown_%': res_full['max_drawdown'], 'n_trades': res_full['n_trades'],
+                 'win_rate_%': res_full['win_rate'], 'avg_hold_days': res_full['avg_hold_days']},
+                {'run': f'Ex-{len(exclude_tickers)}-Tickers', 'exclude': ','.join(exclude_tickers),
+                 'sharpe': res_ex['sharpe'], 'total_return_%': res_ex['total_return'],
+                 'max_drawdown_%': res_ex['max_drawdown'], 'n_trades': res_ex['n_trades'],
+                 'win_rate_%': res_ex['win_rate'], 'avg_hold_days': res_ex['avg_hold_days']},
             ]).to_csv(robustness_csv, index=False)
             logger.success(f"  Robustness-CSV gespeichert: {robustness_csv}")
 
