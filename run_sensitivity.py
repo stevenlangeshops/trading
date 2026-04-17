@@ -1469,6 +1469,8 @@ def parse_args() -> argparse.Namespace:
                    help='Vorhersage-Horizont in Handelstagen')
     p.add_argument('--top-n',          type=int, default=15,
                    help='Anzahl Top-Ergebnisse in der Ausgabe')
+    p.add_argument('--skip-grid-search', action='store_true', default=False,
+                   help='Grid Search überspringen (auch wenn CSV noch nicht existiert)')
     p.add_argument('--policy-compare', action='store_true', default=False,
                    help='Policy-Vergleich Baseline/A1/A2/A3/B ausführen')
     p.add_argument('--policy-csv',     default='policy_comparison.csv',
@@ -1501,17 +1503,25 @@ def main() -> None:
         fname = Path(fold['ckpt_path']).name
         fold['ckpt_path'] = str(ckpt_dir / fname)
 
-    asset_map = load_asset_map(args.asset_map)
+    asset_map   = load_asset_map(args.asset_map)
+    cache_path  = args.score_cache
+    score_exists = cache_path and Path(cache_path).exists()
 
-    logger.info("Feature-Panel aufbauen (dauert ~30s) ...")
-    features = build_features_from_parquet(args.data_dir)
+    # ── Features nur laden wenn Score-Cache NICHT vorhanden ──────────────────
+    # Features werden ausschließlich für build_score_cache() gebraucht.
+    # Wenn der Cache schon existiert, können wir uns die ~15s sparen.
+    if score_exists:
+        logger.info(f"Score-Cache vorhanden → Feature-Panel wird übersprungen.")
+        features = None
+    else:
+        logger.info("Feature-Panel aufbauen (dauert ~30s) ...")
+        features = build_features_from_parquet(args.data_dir)
 
     logger.info("Price-Cache aufbauen ...")
     price_cache = build_price_cache_local(asset_map, args.data_dir)
 
     # ── Phase 1: Score-Cache (einmalig oder aus Datei laden) ─────────────────
-    cache_path = args.score_cache
-    if cache_path and Path(cache_path).exists():
+    if score_exists:
         logger.info(f"Score-Cache aus Datei laden: {cache_path}")
         score_cache = load_score_cache(cache_path)
     else:
@@ -1521,20 +1531,25 @@ def main() -> None:
             save_score_cache(score_cache, cache_path)
 
     # ── Phase 2: Grid Search + Plots ─────────────────────────────────────────
-    df = grid_search(score_cache, price_cache)
+    # Grid Search überspringen wenn Output-CSV bereits vorhanden und Score-Cache unverändert
+    grid_csv = Path(args.output)
+    if (grid_csv.exists() and score_exists) or args.skip_grid_search:
+        logger.info(f"Grid-Search-CSV vorhanden → Grid Search wird übersprungen: {grid_csv}")
+        df = pd.read_csv(grid_csv, index_col=0)
+    else:
+        df = grid_search(score_cache, price_cache)
+        df.to_csv(args.output)
+        logger.success(f"CSV gespeichert: {args.output}")
 
-    df.to_csv(args.output)
-    logger.success(f"CSV gespeichert: {args.output}")
-
-    plot_top_equity_curves(score_cache, price_cache, df,
-                           save_path=args.plot)
+        plot_top_equity_curves(score_cache, price_cache, df,
+                               save_path=args.plot)
 
     print_summary(df, top_n=args.top_n)
 
     # Subperioden-Analyse für Referenz-Konfiguration
     ref_result = run_portfolio(score_cache, price_cache, PortfolioParams())
     subperiod_report(ref_result['equity'], ref_result['equity_dates'],
-                     label=f'n7/rb3/hs25%/f0.1%')
+                     label='n7/rb3/hs20%/f0.1%')
 
     # ── Phase 3: Rolling Rank-IC ──────────────────────────────────────────────
     logger.info("═" * 60)
