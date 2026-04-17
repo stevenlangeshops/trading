@@ -365,17 +365,7 @@ def run_portfolio(
     -------
     dict mit Backtest-Metriken + equity/equity_dates + days_n_max_reduced.
     """
-    spy_prices_raw = price_cache.get('SPY')
-
-    # SPY-Index einmalig tz-normalisieren (UTC → tz-naive) damit alle Vergleiche
-    # mit den tz-naiven Score-Cache-Dates funktionieren.
-    if spy_prices_raw is not None:
-        spy_prices = pd.Series(
-            spy_prices_raw.values,
-            index=_strip_tz_index(spy_prices_raw.index),
-        )
-    else:
-        spy_prices = None
+    spy_prices = price_cache.get('SPY')   # bereits tz-naive (aus build_price_cache_local)
 
     # SPY 200-Tage-SMA einmalig vorberechnen (für SPY200-Policy)
     spy_sma200: Optional[pd.Series] = None
@@ -652,12 +642,23 @@ def build_features_from_parquet(data_dir: str | Path) -> pd.DataFrame:
 
 
 def build_price_cache_local(asset_map: Dict[str, int], data_dir: str | Path) -> dict:
-    """Baut price_cache aus Parquet-Dateien."""
+    """
+    Baut price_cache aus Parquet-Dateien.
+
+    Normalisiert alle Series-Indices auf tz-naive (UTC → ohne Timezone),
+    damit Vergleiche mit den tz-naiven Score-Cache-Keys überall funktionieren.
+    """
     from strategy.backtest import build_price_cache
     assets = list(asset_map.keys())
     if 'SPY' not in assets:
         assets.append('SPY')
-    return build_price_cache(assets, raw_dir=Path(data_dir))
+    raw = build_price_cache(assets, raw_dir=Path(data_dir))
+    normalized: dict = {}
+    for asset, ps in raw.items():
+        if ps is not None and hasattr(ps.index, 'tz') and ps.index.tz is not None:
+            ps = pd.Series(ps.values, index=ps.index.tz_localize(None), name=ps.name)
+        normalized[asset] = ps
+    return normalized
 
 
 # ══════════════════════════════════════════════════════════════════════════════
