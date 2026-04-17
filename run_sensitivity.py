@@ -1197,40 +1197,23 @@ def policy_comparison(
 
     df = pd.DataFrame(rows).set_index('run')
 
-    # ── Konsolen-Report ───────────────────────────────────────────────────────
-    import sys
-    W = 110
-    logger.info("Policy-Report wird gedruckt ...")
-    lines = []
-    lines.append("\n" + "=" * W)
-    lines.append("  POLICY-VERGLEICH: Baseline vs. A1(IC20) / A2(IC30) / A3(IC40) / B(SPY200)")
-    lines.append(f"  n_max={base_params.n_max} rb={base_params.rotation_buffer} "
-                 f"hs={base_params.hard_stop_pct:.0%} fees={base_params.fees:.3%}  "
-                 f"→ n_max auf 3 wenn Trigger aktiv")
-    lines.append("=" * W)
-    cols_main = ['policy','sharpe','total_return_%','max_drawdown_%',
-                 'n_trades','win_rate_%','avg_hold_days','pct_days_reduced']
-    lines.append(df[cols_main].to_string())
-    lines.append("-" * W)
-    lines.append("  SUBPERIODEN")
-    cols_sub = ['policy','ret_2022_%','dd_2022_%','ret_2023_%','ret_2024_%',
-                'ret_2025_%','dd_2025_%']
-    lines.append(df[cols_sub].to_string())
-    lines.append("-" * W)
+    # ── Konsolen-Report (kurz – Details in CSV) ──────────────────────────────
     base_row = df.loc['Baseline']
-    lines.append(f"  {'Run':12s}  {'dSharpe':>8s}  {'dReturn':>10s}  {'dMaxDD':>8s}  "
-                 f"{'dDD-2022':>10s}  {'dDD-2025':>10s}")
+    logger.info("─── DELTA vs. Baseline ──────────────────────────────────────────────")
+    logger.info(f"  {'Run':12s}  {'dSharpe':>8s}  {'dReturn':>10s}  {'dMaxDD':>8s}  "
+                f"{'dDD-2022':>10s}  {'dDD-2025':>10s}")
     for run_name, row in df.iterrows():
         if run_name == 'Baseline':
+            logger.info(f"  {'Baseline':12s}  {'---':>8s}  "
+                        f"{'Ref':>10s}  {'---':>8s}  {'---':>10s}  {'---':>10s}")
             continue
-        lines.append(f"  {run_name:12s}  "
-                     f"{row['sharpe'] - base_row['sharpe']:>+8.3f}  "
-                     f"{row['total_return_%'] - base_row['total_return_%']:>+10.1f}%  "
-                     f"{row['max_drawdown_%'] - base_row['max_drawdown_%']:>+8.1f}%  "
-                     f"{row['dd_2022_%'] - base_row['dd_2022_%']:>+10.1f}%  "
-                     f"{row['dd_2025_%'] - base_row['dd_2025_%']:>+10.1f}%")
-    lines.append("=" * W)
-    print("\n".join(lines), flush=True)
+        logger.info(f"  {run_name:12s}  "
+                    f"{row['sharpe'] - base_row['sharpe']:>+8.3f}  "
+                    f"{row['total_return_%'] - base_row['total_return_%']:>+10.1f}%  "
+                    f"{row['max_drawdown_%'] - base_row['max_drawdown_%']:>+8.1f}%  "
+                    f"{row['dd_2022_%'] - base_row['dd_2022_%']:>+10.1f}%  "
+                    f"{row['dd_2025_%'] - base_row['dd_2025_%']:>+10.1f}%")
+    logger.info("─────────────────────────────────────────────────────────────────────")
 
     if save_path:
         df.reset_index().to_csv(save_path, index=False)
