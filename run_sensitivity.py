@@ -1031,6 +1031,10 @@ def parse_args() -> argparse.Namespace:
                    help='Ausgabe-CSV')
     p.add_argument('--plot',       default='sensitivity_top_equity.png',
                    help='Ausgabe-PNG (Top-5 Equity-Kurven)')
+    p.add_argument('--ic-plot',    default='rolling_ic.png',
+                   help='Ausgabe-PNG (Rolling Rank-IC Chart)')
+    p.add_argument('--horizon',    type=int, default=7,
+                   help='Vorhersage-Horizont in Handelstagen')
     p.add_argument('--top-n',      type=int, default=15,
                    help='Anzahl Top-Ergebnisse in der Ausgabe')
     p.add_argument('--device',     default=None,
@@ -1043,7 +1047,6 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
 
-    # Repo-Verzeichnis in sys.path aufnehmen
     repo_dir = Path(args.repo_dir).resolve()
     if str(repo_dir) not in sys.path:
         sys.path.insert(0, str(repo_dir))
@@ -1055,7 +1058,6 @@ def main() -> None:
     # ── Artefakte laden ───────────────────────────────────────────────────────
     fold_results = load_walk_forward_json(args.walk_json)
 
-    # Checkpoint-Pfade auf --ckpt-dir umbiegen (falls aus Archiv extrahiert)
     ckpt_dir = Path(args.ckpt_dir)
     for fold in fold_results:
         fname = Path(fold['ckpt_path']).name
@@ -1071,12 +1073,11 @@ def main() -> None:
 
     # ── Phase 1: Score-Cache (einmalig) ──────────────────────────────────────
     score_cache = build_score_cache(features, fold_results, asset_map,
-                                     device=args.device)
+                                    device=args.device)
 
-    # ── Phase 2: Grid Search ──────────────────────────────────────────────────
+    # ── Phase 2: Grid Search + Plots ─────────────────────────────────────────
     df = grid_search(score_cache, price_cache)
 
-    # ── Ausgabe ───────────────────────────────────────────────────────────────
     df.to_csv(args.output)
     logger.success(f"CSV gespeichert: {args.output}")
 
@@ -1084,6 +1085,21 @@ def main() -> None:
                            save_path=args.plot)
 
     print_summary(df, top_n=args.top_n)
+
+    # Subperioden-Analyse für Referenz-Konfiguration
+    ref_result = run_portfolio(score_cache, price_cache, PortfolioParams())
+    subperiod_report(ref_result['equity'], ref_result['equity_dates'],
+                     label=f'n7/rb3/hs25%/f0.1%')
+
+    # ── Phase 3: Rolling Rank-IC ──────────────────────────────────────────────
+    logger.info("═" * 60)
+    logger.info("  Phase 3: Rolling Rank-IC")
+    logger.info("═" * 60)
+    daily_ic = compute_daily_ic(score_cache, price_cache, horizon=args.horizon)
+    rolling_ic_report(daily_ic, window=60, label=f'v2_{args.horizon}d')
+    plot_rolling_ic(daily_ic, window=60, save_path=args.ic_plot,
+                    label=f'v2_{args.horizon}d')
+    logger.success(f"IC-Chart gespeichert: {args.ic_plot}")
 
 
 if __name__ == '__main__':
