@@ -313,13 +313,17 @@ def step_copy_data():
 
 # ── Schritt 4: Features bauen ────────────────────────────────────────────────
 
-def step_build_panel():
-    log_write(f"\n{'='*60}\nSCHRITT 4: build_panel() [{elapsed()}]\n{'='*60}")
+def step_build_panel(sector_neutral: bool = False):
+    mode = "sektor-neutral" if sector_neutral else "cross-sectional"
+    log_write(f"\n{'='*60}\nSCHRITT 4: build_panel() [{elapsed()}]  Modus={mode}\n{'='*60}")
     sys.path.insert(0, str(REPO_DIR))
     os.chdir(str(REPO_DIR))
 
     from features.engineer import build_panel
-    features, targets = build_panel(timeframe="1d", horizon=11, min_rows=300)
+    features, targets = build_panel(
+        timeframe="1d", horizon=11, min_rows=300,
+        sector_neutral=sector_neutral,
+    )
     log_write(f"  features: {features.shape}")
     log_write(f"  targets:  {targets.shape}")
     log_write(f"  Assets:   {features.index.get_level_values('asset').nunique()}")
@@ -1343,6 +1347,12 @@ def main() -> int:
     RUN_V2_MULTI   = False
     V2_MAX_ASSETS  = 0    # 0 = alle Assets (260 S&P 500)
 
+    # ── Sektor-Neutrale Normalisierung ───────────────────────────────
+    # False = Cross-Sectional z-Score über alle Assets (bisheriger Standard)
+    # True  = z-Score pro Tag UND pro GICS-Sektor (neues Training)
+    # Im Kaggle-Notebook: os.environ["KAGGLE_SECTOR_NEUTRAL"] = "1" setzen.
+    SECTOR_NEUTRAL = os.environ.get("KAGGLE_SECTOR_NEUTRAL", "").strip() == "1"
+
     # ── Smoke-Test-Modus (KAGGLE_SMOKE_TEST=1) ────────────────────────
     # Schneller End-to-End-Test: 15 Assets, 3 Epochen, ~2 Folds.
     # Alle Pipeline-Schritte werden durchlaufen, aber stark verkleinert.
@@ -1369,7 +1379,7 @@ def main() -> int:
         step_install()
         step_copy_data()
 
-        features, targets = step_build_panel()
+        features, targets = step_build_panel(sector_neutral=SECTOR_NEUTRAL)
         asset_map         = step_build_asset_map(features)
 
         if V2_MAX_ASSETS > 0 and len(asset_map) > V2_MAX_ASSETS:

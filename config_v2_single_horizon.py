@@ -47,6 +47,12 @@ class SingleHorizonConfig:
     val_months:   float = 6.0
     step_months:  float = 6.0
 
+    # ── Feature Engineering ──────────────────────────────
+    # False = klassischer Cross-Sectional z-Score (alle Assets pro Tag)
+    # True  = Sektor-neutraler z-Score (pro Tag UND pro GICS-Sektor)
+    #         Erfordert features/sector_map.json im Repo
+    sector_neutral:  bool  = False
+
     # ── Backtest (Run G identisch) ─────────────────────────────────────
     n_max:           int   = 7
     n_mid:           int   = 3

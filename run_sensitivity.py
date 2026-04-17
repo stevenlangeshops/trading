@@ -645,17 +645,29 @@ def load_asset_map(path: str | Path) -> Dict[str, int]:
     return am
 
 
-def build_features_from_parquet(data_dir: str | Path) -> pd.DataFrame:
+def build_features_from_parquet(
+    data_dir: str | Path,
+    sector_neutral: bool = False,
+) -> pd.DataFrame:
     """
     Baut das Feature-Panel aus dem Parquet-Verzeichnis auf.
     Identisch zu step_build_panel() in kaggle_full_run.py.
 
     build_panel() liest RAW_DIR als Modul-Konstante, daher wird sie
     vor dem Import-/Aufruf-Zeitpunkt überschrieben.
+
+    Parameters
+    ----------
+    sector_neutral : bool
+        False = klassischer Cross-Sectional z-Score (Standard)
+        True  = Sektor-neutraler z-Score (pro Tag und GICS-Sektor)
     """
     import features.engineer as eng
     eng.RAW_DIR = Path(data_dir)
-    features, _ = eng.build_panel(timeframe="1d", horizon=11, min_rows=300)
+    features, _ = eng.build_panel(
+        timeframe="1d", horizon=11, min_rows=300,
+        sector_neutral=sector_neutral,
+    )
     return features
 
 
