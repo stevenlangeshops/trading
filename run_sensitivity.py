@@ -305,7 +305,7 @@ def get_effective_n_max(
         if spy_prices is None or spy_sma200 is None:
             return base_n_max, False
         ts = date.tz_localize(None) if (hasattr(date, 'tzinfo') and date.tzinfo) else date
-        # SPY-Kurs am/vor diesem Tag
+        # spy_prices und spy_sma200 sind bereits tz-naive (normalisiert in run_portfolio)
         past_spy = spy_prices[spy_prices.index <= ts]
         if past_spy.empty:
             return base_n_max, False
@@ -361,7 +361,17 @@ def run_portfolio(
     -------
     dict mit Backtest-Metriken + equity/equity_dates + days_n_max_reduced.
     """
-    spy_prices = price_cache.get('SPY')
+    spy_prices_raw = price_cache.get('SPY')
+
+    # SPY-Index einmalig tz-normalisieren (UTC → tz-naive) damit alle Vergleiche
+    # mit den tz-naiven Score-Cache-Dates funktionieren.
+    if spy_prices_raw is not None:
+        spy_prices = pd.Series(
+            spy_prices_raw.values,
+            index=_strip_tz_index(spy_prices_raw.index),
+        )
+    else:
+        spy_prices = None
 
     # SPY 200-Tage-SMA einmalig vorberechnen (für SPY200-Policy)
     spy_sma200: Optional[pd.Series] = None
