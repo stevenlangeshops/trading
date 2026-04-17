@@ -546,56 +546,80 @@ def compute_daily_ic(
     horizon:      int = 7,
 ) -> pd.Series:
     """
-    Berechnet den täglichen Rank-IC (Spearman) zwischen Modell-Score und
-    tatsächlichem Forward-Return.
+    Berechnet den täglichen Rank-IC (Spearman) – vollständig vektorisiert.
 
-    Für jeden Tag t in score_cache:
-      - Scores   = score_cache[t]  (Modell-Vorhersage)
-      - Forward-Return = (price[t+horizon] / price[t]) - 1  (realisiert)
-      - IC = Spearman(scores.rank(), returns.rank())
+    Strategie:
+      1. Einmalig für alle Assets eine Preismatrix (date × asset) aufbauen.
+      2. Forward-Return-Matrix per shift(-horizon) berechnen.
+      3. Pro Tag: Spearman zwischen Modell-Scores und Forward-Returns.
 
-    Returns
-    -------
-    pd.Series(index=date, values=ic) – nur für Tage mit >= 10 gemeinsamen Assets
+    Deutlich schneller als der Asset-für-Asset Loop (~10–30s statt Minuten).
     """
     from scipy.stats import spearmanr
 
-    ic_values: dict[pd.Timestamp, float] = {}
-    sorted_dates = sorted(score_cache.keys())
-    date_set     = set(sorted_dates)
+    logger.info("compute_daily_ic: Preismatrix aufbauen ...")
 
-    for date in sorted_dates:
-        scores = score_cache[date]
-        fwd: dict[str, float] = {}
-        for asset, score in scores.items():
-            ps = price_cache.get(asset)
-            if ps is None:
-                continue
-            # Preis am Tag t
-            idx_t = ps.index.searchsorted(date, side='right') - 1
-            if idx_t < 0:
-                continue
-            p0 = float(ps.iloc[idx_t])
-            d0 = ps.index[idx_t]
-            # Preis am Tag t+horizon (nächster verfügbarer Handelstag)
-            future_dates = ps.index[ps.index > d0]
-            if len(future_dates) < horizon:
-                continue
-            p1 = float(ps.loc[future_dates[horizon - 1]])
-            fwd[asset] = (p1 / p0 - 1) if p0 > 0 else np.nan
+    # ── Preismatrix aufbauen ──────────────────────────────────────────────────
+    all_dates  = sorted(score_cache.keys())
+    all_assets = sorted({a for s in score_cache.values() for a in s.index})
 
-        # Gemeinsame Assets
-        common = [a for a in scores.index if a in fwd and not np.isnan(fwd[a])]
+    price_df = pd.DataFrame(index=all_dates, columns=all_assets, dtype=float)
+
+    for asset in all_assets:
+        ps = price_cache.get(asset)
+        if ps is None:
+            continue
+        ps_clean = ps[~ps.index.duplicated(keep='last')].sort_index()
+        # reindex: für jeden Score-Datum den letzten verfügbaren Preis
+        aligned = ps_clean.reindex(all_dates, method='ffill')
+        price_df[asset] = aligned.values
+
+    logger.info(f"  Preismatrix: {price_df.shape[0]} Tage × {price_df.shape[1]} Assets")
+
+    # ── Forward-Return-Matrix ─────────────────────────────────────────────────
+    # Für jeden Eintrag [t, asset]: Preis in horizon Handelstagen / Preis heute - 1
+    # Wir brauchen die vollständige Preisserie (auch Tage ohne Score) für die
+    # korrekte Vorwärtsverschiebung.
+
+    # Vereinige alle Preisdaten auf einem gemeinsamen täglichen Index
+    all_price_dates = sorted({
+        d for ps in price_cache.values() if ps is not None for d in ps.index
+    })
+    full_price_df = pd.DataFrame(index=all_price_dates, columns=all_assets, dtype=float)
+    for asset in all_assets:
+        ps = price_cache.get(asset)
+        if ps is None:
+            continue
+        ps_clean = ps[~ps.index.duplicated(keep='last')].sort_index()
+        full_price_df[asset] = ps_clean.reindex(all_price_dates, method='ffill')
+
+    # Forward-Return: Preis in `horizon` Handelstagen relativ zu heute
+    fwd_price_df = full_price_df.shift(-horizon)
+    fwd_ret_df   = (fwd_price_df / full_price_df - 1).reindex(all_dates)
+
+    logger.info("  Forward-Return-Matrix berechnet. Spearman pro Tag ...")
+
+    # ── Täglicher Spearman-IC ─────────────────────────────────────────────────
+    ic_values: dict = {}
+    for date in all_dates:
+        scores   = score_cache[date]
+        fwd_row  = fwd_ret_df.loc[date]
+
+        # Schnittmenge: Assets mit Score UND gültigem Forward-Return
+        common   = scores.index.intersection(fwd_row.dropna().index)
         if len(common) < 10:
             continue
 
         sc_vals  = scores[common].values
-        ret_vals = np.array([fwd[a] for a in common])
+        ret_vals = fwd_row[common].values
         corr, _  = spearmanr(sc_vals, ret_vals)
         if not np.isnan(corr):
             ic_values[date] = float(corr)
 
-    return pd.Series(ic_values).sort_index()
+    result = pd.Series(ic_values).sort_index()
+    logger.success(f"  Täglicher IC berechnet: {len(result)} Tage "
+                   f"| Ø IC={result.mean():+.4f} | Median={result.median():+.4f}")
+    return result
 
 
 def plot_rolling_ic(
