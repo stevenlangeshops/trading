@@ -468,11 +468,253 @@ def build_price_cache_local(asset_map: Dict[str, int], data_dir: str | Path) -> 
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# Tearsheet – Subperioden-Analyse + Rolling Rank-IC
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Marktphasen mit ihrer Bedeutung
+DEFAULT_PERIODS = [
+    ("2020       (COVID-Crash + Erholung)", "2020-01-01", "2020-12-31"),
+    ("2021       (Post-COVID Rallye)",       "2021-01-01", "2021-12-31"),
+    ("2022       (Bärenmarkt / Zinsanstieg)","2022-01-01", "2022-12-31"),
+    ("2023-2024  (KI-Rallye)",               "2023-01-01", "2024-12-31"),
+    ("2025+      (Neuland)",                 "2025-01-01", "2099-12-31"),
+]
+
+
+def _period_metrics(equity: list, dates: list, start: str, end: str) -> Optional[dict]:
+    """Berechnet Return / MaxDD / Sharpe für eine Zeitscheibe der Equity-Kurve."""
+    ts  = pd.Timestamp(start)
+    te  = pd.Timestamp(end)
+    idx = [(i, d) for i, d in enumerate(dates) if ts <= d <= te]
+    if len(idx) < 5:
+        return None
+    positions = [i for i, _ in idx]
+    # Equity-Array: equity ist um 1 versetzt gegenüber equity_dates
+    eq = np.array([equity[p + 1] for p in positions])
+    daily_rets = np.diff(eq) / eq[:-1]
+    ret    = (eq[-1] / eq[0] - 1) * 100
+    peaks  = np.maximum.accumulate(eq)
+    max_dd = float(((eq - peaks) / peaks).min()) * 100
+    sharpe = (float(np.mean(daily_rets) / np.std(daily_rets)) * np.sqrt(252)
+              if len(daily_rets) > 1 and np.std(daily_rets) > 0 else 0.0)
+    return {'return': ret, 'max_dd': max_dd, 'sharpe': sharpe, 'n_days': len(idx)}
+
+
+def subperiod_report(
+    equity:       list,
+    equity_dates: list,
+    periods:      Optional[list] = None,
+    label:        str = "",
+) -> None:
+    """
+    Druckt Return / Max-DD / Sharpe für jede Marktphase isoliert.
+
+    Parameters
+    ----------
+    equity       : Equity-Liste aus run_portfolio()
+    equity_dates : Datumsliste aus run_portfolio()
+    periods      : [(name, start, end), ...] – Default = DEFAULT_PERIODS
+    label        : optionale Kopfzeile (z.B. Konfigurations-Label)
+    """
+    if periods is None:
+        periods = DEFAULT_PERIODS
+
+    hdr = f"  SUBPERIODEN-ANALYSE{f'  [{label}]' if label else ''}"
+    print("\n" + "─" * 80)
+    print(hdr)
+    print("─" * 80)
+    print(f"  {'Phase':<42} {'Return':>8}  {'MaxDD':>7}  {'Sharpe':>7}  {'Tage':>5}")
+    print("  " + "─" * 75)
+
+    for name, start, end in periods:
+        m = _period_metrics(equity, equity_dates, start, end)
+        if m is None:
+            print(f"  {name:<42} {'–':>8}  {'–':>7}  {'–':>7}  {'–':>5}")
+        else:
+            print(f"  {name:<42} "
+                  f"{m['return']:>+7.1f}%  "
+                  f"{m['max_dd']:>6.1f}%  "
+                  f"{m['sharpe']:>7.3f}  "
+                  f"{m['n_days']:>5d}")
+
+    print("─" * 80)
+
+
+def compute_daily_ic(
+    score_cache:  ScoreCache,
+    price_cache:  dict,
+    horizon:      int = 7,
+) -> pd.Series:
+    """
+    Berechnet den täglichen Rank-IC (Spearman) zwischen Modell-Score und
+    tatsächlichem Forward-Return.
+
+    Für jeden Tag t in score_cache:
+      - Scores   = score_cache[t]  (Modell-Vorhersage)
+      - Forward-Return = (price[t+horizon] / price[t]) - 1  (realisiert)
+      - IC = Spearman(scores.rank(), returns.rank())
+
+    Returns
+    -------
+    pd.Series(index=date, values=ic) – nur für Tage mit >= 10 gemeinsamen Assets
+    """
+    from scipy.stats import spearmanr
+
+    ic_values: dict[pd.Timestamp, float] = {}
+    sorted_dates = sorted(score_cache.keys())
+    date_set     = set(sorted_dates)
+
+    for date in sorted_dates:
+        scores = score_cache[date]
+        fwd: dict[str, float] = {}
+        for asset, score in scores.items():
+            ps = price_cache.get(asset)
+            if ps is None:
+                continue
+            # Preis am Tag t
+            idx_t = ps.index.searchsorted(date, side='right') - 1
+            if idx_t < 0:
+                continue
+            p0 = float(ps.iloc[idx_t])
+            d0 = ps.index[idx_t]
+            # Preis am Tag t+horizon (nächster verfügbarer Handelstag)
+            future_dates = ps.index[ps.index > d0]
+            if len(future_dates) < horizon:
+                continue
+            p1 = float(ps.loc[future_dates[horizon - 1]])
+            fwd[asset] = (p1 / p0 - 1) if p0 > 0 else np.nan
+
+        # Gemeinsame Assets
+        common = [a for a in scores.index if a in fwd and not np.isnan(fwd[a])]
+        if len(common) < 10:
+            continue
+
+        sc_vals  = scores[common].values
+        ret_vals = np.array([fwd[a] for a in common])
+        corr, _  = spearmanr(sc_vals, ret_vals)
+        if not np.isnan(corr):
+            ic_values[date] = float(corr)
+
+    return pd.Series(ic_values).sort_index()
+
+
+def rolling_ic_report(
+    daily_ic: pd.Series,
+    window:   int = 60,
+    label:    str = "",
+) -> None:
+    """
+    Druckt Rolling-IC-Statistiken:
+      - Median Rolling IC (60-Tage-Fenster)
+      - % der Tage mit IC < 0
+      - Längste zusammenhängende Phase mit negativem IC (in Tagen)
+
+    Parameters
+    ----------
+    daily_ic : pd.Series(date → ic_wert) aus compute_daily_ic()
+    window   : Rollierendes Fenster in Handelstagen
+    label    : optionale Kopfzeile
+    """
+    if daily_ic.empty:
+        print("\n  [WARN] Keine IC-Daten verfügbar.")
+        return
+
+    rolling = daily_ic.rolling(window=window, min_periods=max(5, window // 4))
+    roll_median = rolling.median()
+
+    pct_negative = (daily_ic < 0).mean() * 100
+
+    # Längste zusammenhängende negative Streak
+    neg_flags = (daily_ic < 0).astype(int).values
+    max_streak = cur_streak = 0
+    for v in neg_flags:
+        if v:
+            cur_streak += 1
+            max_streak  = max(max_streak, cur_streak)
+        else:
+            cur_streak  = 0
+
+    hdr = f"  ROLLING RANK-IC  (Fenster={window} Tage){f'  [{label}]' if label else ''}"
+    print("\n" + "─" * 80)
+    print(hdr)
+    print("─" * 80)
+    print(f"  Tage mit IC-Daten             : {len(daily_ic):>6d}")
+    print(f"  Ø täglicher IC                : {daily_ic.mean():>+.4f}")
+    print(f"  Median täglicher IC           : {daily_ic.median():>+.4f}")
+    print(f"  Median Rolling-IC ({window}d)      : {roll_median.dropna().median():>+.4f}")
+    print(f"  % Tage mit IC < 0             : {pct_negative:>6.1f}%")
+    print(f"  Längste negative Streak       : {max_streak:>6d} Tage")
+    print(f"  IC-Stabilitäts-Score          : {(100 - pct_negative):.1f}% positive Tage")
+
+    # Jahres-Aufschlüsselung des IC
+    print(f"\n  Jährlicher Ø IC:")
+    for yr, grp in daily_ic.groupby(daily_ic.index.year):
+        bar_len = max(0, int((grp.mean() + 0.15) / 0.30 * 20))
+        bar     = "█" * bar_len
+        print(f"    {yr}: {grp.mean():>+.4f}  {bar}")
+    print("─" * 80)
+
+
+def full_tearsheet(
+    score_cache:  ScoreCache,
+    price_cache:  dict,
+    df:           pd.DataFrame,
+    horizon:      int = 7,
+    ic_window:    int = 60,
+) -> None:
+    """
+    Vollständiges Tearsheet für die Referenz-Konfiguration (n7/rb3/hs25%/f0.1%):
+      1. Subperioden-Analyse (Jahres-/Marktphasen-Slices)
+      2. Rolling Rank-IC (60-Tage-Fenster)
+
+    Berechnet die Equity-Kurve der Referenz-Konfiguration neu (schnell, da
+    score_cache bereits existiert) und zeigt beide Analysen.
+    """
+    # ── Referenz-Equity ───────────────────────────────────────────────────────
+    ref_row = df[(df['n_max'] == 7) & (df['rotation_buffer'] == 3) &
+                 (df['hard_stop_pct'] == 0.25) & (df['fees'] == 0.001)]
+    ref_params = PortfolioParams()   # defaults = Referenz
+    if not ref_row.empty:
+        r = ref_row.iloc[0]
+        print(f"\n  Tearsheet für Referenz-Konfiguration "
+              f"(Rang {ref_row.index[0]} von {len(df)}): "
+              f"Sharpe={r['sharpe']:.3f}  Return={r['total_return_%']:+.1f}%")
+    else:
+        print("\n  Tearsheet für Default-Konfiguration (n7/rb3/hs25%/f0.1%)")
+
+    ref_result = run_portfolio(score_cache, price_cache, ref_params)
+
+    # ── 1. Subperioden-Analyse ────────────────────────────────────────────────
+    subperiod_report(
+        ref_result['equity'],
+        ref_result['equity_dates'],
+        label="n7/rb3/hs25%/f0.1%",
+    )
+
+    # ── 2. Rolling Rank-IC ────────────────────────────────────────────────────
+    logger.info("Rolling Rank-IC berechnen (dauert ~1-2 Min) ...")
+    daily_ic = compute_daily_ic(score_cache, price_cache, horizon=horizon)
+    rolling_ic_report(daily_ic, window=ic_window, label=f"v2_{horizon}d")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # Ausgabe & Visualisierung
 # ══════════════════════════════════════════════════════════════════════════════
 
-def print_summary(df: pd.DataFrame, top_n: int = 15) -> None:
-    """Gibt die Top-N Ergebnisse als formatierte Tabelle aus."""
+def print_summary(
+    df:           pd.DataFrame,
+    top_n:        int             = 15,
+    score_cache:  Optional[ScoreCache] = None,
+    price_cache:  Optional[dict]       = None,
+    horizon:      int             = 7,
+    ic_window:    int             = 60,
+) -> None:
+    """
+    Gibt die Top-N Ergebnisse als formatierte Tabelle aus.
+
+    Wenn score_cache und price_cache übergeben werden, wird zusätzlich
+    das vollständige Tearsheet berechnet (Subperioden + Rolling IC).
+    """
     print("\n" + "═" * 100)
     print("  SENSITIVITÄTSANALYSE — TOP-Ergebnisse nach Sharpe")
     print("═" * 100)
@@ -500,6 +742,11 @@ def print_summary(df: pd.DataFrame, top_n: int = 15) -> None:
     for col in ['n_max', 'rotation_buffer', 'hard_stop_pct', 'fees']:
         print(f"  {col:18s}: " +
               "  ".join(f"{v}→{df[df[col]==v]['sharpe'].mean():.3f}" for v in sorted(df[col].unique())))
+
+    # ── Erweitertes Tearsheet (optional) ─────────────────────────────────────
+    if score_cache is not None and price_cache is not None:
+        full_tearsheet(score_cache, price_cache, df,
+                       horizon=horizon, ic_window=ic_window)
 
 
 def plot_top_equity_curves(
