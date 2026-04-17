@@ -1496,6 +1496,13 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
+    # Unbuffered stdout: jede print()-Zeile flusht sofort → kein Pipe-Buffer-Blockade
+    # beim Subprocess-Exit (Kaggle-Pipe-Buffer ist klein).
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+    except Exception:
+        pass
+
     args = parse_args()
 
     repo_dir = Path(args.repo_dir).resolve()
@@ -1620,6 +1627,14 @@ def main() -> None:
             logger.error(f"Phase 4 fehlgeschlagen: {exc}")
             import traceback
             traceback.print_exc()
+
+    # Expliziter Flush vor dem Exit – verhindert Blockade beim Pipe-Close
+    try:
+        sys.stdout.flush()
+        sys.stderr.flush()
+    except Exception:
+        pass
+    logger.info("run_sensitivity.py beendet.")
 
 
 if __name__ == '__main__':
