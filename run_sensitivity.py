@@ -178,7 +178,9 @@ def build_score_cache(
         for date in fold_dates:
             scores = predict_cross_section(model, features, asset_map, date, seq_len, device)
             if len(scores) >= 2:
-                cache[date] = scores
+                # Key immer tz-naive speichern – konsistent mit price_cache und load_score_cache
+                date_key = date.tz_localize(None) if getattr(date, 'tzinfo', None) else date
+                cache[date_key] = scores
                 n_dates += 1
 
         logger.info(f"  Fold {fold['fold_id']:2d}: {vs.date()} → {ve.date()} "
