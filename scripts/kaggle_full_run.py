@@ -32,6 +32,7 @@ import sys
 import tarfile
 import time
 from pathlib import Path
+from typing import Any
 
 # Kaggle + PyTorch 2.10: Ohne das kann AdamW torch._dynamo → sympy ziehen; bei
 # kaputtem/alten system-sympy: AttributeError: module 'sympy' has no attribute 'core'
@@ -72,6 +73,47 @@ def log_write(msg: str) -> None:
     if _log_fh:
         _log_fh.write(line + "\n")
         _log_fh.flush()
+
+
+def _to_jsonable(obj: Any) -> Any:
+    """
+    Rekursive Konvertierung in JSON-serialisierbare Python-Typen.
+
+    Hintergrund:
+      Backtest-Ergebnisse können pandas.Series, pandas.Timestamp oder numpy-Typen
+      enthalten (z.B. in ic_data). json.dump() bricht dann mit
+      "Object of type Series is not JSON serializable" ab.
+    """
+    import numpy as np
+    import pandas as pd
+
+    if obj is None or isinstance(obj, (str, int, float, bool)):
+        return obj
+    if isinstance(obj, (np.integer, np.int64, np.int32)):
+        return int(obj)
+    if isinstance(obj, (np.floating, np.float64, np.float32)):
+        return float(obj)
+    if isinstance(obj, np.ndarray):
+        return [_to_jsonable(v) for v in obj.tolist()]
+    if isinstance(obj, pd.Timestamp):
+        return obj.isoformat()
+    if isinstance(obj, pd.Series):
+        # Index ggf. Timestamp → str, Werte rekursiv
+        return {str(k): _to_jsonable(v) for k, v in obj.items()}
+    if isinstance(obj, pd.DataFrame):
+        return {
+            "columns": list(obj.columns),
+            "index": [str(i) for i in obj.index],
+            "data": [_to_jsonable(row) for row in obj.to_numpy().tolist()],
+        }
+    if isinstance(obj, Path):
+        return str(obj)
+    if isinstance(obj, dict):
+        return {str(k): _to_jsonable(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple, set)):
+        return [_to_jsonable(v) for v in obj]
+    # Fallback: lesbare String-Repräsentation statt Exception
+    return str(obj)
 
 
 def run(cmd: list, cwd: Path = WORKING, check: bool = True) -> str:
@@ -1248,12 +1290,16 @@ def step_backtest_single_horizons(features, asset_map, all_train_results, v1_res
     from backtest_v2_single_horizon import save_ic_artifacts
 
     for h, bt in all_bt.items():
+        bt_slim_json = _to_jsonable(slim(bt))
+        trade_log_json = _to_jsonable(bt.get("trade_log", []))
+        daily_signals_json = _to_jsonable(bt.get("daily_signals", []))
+
         with open(WORKING / f"v2_{h}d_backtest.json", "w") as f:
-            json.dump(slim(bt), f, indent=2)
+            json.dump(bt_slim_json, f, indent=2)
         with open(WORKING / f"v2_{h}d_trade_log.json", "w") as f:
-            json.dump(bt.get("trade_log", []), f, indent=2)
+            json.dump(trade_log_json, f, indent=2)
         with open(WORKING / f"v2_{h}d_daily_signals.json", "w") as f:
-            json.dump(bt.get("daily_signals", []), f, indent=1)
+            json.dump(daily_signals_json, f, indent=1)
         # Rolling-IC-Artefakt speichern
         ic_data = bt.get("ic_data", {})
         if ic_data.get("records"):
