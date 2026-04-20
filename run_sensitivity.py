@@ -582,7 +582,7 @@ def run_portfolio(
 PARAM_GRID = {
     'n_max':           [5, 7, 9],
     'rotation_buffer': [2, 3, 4],
-    'hard_stop_pct':   [0.20, 0.25, 0.30],
+    'hard_stop_pct':   [0.20],          # 25 % / 30 % schlechter – nur 20 % sinnvoll
     'fees':            [0.001, 0.0015, 0.002],
 }
 
