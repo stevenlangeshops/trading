@@ -1519,6 +1519,15 @@ def parse_args() -> argparse.Namespace:
                    help='Ausgabe-CSV für Policy-Vergleich')
     p.add_argument('--policy-plot',    default='policy_equity.png',
                    help='Ausgabe-PNG für Policy-Equity-Chart')
+    # Normalisierungs-Vergleich
+    p.add_argument('--cs-score-cache', default=None,
+                   help='Score-Cache des global cross-sectional Modells (zum Vergleich).')
+    p.add_argument('--norm-compare', action='store_true', default=False,
+                   help='Phase 6: 1:1-Vergleich CS-Normalisierung vs. Sektor-neutral.')
+    p.add_argument('--norm-compare-csv', default='normalization_comparison.csv',
+                   help='Ausgabe-CSV für Normalisierungs-Vergleich.')
+    p.add_argument('--norm-compare-plot', default='normalization_comparison.png',
+                   help='Ausgabe-PNG für Normalisierungs-Vergleich Equity-Chart.')
     # Universum-Robustheit
     p.add_argument('--exclude-tickers', nargs='+', default=[],
                    metavar='TICKER',
@@ -1530,6 +1539,151 @@ def parse_args() -> argparse.Namespace:
     p.add_argument('--repo-dir',   default='.',
                    help='Pfad zum Repo (für Imports)')
     return p.parse_args()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Phase 6: Normalisierungs-Vergleich (CS vs. Sektor-Neutral)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def normalization_compare(
+    cs_score_cache:  ScoreCache,
+    sn_score_cache:  ScoreCache,
+    price_cache:     dict,
+    horizon:         int   = 7,
+    save_csv:        str   = 'normalization_comparison.csv',
+    save_plot:       str   = 'normalization_comparison.png',
+) -> pd.DataFrame:
+    """
+    1:1-Vergleich: global cross-sectional Z-Score vs. sektor-neutral Z-Score.
+
+    Feste Portfolio-Parameter: n_max=5, rotation_buffer=4, hard_stop=20 %
+    Vier Runs: CS-Baseline, CS+A3, SN-Baseline, SN+A3
+    (A3 = IC_roll_40 < 0 → n_max auf 3 reduzieren)
+
+    Subperioden: 2020 (COVID), 2022 (Bärenmarkt), 2025 (Neuland)
+
+    Returns
+    -------
+    DataFrame mit einer Zeile pro Run + Kennzahlen.
+    """
+    BASE_PARAMS = PortfolioParams(n_max=5, rotation_buffer=4, hard_stop_pct=0.20)
+
+    RUNS = [
+        ('CS_Baseline', cs_score_cache, None),
+        ('CS_A3',       cs_score_cache, 'IC40'),
+        ('SN_Baseline', sn_score_cache, None),
+        ('SN_A3',       sn_score_cache, 'IC40'),
+    ]
+
+    SUBPERIODS = [
+        ('2020', '2020-01-01', '2020-12-31'),
+        ('2022', '2022-01-01', '2022-12-31'),
+        ('2025', '2025-01-01', '2026-12-31'),
+    ]
+
+    logger.info("═" * 68)
+    logger.info("  Phase 6: Normalisierungs-Vergleich  CS vs. Sektor-Neutral")
+    logger.info(f"  Portfolio: n_max=5  rb=4  hs=20%  Policy: Baseline / A3 (IC40)")
+    logger.info("═" * 68)
+
+    rows       = []
+    equity_map = {}   # label → (equity_dates, equity_values)
+
+    for label, cache, policy in RUNS:
+        logger.info(f"  Run {label} (policy={policy}) ...")
+
+        # IC-Daten für IC-Policies berechnen (aus dem jeweiligen Score-Cache)
+        ic_df_run: Optional[pd.DataFrame] = None
+        if policy is not None:
+            try:
+                daily_ic_run = compute_daily_ic(cache, price_cache, horizon=horizon)
+                if not daily_ic_run.empty:
+                    rolling_map_run = rolling_ic_report(
+                        daily_ic_run, windows=IC_WINDOWS, label=label)
+                    ic_df_run = build_ic_df(daily_ic_run, rolling_map_run)
+            except Exception as ic_exc:
+                logger.warning(f"  IC-Berechnung für {label} fehlgeschlagen: {ic_exc}")
+
+        res = run_portfolio(
+            score_cache=cache,
+            price_cache=price_cache,
+            params=BASE_PARAMS,
+            policy=policy,
+            ic_df=ic_df_run,
+        )
+
+        eq    = res['equity']
+        eqd   = res['equity_dates']
+        equity_map[label] = (eqd, eq)
+
+        # Subperioden-Kennzahlen
+        sub_dd  = {sp: _subperiod_dd(eq, eqd, s, e) for sp, s, e in SUBPERIODS}
+        sub_ret = {sp: _subperiod_ret(eq, eqd, s, e) for sp, s, e in SUBPERIODS}
+
+        row = {
+            'run':             label,
+            'normalization':   'CrossSectional' if label.startswith('CS') else 'SectorNeutral',
+            'policy':          policy or 'None',
+            'sharpe':          round(res['sharpe'], 3),
+            'total_return_%':  round(res['total_return'], 1),
+            'max_drawdown_%':  round(res['max_drawdown'], 1),
+            'n_trades':        res['n_trades'],
+            'win_rate_%':      round(res['win_rate'], 1),
+            'avg_hold_days':   round(res['avg_hold_days'], 1),
+            'pct_days_reduced': round(
+                res['days_n_max_reduced'] / max(len(eqd), 1) * 100, 1),
+        }
+        for sp, _, _ in SUBPERIODS:
+            row[f'ret_{sp}_%']  = round(sub_ret[sp], 1)
+            row[f'dd_{sp}_%']   = round(sub_dd[sp],  1)
+        rows.append(row)
+
+        logger.info(
+            f"  → Sharpe={res['sharpe']:+.3f}  Return={res['total_return']:+.1f}%  "
+            f"MaxDD={res['max_drawdown']:+.1f}%  "
+            f"DD-2022={sub_dd['2022']:+.1f}%  DD-2025={sub_dd['2025']:+.1f}%"
+        )
+
+    df = pd.DataFrame(rows)
+    df.to_csv(save_csv, index=False)
+    logger.success(f"  Normalisierungs-Vergleich CSV: {save_csv}")
+
+    # ── Equity-Chart ─────────────────────────────────────────────────────────
+    try:
+        import matplotlib
+        matplotlib.use('Agg')
+        import matplotlib.pyplot as plt
+
+        fig, ax = plt.subplots(figsize=(13, 6), dpi=90)
+        colors  = {'CS_Baseline': '#888888', 'CS_A3': '#d62728',
+                   'SN_Baseline': '#1f77b4', 'SN_A3': '#2ca02c'}
+        styles  = {'CS_Baseline': '--', 'CS_A3': '-.',
+                   'SN_Baseline': '--', 'SN_A3': '-'}
+
+        all_dates_sorted = sorted(
+            {d for (eqd, _) in equity_map.values() for d in eqd})
+        for label, (eqd, eq) in equity_map.items():
+            eq_s = pd.Series(eq[1:], index=eqd)
+            eq_pct = (eq_s / eq_s.iloc[0] - 1) * 100
+            ax.plot(eq_s.index, eq_pct.values,
+                    label=label, color=colors[label],
+                    linestyle=styles[label], linewidth=1.8)
+
+        ax.set_title('Normalisierungs-Vergleich: CS vs. Sektor-Neutral\n'
+                     'n_max=5  rb=4  hard_stop=20%  (Baseline & A3=IC40)',
+                     fontsize=11)
+        ax.set_ylabel('Kumulierter Return (%)')
+        ax.axhline(0, color='black', linewidth=0.5)
+        ax.legend(fontsize=9)
+        ax.grid(True, alpha=0.3)
+        fig.tight_layout()
+        fig.savefig(save_plot, dpi=90)
+        plt.close(fig)
+        logger.success(f"  Normalisierungs-Vergleich Chart: {save_plot}")
+    except Exception as plot_exc:
+        logger.warning(f"  Chart fehlgeschlagen: {plot_exc}")
+
+    return df
 
 
 def main() -> None:
@@ -1745,6 +1899,37 @@ def main() -> None:
 
         except Exception as exc:
             logger.error(f"Phase 5 fehlgeschlagen: {exc}")
+            import traceback
+            traceback.print_exc()
+
+    # ── Phase 6: Normalisierungs-Vergleich (optional) ────────────────────────
+    if args.norm_compare:
+        logger.info("═" * 60)
+        logger.info("  Phase 6: Normalisierungs-Vergleich (CS vs. Sektor-Neutral)")
+        logger.info("═" * 60)
+        try:
+            cs_cache_path = args.cs_score_cache
+            if not cs_cache_path or not Path(cs_cache_path).exists():
+                logger.error(
+                    "Phase 6 benötigt --cs-score-cache <Pfad zum CS-Score-Cache>. "
+                    "Datei nicht gefunden oder nicht angegeben."
+                )
+            else:
+                logger.info(f"  Lade CS-Score-Cache: {cs_cache_path}")
+                cs_score_cache = load_score_cache(cs_cache_path)
+                logger.success(
+                    f"  CS-Score-Cache geladen: {len(cs_score_cache)} Tage")
+
+                normalization_compare(
+                    cs_score_cache=cs_score_cache,
+                    sn_score_cache=score_cache,
+                    price_cache=price_cache,
+                    horizon=args.horizon,
+                    save_csv=args.norm_compare_csv,
+                    save_plot=args.norm_compare_plot,
+                )
+        except Exception as exc:
+            logger.error(f"Phase 6 fehlgeschlagen: {exc}")
             import traceback
             traceback.print_exc()
 
