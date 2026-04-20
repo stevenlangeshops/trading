@@ -1619,7 +1619,9 @@ def normalization_compare(
     -------
     DataFrame mit einer Zeile pro Run + Kennzahlen.
     """
-    BASE_PARAMS = PortfolioParams(n_max=5, rotation_buffer=4, hard_stop_pct=0.20)
+    # n_max=7 / rb=3 = gleiche Referenz wie Phase 4 → aktive Rotation,
+    # tägliche Rankings werden wirklich genutzt, Modellunterschiede sichtbar.
+    BASE_PARAMS = PortfolioParams(n_max=7, rotation_buffer=3, hard_stop_pct=0.20)
 
     RUNS = [
         ('CS_Baseline', cs_score_cache, None),
@@ -1638,7 +1640,7 @@ def normalization_compare(
 
     logger.info("═" * 68)
     logger.info("  Phase 6: Normalisierungs-Vergleich  CS vs. Sektor-Neutral")
-    logger.info(f"  Portfolio: n_max=5  rb=4  hs=20%  Policy: Baseline / A3 (IC40) / C_Budget")
+    logger.info(f"  Portfolio: n_max=7  rb=3  hs=20%  Policy: Baseline / A3 (IC40) / C_Budget")
     logger.info("═" * 68)
 
     rows       = []
@@ -1725,7 +1727,7 @@ def normalization_compare(
                     linestyle=styles[label], linewidth=1.8)
 
         ax.set_title('Normalisierungs-Vergleich: CS vs. Sektor-Neutral\n'
-                     'n_max=5  rb=4  hard_stop=20%  (Baseline / A3=IC40 / C_Budget)',
+                     'n_max=7  rb=3  hard_stop=20%  (Baseline / A3=IC40 / C_Budget)',
                      fontsize=11)
         ax.set_ylabel('Kumulierter Return (%)')
         ax.axhline(0, color='black', linewidth=0.5)
