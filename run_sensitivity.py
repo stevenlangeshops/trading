@@ -1567,6 +1567,9 @@ def parse_args() -> argparse.Namespace:
                    help='Ausgabe-CSV für Policy-Vergleich')
     p.add_argument('--policy-plot',    default='policy_equity.png',
                    help='Ausgabe-PNG für Policy-Equity-Chart')
+    # Feature-Engineering
+    p.add_argument('--sector-neutral', action='store_true', default=False,
+                   help='Sektor-neutrale Z-Score Normalisierung beim Feature-Panel-Aufbau.')
     # Normalisierungs-Vergleich
     p.add_argument('--cs-score-cache', default=None,
                    help='Score-Cache des global cross-sectional Modells (zum Vergleich).')
@@ -1786,8 +1789,10 @@ def main() -> None:
         logger.info(f"Score-Cache vorhanden → Feature-Panel wird übersprungen.")
         features = None
     else:
-        logger.info("Feature-Panel aufbauen (dauert ~30s) ...")
-        features = build_features_from_parquet(args.data_dir)
+        mode = "sektor-neutral" if args.sector_neutral else "cross-sectional"
+        logger.info(f"Feature-Panel aufbauen ({mode}, dauert ~30s) ...")
+        features = build_features_from_parquet(args.data_dir,
+                                               sector_neutral=args.sector_neutral)
 
     logger.info("Price-Cache aufbauen ...")
     price_cache = build_price_cache_local(asset_map, args.data_dir)
