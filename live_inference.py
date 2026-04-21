@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import sys
 import warnings
 from dataclasses import dataclass, field
@@ -93,62 +94,191 @@ class LiveConfig:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Schritt 1: Daten herunterladen (Placeholder)
+# Schritt 1: OHLCV-Download via yfinance
 # ══════════════════════════════════════════════════════════════════════════════
 
-def download_ohlcv(
-    tickers:       list[str],
-    days:          int = 250,
-    end_date:      Optional[date] = None,
-) -> dict[str, pd.DataFrame]:
-    """Lädt OHLCV-Tagesdaten für alle Ticker.
+# Pflicht-Spalten die compute_indicators() erwartet (alle lowercase)
+_REQUIRED_COLS = ["open", "high", "low", "close", "volume"]
 
-    **Aktuell: Placeholder – gibt leere DataFrames zurück.**
 
-    Ersetze den Funktionskörper durch einen echten API-Call, z.B.:
+def _extract_ticker_df(
+    raw:    pd.DataFrame,
+    ticker: str,
+) -> Optional[pd.DataFrame]:
+    """Extrahiert den OHLCV-Subtable für einen Ticker aus dem yfinance-Ergebnis.
 
-    .. code-block:: python
+    yfinance 1.x liefert bei Batch-Downloads immer einen MultiIndex:
+        Level 0 = Preis-Typ (Close, High, Low, Open, Volume)
+        Level 1 = Ticker-Symbol
 
-        # yfinance
-        import yfinance as yf
-        raw = yf.download(tickers, period=f"{days}d", auto_adjust=True)
-        # Alpaca
-        from alpaca.data.historical import StockHistoricalDataClient
-        ...
+    Bei einem einzelnen Ticker oder String-Input kommt ebenfalls ein
+    MultiIndex (Level 1 enthält den Ticker einmalig).
 
     Args:
-        tickers:  Liste von Ticker-Symbolen (z.B. ``["AAPL", "MSFT", ...]``).
-        days:     Anzahl Handelstage Rückblick (inkl. heute).
-        end_date: Letzter Tag (``None`` = heute).
+        raw:    Roh-DataFrame von ``yf.download()``.
+        ticker: Ticker-Symbol (z.B. ``"AAPL"``).
 
     Returns:
-        Dict ``{ticker → OHLCV-DataFrame}``.  Jeder DataFrame hat einen
-        DatetimeIndex und Spalten ``open``, ``high``, ``low``, ``close``, ``volume``.
+        Subtable mit Spalten ``Close``, ``High``, ``Low``, ``Open``, ``Volume``
+        oder ``None`` wenn Ticker nicht im DataFrame enthalten.
     """
-    # ── TODO: Ersetze diesen Block durch echten Download ─────────────────────
-    # Beispiel mit yfinance:
-    #
-    # import yfinance as yf
-    # end   = end_date or date.today()
-    # start = end - timedelta(days=int(days * 1.5))   # Kalender- vs. Handelstage
-    # data  = yf.download(
-    #     tickers, start=str(start), end=str(end),
-    #     auto_adjust=True, progress=False, threads=True,
-    # )
-    # result = {}
-    # for tkr in tickers:
-    #     try:
-    #         df = data.xs(tkr, axis=1, level=1).rename(columns=str.lower)
-    #         df.index = pd.to_datetime(df.index)
-    #         result[tkr] = df.dropna(how="all")
-    #     except Exception:
-    #         pass
-    # return result
-    # ─────────────────────────────────────────────────────────────────────────
+    if not isinstance(raw.columns, pd.MultiIndex):
+        # Kein MultiIndex → Einzelticker direkt zurückgeben
+        return raw.copy()
 
-    print("[PLACEHOLDER] download_ohlcv: keine Daten heruntergeladen.")
-    print("  → Implementiere den yfinance/Alpaca-Block in download_ohlcv().")
-    return {}
+    # Level 1 enthält Ticker-Symbole (yfinance 1.x Standard)
+    try:
+        return raw.xs(ticker, axis=1, level=1).copy()
+    except KeyError:
+        return None
+
+
+def download_ohlcv(
+    tickers:  list[str],
+    days:     int = 250,
+    end_date: Optional[date] = None,
+) -> dict[str, pd.DataFrame]:
+    """Lädt OHLCV-Tagesdaten für alle Ticker via yfinance (Batch-Download).
+
+    Gibt ein Dict ``{ticker → DataFrame}`` zurück, das direkt als Eingabe
+    für ``build_live_features()`` → ``compute_indicators()`` dient.
+
+    Jeder DataFrame hat:
+    - ``DatetimeIndex``  (tz-naive, nur vollständige Handelstage)
+    - Spalten:           ``open``, ``high``, ``low``, ``close``, ``volume`` (lowercase)
+
+    Fehlerbehandlung:
+    - Delisted / nicht gefundene Ticker → Warnung, Ticker wird übersprungen.
+    - >80 % NaN in ``close`` → delisted, wird übersprungen.
+    - Weniger als 50 valide Zeilen → übersprungen (zu wenig Warm-up).
+    - Netzwerk-/API-Fehler → Exception wird gefangen, leeres Dict wird zurückgegeben.
+
+    Alternative Datenquellen (Adapter-Muster):
+        Um auf Alpaca oder Interactive Brokers umzusteigen, ersetze nur diese
+        Funktion – die Signatur ``(tickers, days, end_date) → dict[str, DataFrame]``
+        bleibt identisch:
+
+        .. code-block:: python
+
+            # Alpaca (alpaca-py)
+            from alpaca.data.historical import StockHistoricalDataClient
+            from alpaca.data.requests import StockBarsRequest
+            from alpaca.data.timeframe import TimeFrame
+            client = StockHistoricalDataClient(API_KEY, SECRET_KEY)
+            request = StockBarsRequest(
+                symbol_or_symbols=tickers, timeframe=TimeFrame.Day,
+                start=start_ts, end=end_ts,
+            )
+            bars = client.get_stock_bars(request).df
+            # ... Umformatierung auf unser Dict-Format
+
+    Args:
+        tickers:  Liste von Ticker-Symbolen (z.B. Keys aus ``asset_map.json``).
+        days:     Gewünschte Anzahl **Handelstage** Rückblick (inkl. ``end_date``).
+                  Der Download wird mit einem 1,5×-Puffer in Kalendertagen
+                  angefragt, damit auch nach langen Feiertags-Perioden genug
+                  Daten vorhanden sind.
+        end_date: Letzter einzuschließender Tag.  ``None`` = heute.
+
+    Returns:
+        ``dict[str, pd.DataFrame]``, bereit für ``build_live_features()``.
+        Ticker mit zu wenig Daten oder Fehlern werden nicht zurückgegeben.
+
+    Raises:
+        ImportError: Wenn ``yfinance`` nicht installiert ist.
+    """
+    try:
+        import yfinance as yf
+    except ImportError as e:
+        raise ImportError(
+            "yfinance nicht installiert. Ausführen: pip install yfinance"
+        ) from e
+
+    end_ts   = pd.Timestamp(end_date or date.today()).normalize()
+    # 1.5× Puffer: Handelstage ≈ 252/365 Kalendertage → sicher 50 % Puffer
+    start_ts = end_ts - pd.Timedelta(days=int(days * 1.5))
+    # yfinance: end-Parameter ist exklusiv → +1 Kalendertag
+    end_dl   = (end_ts + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+    start_dl = start_ts.strftime("%Y-%m-%d")
+
+    print(f"  yfinance Download: {start_dl} bis {end_ts.date()}"
+          f"  ({len(tickers)} Ticker, ~{days} Handelstage) ...")
+
+    # yfinance-interne Warnungen unterdrücken (delisted-Meldungen kommen
+    # trotzdem als stderr-Zeilen; wir ersetzen sie durch eigene Warnings).
+    logging.getLogger("yfinance").setLevel(logging.CRITICAL)
+
+    try:
+        raw = yf.download(
+            tickers     = tickers,
+            start       = start_dl,
+            end         = end_dl,
+            auto_adjust = True,    # Split/Dividend-bereinigt; keine Adj-Close-Spalte
+            progress    = False,   # Keine tqdm-Fortschrittsanzeige
+        )
+    except Exception as exc:
+        print(f"  [ERROR] yfinance Download fehlgeschlagen: {exc}")
+        return {}
+
+    if raw.empty:
+        print("  [WARN] yfinance lieferte leeres DataFrame – Netzwerk-Problem?")
+        return {}
+
+    result: dict[str, pd.DataFrame] = {}
+    n_skip_nan   = 0
+    n_skip_short = 0
+    n_skip_cols  = 0
+
+    for tkr in tickers:
+        # ── Ticker-Subtable extrahieren ───────────────────────────────────────
+        df = _extract_ticker_df(raw, tkr)
+        if df is None:
+            n_skip_nan += 1
+            continue
+
+        # ── Spalten-Namen normalisieren (Lowercase) ───────────────────────────
+        df.columns = [c.lower() for c in df.columns]
+
+        missing = set(_REQUIRED_COLS) - set(df.columns)
+        if missing:
+            n_skip_cols += 1
+            continue
+
+        df = df[_REQUIRED_COLS].copy()
+
+        # ── Index bereinigen (tz-strip, Datumsfilter) ─────────────────────────
+        df.index = pd.to_datetime(df.index).tz_localize(None)
+        df = df[df.index <= end_ts]
+
+        # ── Delisted-Erkennung: >80 % NaN im Close ───────────────────────────
+        nan_ratio = df["close"].isna().mean()
+        if nan_ratio > 0.8:
+            print(f"  [WARN] {tkr}: {nan_ratio:.0%} NaN in close – möglicherweise delisted")
+            n_skip_nan += 1
+            continue
+
+        # ── Zeilen mit fehlenden Kern-Daten entfernen ─────────────────────────
+        df = df.dropna(subset=["open", "high", "low", "close"])
+
+        # ── Mindest-Länge prüfen (Warm-up für SMA200 + seq_len) ───────────────
+        if len(df) < 50:
+            n_skip_short += 1
+            continue
+
+        result[tkr] = df
+
+    # ── Zusammenfassung ───────────────────────────────────────────────────────
+    n_ok   = len(result)
+    n_days = len(next(iter(result.values()))) if result else 0
+    print(f"  OK: {n_ok}/{len(tickers)} Ticker geladen  ({n_days} Handelstage)")
+    if n_skip_nan > 0:
+        print(f"     {n_skip_nan} Ticker: delisted / nicht gefunden / kein MultiIndex")
+    if n_skip_short > 0:
+        print(f"     {n_skip_short} Ticker: zu wenig Daten (<50 Zeilen)")
+    if n_skip_cols > 0:
+        print(f"     {n_skip_cols} Ticker: fehlende Pflicht-Spalten")
+
+    return result
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -352,7 +482,7 @@ def load_ic_history(ic_csv: Path, window: int = 40) -> Optional[float]:
 
     if not ic_csv.exists():
         print(f"  [WARN] IC-History-CSV nicht gefunden: {ic_csv}")
-        print(f"         → A3-Policy kann nicht geprüft werden (kein IC_roll_{window}).")
+        print(f"         A3-Policy kann nicht geprueft werden (kein IC_roll_{window}).")
         return None
 
     try:
@@ -416,14 +546,16 @@ def format_allocation(
         Formatierter Multi-Zeilen-String für ``print()``.
     """
     n_eff  = a3_reduced_n if a3_active else top_n
-    policy = "AKTIV  → Defensiv-Modus" if a3_active else "Inaktiv"
+    policy = "AKTIV (Defensiv-Modus)" if a3_active else "Inaktiv"
     top    = scores.head(n_eff)
+    sep    = "=" * 60
+    sep_s  = "-" * 60
 
     lines = [
         "",
-        "═" * 60,
-        f"  TÄGLICHE ZIEL-ALLOKATION  [{target_date.date()}]",
-        "═" * 60,
+        sep,
+        f"  TAEGLICHE ZIEL-ALLOKATION  [{target_date.date()}]",
+        sep,
         f"  A3-Policy (IC_roll_40 < 0): {policy}",
     ]
 
@@ -433,22 +565,22 @@ def format_allocation(
     lines += [
         f"  n_max aktiv             : {n_eff}  "
         f"({'reduziert' if a3_active else 'Standard'})",
-        "─" * 60,
-        f"  Kaufe (Rang 1–{n_eff}):",
+        sep_s,
+        f"  Kaufe (Rang 1-{n_eff}):",
     ]
 
     for rank, (ticker, score) in enumerate(top.items(), start=1):
         lines.append(f"    {rank}. {ticker:<8}  Score={score:+.4f}")
 
     lines += [
-        "─" * 60,
-        f"  Watchlist (Rang {n_eff+1}–{min(n_eff+5, len(scores))}):",
+        sep_s,
+        f"  Watchlist (Rang {n_eff+1}-{min(n_eff+5, len(scores))}):",
     ]
     for rank, (ticker, score) in enumerate(scores.iloc[n_eff:n_eff+5].items(),
                                             start=n_eff+1):
         lines.append(f"    {rank}. {ticker:<8}  Score={score:+.4f}")
 
-    lines.append("═" * 60)
+    lines.append(sep)
     return "\n".join(lines)
 
 
@@ -544,9 +676,9 @@ def run_live_inference(cfg: LiveConfig, target_date: Optional[pd.Timestamp] = No
         target_date = _latest_trading_day()
 
     device = _resolve_device(cfg.device)
-    print(f"\n{'═'*60}")
+    print(f"\n{'='*60}")
     print(f"  Live-Inference  |  {target_date.date()}  |  Device={device}")
-    print(f"{'═'*60}")
+    print(f"{'='*60}")
 
     # ── Schritt 0: Metadaten laden ────────────────────────────────────────────
     print("\n[1/5] Metadaten laden ...")
@@ -571,8 +703,8 @@ def run_live_inference(cfg: LiveConfig, target_date: Optional[pd.Timestamp] = No
 
     if not ohlcv_map:
         print("\n[ABBRUCH] Keine OHLCV-Daten erhalten.")
-        print("  → Implementiere download_ohlcv() mit yfinance oder Alpaca,")
-        print("    dann erneut ausführen.\n")
+        print("  Bitte download_ohlcv() mit yfinance oder Alpaca implementieren,")
+        print("  dann erneut ausfuehren.\n")
         # Demo-Modus: Zeige Policy-Status ohne echte Scores
         ic_roll_40 = load_ic_history(cfg.ic_history_csv, cfg.a3_policy_window)
         a3_active  = check_a3_policy(ic_roll_40)
