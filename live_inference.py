@@ -76,11 +76,12 @@ class LiveConfig:
         tickers:          Vollständige Ticker-Liste. ``None`` → aus asset_map laden.
     """
 
-    ckpt_dir:         Path    = Path("checkpoints/v2_7d")
-    walk_json:        Path    = Path("checkpoints/v2_7d/v2_7d_walk_forward.json")
-    asset_map_json:   Path    = Path("asset_map.json")
-    ic_history_csv:   Path    = Path("rolling_ic_v2_7d.csv")
-    sector_map_json:  Path    = Path("features/sector_map.json")
+    ckpt_dir:          Path    = Path("checkpoints/v2_7d")
+    walk_json:         Path    = Path("checkpoints/v2_7d/v2_7d_walk_forward.json")
+    asset_map_json:    Path    = Path("asset_map.json")
+    ic_history_csv:    Path    = Path("rolling_ic_v2_7d.csv")
+    sector_map_json:   Path    = Path("features/sector_map.json")
+    predictions_csv:   Path    = Path("live_predictions_history.csv")
 
     horizon:          int     = 7
     seq_len:          int     = 64
@@ -560,6 +561,55 @@ def check_a3_policy(ic_roll_40: Optional[float]) -> bool:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# Schritt 4b: Predictions persistieren (für täglichen IC-Update)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def save_predictions(
+    scores:      pd.Series,
+    target_date: pd.Timestamp,
+    csv_path:    Path,
+) -> None:
+    """Speichert alle Modell-Scores des Tages in ``live_predictions_history.csv``.
+
+    Wird täglich von ``run_live_inference()`` aufgerufen.  ``update_ic.py``
+    liest diese Datei 7 Handelstage später, um den tatsächlichen IC zu
+    berechnen.
+
+    Format::
+
+        date,ticker,score
+        2026-04-21,AAPL,0.00556
+        2026-04-21,MSFT,0.00554
+        ...
+
+    Wenn für ``target_date`` bereits ein Eintrag existiert, wird er
+    überschrieben (Idempotenz bei Mehrfachausführung am selben Tag).
+
+    Args:
+        scores:      Alle Scores aus ``score_universe()`` (absteigend sortiert).
+        target_date: Datum der Inference (= Datum der Vorhersage).
+        csv_path:    Pfad zu ``live_predictions_history.csv``.
+    """
+    today_str = target_date.strftime("%Y-%m-%d")
+    new_rows  = pd.DataFrame({
+        "date":   today_str,
+        "ticker": scores.index,
+        "score":  scores.values,
+    })
+
+    if csv_path.exists():
+        existing = pd.read_csv(csv_path)
+        # Vorhandene Zeilen für heute entfernen (Idempotenz)
+        existing = existing[existing["date"].astype(str) != today_str]
+        combined = pd.concat([existing, new_rows], ignore_index=True)
+    else:
+        combined = new_rows
+
+    combined.to_csv(csv_path, index=False)
+    print(f"  Predictions gespeichert: {len(new_rows)} Ticker -> {csv_path.name}")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # Schritt 5: Allokations-Output
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -950,7 +1000,14 @@ def run_live_inference(cfg: LiveConfig, target_date: Optional[pd.Timestamp] = No
         return {"target_date": target_date, "scores": pd.Series(dtype=float),
                 "top_tickers": [], "a3_active": False, "n_eff": 0, "ic_roll_40": None}
 
-    # ── Schritt 4: A3-Policy prüfen ───────────────────────────────────────────
+    # ── Schritt 4b: Predictions persistieren ─────────────────────────────────
+    save_predictions(
+        scores      = scores,
+        target_date = target_date,
+        csv_path    = cfg.predictions_csv,
+    )
+
+    # ── Schritt 4c: A3-Policy prüfen ──────────────────────────────────────────
     print("\n[5/5] A3-Policy (IC_roll_40) prüfen ...")
     ic_roll_40 = load_ic_history(cfg.ic_history_csv, cfg.a3_policy_window)
     a3_active  = check_a3_policy(ic_roll_40)

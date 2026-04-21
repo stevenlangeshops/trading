@@ -27,3 +27,10 @@ notebooks/*.ipynb
 # Kaggle Kernels (lokales Staging + Downloads)
 .kaggle_kernel_upload/
 kaggle_kernel_runs/
+
+# Live-Trading Laufzeitdaten (lokal gepflegt, nicht ins Repo)
+rolling_ic_v2_7d.csv
+live_predictions_history.csv
+sensitivity_results.csv
+archive17_extracted/
+arch*/
