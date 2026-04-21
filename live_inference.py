@@ -84,7 +84,7 @@ class LiveConfig:
 
     horizon:          int     = 7
     seq_len:          int     = 64
-    download_days:    int     = 250     # > seq_len + Indikator-Warmup (~200)
+    download_days:    int     = 320     # SMA200-Warmup(200) + seq_len(64) + Puffer(56)
     top_n:            int     = 5       # = PROD_N_MAX
     a3_policy_window: int     = 40      # IC_roll_40
     a3_reduced_n:     int     = 3       # n_max im Defensiv-Modus
@@ -371,14 +371,34 @@ def load_latest_checkpoint(
     """
     from backtest_v2_single_horizon import load_fold_model
 
-    if not walk_json.exists():
+    # ── Walk-Forward-JSON suchen ──────────────────────────────────────────────
+    wj = _find_artifact(walk_json, "v2_7d_walk_forward.json")
+    if wj is None:
         print(f"[ERROR] Walk-Forward-JSON nicht gefunden: {walk_json}")
+        print("  Bitte Kaggle-Archiv entpacken oder --walk-json setzen.")
         return None, None, None
+    try:
+        rel = wj.relative_to(_REPO_ROOT)
+    except ValueError:
+        rel = wj
+    print(f"  walk_forward.json: {rel}")
 
-    data  = json.loads(walk_json.read_text())
+    # ── Checkpoint-Verzeichnis suchen ─────────────────────────────────────────
+    cd = _find_ckpt_dir(ckpt_dir)
+    if cd is None:
+        print(f"[ERROR] Kein Verzeichnis mit fold_*_best.pt gefunden: {ckpt_dir}")
+        print("  Bitte Kaggle-Archiv entpacken oder --ckpt-dir setzen.")
+        return None, None, None
+    try:
+        rel_cd = cd.relative_to(_REPO_ROOT)
+    except ValueError:
+        rel_cd = cd
+    print(f"  ckpt_dir: {rel_cd}")
+
+    data  = json.loads(wj.read_text())
     folds = data.get("fold_summary", data.get("fold_results", []))
     if not folds:
-        print(f"[ERROR] Keine Fold-Daten in {walk_json}")
+        print(f"[ERROR] Keine Fold-Daten in {wj}")
         return None, None, None
 
     # Neuesten Fold (spätestes val_end) auswählen
@@ -388,11 +408,11 @@ def load_latest_checkpoint(
     folds_sorted = sorted(folds, key=_val_end)
     latest_fold  = folds_sorted[-1]
 
-    # Checkpoint-Pfad auf aktuelles Verzeichnis zeigen lassen
+    # Checkpoint-Dateiname aus Metadaten ableiten
     ckpt_fname = Path(latest_fold.get("ckpt_path", "")).name
     if not ckpt_fname:
         ckpt_fname = f"fold_{latest_fold.get('fold_id', 0)}_best.pt"
-    ckpt_path = ckpt_dir / ckpt_fname
+    ckpt_path = cd / ckpt_fname
 
     if not ckpt_path.exists():
         print(f"[ERROR] Checkpoint nicht gefunden: {ckpt_path}")
@@ -439,6 +459,25 @@ def score_universe(
     """
     import torch
     from backtest_v2_single_horizon import predict_cross_section
+
+    # Letztes verfügbares Datum im Panel ermitteln
+    panel_dates = features_panel.index.get_level_values("date").unique().sort_values()
+    if panel_dates.empty:
+        return pd.Series(dtype=float)
+
+    last_panel_date = panel_dates[-1]
+    if target_date not in panel_dates:
+        print(f"  [INFO] {target_date.date()} nicht im Feature-Panel "
+              f"(Markt noch offen?) – verwende letzten verfuegbaren Tag: "
+              f"{last_panel_date.date()}")
+        target_date = last_panel_date
+
+    # Schnellcheck: Mindestens ein Asset sollte am target_date vorhanden sein
+    try:
+        n_assets_today = len(features_panel.xs(target_date, level="date"))
+    except KeyError:
+        n_assets_today = 0
+    print(f"  Panel: {n_assets_today} Assets am {target_date.date()}")
 
     model.eval()
     with torch.no_grad():
@@ -599,11 +638,154 @@ def _resolve_device(device: Optional[str]) -> str:
         return "cpu"
 
 
-def _load_asset_map(path: Path) -> dict[str, int]:
-    """Lädt ``asset_map.json`` → ``{ticker: id}``."""
-    if not path.exists():
-        raise FileNotFoundError(f"asset_map.json nicht gefunden: {path}")
-    return json.loads(path.read_text())
+def _archive_dirs() -> list[Path]:
+    """Gibt alle ``archive*/kaggle_artifacts``-Verzeichnisse zurück.
+
+    Sucht sowohl im Repo-Root als auch ein Verzeichnis darüber (typische
+    lokale Entpack-Struktur bei Kaggle-Downloads).
+    Sortiert absteigend nach Name → neueste Archive zuerst.
+    """
+    dirs: list[Path] = []
+    for root in (_REPO_ROOT, _REPO_ROOT.parent):
+        for d in sorted(root.glob("archive*/kaggle_artifacts"), reverse=True):
+            dirs.append(d)
+        for d in sorted(root.glob("archive*"), reverse=True):
+            dirs.append(d)
+    return dirs
+
+
+def _find_artifact(hint: Path, filename: str) -> Optional[Path]:
+    """Sucht eine Artefakt-Datei in typischen Kaggle-Archiv-Speicherorten.
+
+    Suchreihenfolge:
+    1. Konfigurierter Pfad (``hint``).
+    2. Repo-Root / ``filename``.
+    3. Ein Verzeichnis über Repo-Root.
+    4. ``archive*/kaggle_artifacts/`` (neueste zuerst) – lokal entpackte Artefakte.
+    5. ``checkpoints/`` und Unterverzeichnisse.
+
+    Args:
+        hint:     Konfigurierter Pfad (relativ oder absolut).
+        filename: Dateiname (z.B. ``"asset_map.json"``).
+
+    Returns:
+        Erster gefundener, existierender Pfad oder ``None``.
+    """
+    candidates: list[Path] = [
+        hint,
+        _REPO_ROOT / filename,
+        _REPO_ROOT.parent / filename,
+    ]
+    for archive_dir in _archive_dirs():
+        candidates.append(archive_dir / filename)
+    candidates.append(_REPO_ROOT / "checkpoints" / filename)
+    for sub in _REPO_ROOT.glob("checkpoints/*"):
+        candidates.append(sub / filename)
+
+    for p in candidates:
+        if p.exists():
+            return p.resolve()
+    return None
+
+
+def _find_ckpt_dir(hint: Path) -> Optional[Path]:
+    """Sucht ein Verzeichnis mit ``fold_*_best.pt``-Checkpoints.
+
+    Args:
+        hint: Konfigurierter Pfad.
+
+    Returns:
+        Erster gefundener Verzeichnispfad oder ``None``.
+    """
+    candidates: list[Path] = [hint, _REPO_ROOT / "checkpoints" / "v2_7d"]
+    for archive_dir in _archive_dirs():
+        candidates.append(archive_dir)
+    for sub in _REPO_ROOT.glob("checkpoints/*"):
+        candidates.append(sub)
+
+    for p in candidates:
+        if p.is_dir() and list(p.glob("fold_*_best.pt")):
+            return p.resolve()
+    return None
+
+
+def _build_asset_map_from_sector_map(sector_map_path: Path) -> dict[str, int]:
+    """Rekonstruiert die Asset-Map aus ``sector_map.json``.
+
+    Der Training-Code sortiert Ticker alphabetisch und vergibt 1-basierte IDs:
+    ``{a: i+1 for i, a in enumerate(sorted(tickers))}``.
+    Da ``sector_map.json`` genau dieselben 260 kuratierten Ticker enthält,
+    ist die rekonstruierte Map bit-identisch mit der Trainings-Map.
+
+    Args:
+        sector_map_path: Pfad zu ``features/sector_map.json``.
+
+    Returns:
+        ``{ticker: id}``-Dict, sortiert und 1-basiert.
+    """
+    raw = json.loads(sector_map_path.read_text())
+    tickers = sorted(k for k in raw if not k.startswith("_"))
+    return {ticker: i + 1 for i, ticker in enumerate(tickers)}
+
+
+def _load_asset_map(
+    path:            Path,
+    sector_map_path: Optional[Path] = None,
+) -> dict[str, int]:
+    """Lädt ``asset_map.json`` mit automatischer Suche und Fallback.
+
+    Suchreihenfolge:
+    1. Der konfigurierte Pfad (``path``).
+    2. Weitere typische Speicherorte (Repo-Root, ``archive*/``, ``checkpoints/``).
+    3. Fallback: Rekonstruktion aus ``sector_map.json``.
+
+    Args:
+        path:            Konfigurierter Pfad zu ``asset_map.json``.
+        sector_map_path: Pfad zu ``sector_map.json`` für den Fallback.
+
+    Returns:
+        ``{ticker: id}``-Dict (alphabetisch sortiert, 1-basiert).
+
+    Raises:
+        FileNotFoundError: Wenn weder ``asset_map.json`` noch ``sector_map.json``
+            gefunden werden.
+    """
+    # ── Suche in bekannten Orten ──────────────────────────────────────────────
+    found = _find_artifact(path, "asset_map.json")
+    if found:
+        try:
+            rel = found.relative_to(_REPO_ROOT)
+        except ValueError:
+            rel = found
+        print(f"  asset_map.json: {rel}")
+        return json.loads(found.read_text())
+
+    # ── Fallback: aus sector_map.json rekonstruieren ──────────────────────────
+    sm_path = sector_map_path or (_REPO_ROOT / "features" / "sector_map.json")
+    if sm_path.exists():
+        asset_map = _build_asset_map_from_sector_map(sm_path)
+        print(f"  [INFO] asset_map.json nicht gefunden – aus sector_map.json "
+              f"rekonstruiert ({len(asset_map)} Ticker).")
+        print(f"  [INFO] Das ist korrekt, solange dieselben Ticker wie beim "
+              f"Training verwendet wurden.")
+        # Generierte Datei im Repo-Root speichern (einmaliger Write)
+        out = _REPO_ROOT / "asset_map.json"
+        out.write_text(json.dumps(asset_map, indent=2))
+        print(f"  [INFO] Gespeichert: {out}  (wird beim naechsten Start direkt geladen)")
+        return asset_map
+
+    # ── Nichts gefunden: klarer Fehler mit Anleitung ──────────────────────────
+    raise FileNotFoundError(
+        "\n"
+        "asset_map.json nicht gefunden.\n\n"
+        "Loesungen (eine davon reicht):\n"
+        "  A) Kaggle-Archiv entpacken und --asset-map setzen:\n"
+        "       python live_inference.py --asset-map pfad/zu/asset_map.json\n\n"
+        "  B) sector_map.json muss unter features/sector_map.json liegen.\n"
+        "     Falls vorhanden, wird asset_map.json automatisch daraus erzeugt.\n\n"
+        "  C) asset_map.json aus einem Kaggle-Archiv ins Repo-Root kopieren:\n"
+        "       cp archive_extracted/kaggle_artifacts/asset_map.json .\n"
+    )
 
 
 def _latest_trading_day() -> pd.Timestamp:
@@ -682,16 +864,16 @@ def run_live_inference(cfg: LiveConfig, target_date: Optional[pd.Timestamp] = No
 
     # ── Schritt 0: Metadaten laden ────────────────────────────────────────────
     print("\n[1/5] Metadaten laden ...")
-    asset_map = _load_asset_map(cfg.asset_map_json)
-    tickers   = cfg.tickers or sorted(asset_map.keys())
-    print(f"  {len(tickers)} Ticker aus asset_map.json")
-
     from features.engineer import load_sector_map
     sector_map = load_sector_map(cfg.sector_map_json)
     if sector_map:
-        print(f"  {len(sector_map)} Ticker in sector_map.json")
+        print(f"  sector_map.json: {len(sector_map)} Ticker")
     else:
         print("  [WARN] sector_map.json leer – Fallback auf Cross-Sectional Z-Score")
+
+    asset_map = _load_asset_map(cfg.asset_map_json, sector_map_path=cfg.sector_map_json)
+    tickers   = cfg.tickers or sorted(asset_map.keys())
+    print(f"  {len(tickers)} Ticker in asset_map")
 
     # ── Schritt 1: OHLCV herunterladen ────────────────────────────────────────
     print(f"\n[2/5] OHLCV-Daten herunterladen ({cfg.download_days} Tage) ...")
