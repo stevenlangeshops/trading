@@ -1,27 +1,26 @@
 """
 features/engineer.py
-─────────────────────
-Cross-Sectional Feature Engineering für Multi-Asset LSTM.
+──────────────────────
+Feature Engineering Pipeline für den v2 Multi-Asset LSTM Trading Bot.
 
 Normalisierungs-Modi:
-  cross_sectional (Standard):
-    Z-Score pro Tag über ALLE Assets.
-    +1.0 = "höchster Wert im gesamten Universum heute".
-    Nachteil: Mega-Caps (NVDA, AAPL) dominieren – Modell lernt hauptsächlich
-    Momentum innerhalb der größten Titel.
+    cross_sectional (Referenz):
+        Z-Score pro Tag über ALLE Assets.  Ein Score von +1.0 bedeutet
+        "höchster Wert im gesamten Universum heute".  Nachteil: Mega-Caps
+        (NVDA, AAPL) dominieren – das Modell lernt hauptsächlich Sektor-Momentum
+        statt echten relativen Stärke-Unterschieden.
 
-  sector_neutral (neu):
-    Z-Score pro Tag UND pro GICS-Sektor.
-    +1.0 = "höchster Wert innerhalb des eigenen Sektors heute".
-    Vorteil: Äpfel mit Äpfeln vergleichen – ein Energy-RSI wird gegen andere
-    Energy-Titel gemessen, nicht gegen Tech.  Das Modell ist gezwungen, echtes
-    Cross-Sectional Alpha zu lernen, nicht nur Sektor-Momentum.
+    sector_neutral (Produktion):
+        Z-Score pro Tag UND pro GICS-Sektor.  Ein Score von +1.0 bedeutet
+        "höchster Wert *innerhalb des eigenen Sektors* heute".  Energy-Titel
+        werden gegen andere Energy-Titel gemessen, Tech gegen Tech.  Das Modell
+        ist gezwungen, echtes Cross-Sectional Alpha zu lernen.
 
 Target (Forward Return) bleibt in beiden Modi unverändert als Cross-Sectional
-Rank-Loss über das gesamte Universum – nur die Inputs werden normalisiert.
+Rank-Loss über das gesamte Universum – nur die Input-Features werden normalisiert.
 
-Sektor-Metadaten: features/sector_map.json (GICS, manuell kuratiert).
-Update-Script:    features/build_sector_map.py  (via yfinance).
+Sektor-Metadaten:  features/sector_map.json  (GICS, manuell kuratiert)
+Update-Script:     features/build_sector_map.py  (via yfinance)
 """
 
 from __future__ import annotations
@@ -40,85 +39,86 @@ warnings.filterwarnings("ignore")
 RAW_DIR     = Path("data/raw")
 FEATURE_DIR = Path("features/processed")
 
-# Sektor-Map liegt neben dieser Datei
+# Sektor-Map liegt im selben Verzeichnis wie diese Datei
 _SECTOR_MAP_PATH = Path(__file__).parent / "sector_map.json"
 
-
-# ── Technische Indikatoren (pro Asset, zeitreihen-intern) ─────────────────────
-
+# ── Feature-Spalten (Reihenfolge ist Teil des Modell-Interfaces) ──────────────
 FEATURE_COLS = [
     # Trend
-    "sma_ratio_20",    # Close / SMA20
-    "sma_ratio_50",    # Close / SMA50
-    "sma_ratio_200",   # Close / SMA200
-    "ema_ratio_12",    # Close / EMA12
-    "macd_diff",       # MACD Histogramm
+    "sma_ratio_20",    # Close / SMA(20)
+    "sma_ratio_50",    # Close / SMA(50)
+    "sma_ratio_200",   # Close / SMA(200)
+    "ema_ratio_12",    # Close / EMA(12)
+    "macd_diff",       # MACD-Histogramm
     # Momentum
-    "rsi_14",          # RSI 14
-    "roc_5",           # Rate of Change 5T
-    "roc_21",          # Rate of Change 21T
-    "stoch_k",         # Stochastic %K
+    "rsi_14",          # RSI(14), skaliert auf [0, 1]
+    "roc_5",           # Rate of Change 5 Tage
+    "roc_21",          # Rate of Change 21 Tage
+    "stoch_k",         # Stochastik %K, skaliert auf [0, 1]
     # Volatilität
-    "atr_ratio",       # ATR14 / Close (normiert)
-    "bb_width",        # Bollinger Band Width
-    "bb_pos",          # Position innerhalb Bollinger Bands
+    "atr_ratio",       # ATR(14) / Close
+    "bb_width",        # Bollinger-Band-Breite / Close
+    "bb_pos",          # Position innerhalb Bollinger Bands [0, 1]
     # Volumen
-    "volume_ratio_20", # Volume / SMA-Volume-20
-    "obv_diff",        # OBV tägliche Änderung (normiert)
+    "volume_ratio_20", # Volume / SMA-Volume(20)
+    "obv_diff",        # OBV Tagesveränderung (normiert, gecappt)
     # Preis-Struktur
-    "high_low_ratio",  # (High-Low) / Close
-    "ret_1d",          # 1-Tage Return
-    "ret_5d",          # 5-Tage Return
-    "ret_21d",         # 21-Tage Return
+    "high_low_ratio",  # (High − Low) / Close
+    "ret_1d",          # 1-Tage-Return
+    "ret_5d",          # 5-Tage-Return
+    "ret_21d",         # 21-Tage-Return
 ]
 
 
 def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    """Berechnet technische Indikatoren für ein einzelnes Asset.
+
+    Alle Indikatoren sind zeitreihen-intern (kein Look-Ahead über Assets).
+    Die Z-Score-Normalisierung erfolgt separat in ``build_panel()``.
+
+    Args:
+        df: OHLCV-DataFrame mit Spalten ``open``, ``high``, ``low``,
+            ``close``, ``volume`` und DatetimeIndex.
+
+    Returns:
+        DataFrame mit Spalten gemäß ``FEATURE_COLS``, gleicher Index wie ``df``.
+        Zeilen mit fehlenden Werten (Warm-up-Phase) enthalten NaN.
     """
-    Berechnet technische Indikatoren für ein einzelnes Asset.
-    Input:  OHLCV DataFrame (index=Date)
-    Output: DataFrame mit FEATURE_COLS Spalten
-    """
-    c = df["close"]
-    h = df["high"]
+    c  = df["close"]
+    h  = df["high"]
     lo = df["low"]
     v  = df["volume"]
 
     out = pd.DataFrame(index=df.index)
 
-    # ── Trend ────────────────────────────────────────────────────────────────
+    # Trend
     out["sma_ratio_20"]  = c / c.rolling(20).mean()
     out["sma_ratio_50"]  = c / c.rolling(50).mean()
     out["sma_ratio_200"] = c / c.rolling(200).mean()
     out["ema_ratio_12"]  = c / ta.trend.EMAIndicator(c, window=12).ema_indicator()
+    out["macd_diff"]     = ta.trend.MACD(c).macd_diff()
 
-    macd = ta.trend.MACD(c)
-    out["macd_diff"] = macd.macd_diff()
-
-    # ── Momentum ─────────────────────────────────────────────────────────────
+    # Momentum
     out["rsi_14"]  = ta.momentum.RSIIndicator(c, window=14).rsi() / 100.0
     out["roc_5"]   = c.pct_change(5)
     out["roc_21"]  = c.pct_change(21)
     out["stoch_k"] = ta.momentum.StochasticOscillator(
         h, lo, c, window=14).stoch() / 100.0
 
-    # ── Volatilität ───────────────────────────────────────────────────────────
+    # Volatilität
     atr = ta.volatility.AverageTrueRange(h, lo, c, window=14).average_true_range()
     out["atr_ratio"] = atr / c
-
-    bb = ta.volatility.BollingerBands(c, window=20)
+    bb   = ta.volatility.BollingerBands(c, window=20)
     bb_w = bb.bollinger_hband() - bb.bollinger_lband()
     out["bb_width"] = bb_w / c
     out["bb_pos"]   = (c - bb.bollinger_lband()) / (bb_w + 1e-9)
 
-    # ── Volumen ───────────────────────────────────────────────────────────────
-    vol_sma = v.rolling(20).mean()
-    out["volume_ratio_20"] = v / (vol_sma + 1e-9)
-
+    # Volumen
+    out["volume_ratio_20"] = v / (v.rolling(20).mean() + 1e-9)
     obv = ta.volume.OnBalanceVolumeIndicator(c, v).on_balance_volume()
     out["obv_diff"] = obv.pct_change().clip(-1, 1)
 
-    # ── Preis-Struktur ────────────────────────────────────────────────────────
+    # Preis-Struktur
     out["high_low_ratio"] = (h - lo) / (c + 1e-9)
     out["ret_1d"]  = c.pct_change(1)
     out["ret_5d"]  = c.pct_change(5)
@@ -128,21 +128,39 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def compute_forward_return(df: pd.DataFrame, horizon: int = 11) -> pd.Series:
-    """
-    Berechnet den Forward Return für jede Zeile.
-    ret[t] = (close[t+horizon] / close[t]) - 1
+    """Berechnet den Forward Return als Modell-Target.
+
+    ``ret[t] = (close[t + horizon] / close[t]) − 1``
+
+    Der Wert bei Datum ``t`` spiegelt die Rendite der nächsten ``horizon``
+    Handelstage wider.  Die letzten ``horizon`` Zeilen enthalten NaN.
+
+    Args:
+        df:      OHLCV-DataFrame mit ``close``-Spalte.
+        horizon: Vorhersage-Horizont in Handelstagen.
+
+    Returns:
+        Series mit gleichem Index wie ``df``.
     """
     return df["close"].pct_change(horizon).shift(-horizon)
 
 
-# ── Sektor-Map laden ─────────────────────────────────────────────────────────
+# ── Sektor-Map ────────────────────────────────────────────────────────────────
 
 def load_sector_map(path: Optional[Path] = None) -> dict[str, str]:
-    """
-    Lädt die GICS-Sektor-Zuordnung aus sector_map.json.
+    """Lädt die GICS-Sektor-Zuordnung aus ``sector_map.json``.
 
-    Gibt leeres Dict zurück wenn die Datei fehlt (Fallback auf CS-Normalisierung).
-    Meta-Keys (mit "_"-Präfix) werden gefiltert.
+    Die Datei ordnet jeden Ticker einem GICS-Sektor zu (z.B.
+    ``"AAPL": "Information Technology"``).  Meta-Einträge mit
+    ``_``-Präfix werden ignoriert.
+
+    Args:
+        path: Optionaler Pfad zur JSON-Datei.  Standard: ``features/sector_map.json``
+              neben dieser Datei.
+
+    Returns:
+        Dict ``{ticker → sektor}``.  Leer wenn Datei nicht gefunden –
+        ``build_panel()`` fällt dann automatisch auf Cross-Sectional zurück.
     """
     p = Path(path) if path else _SECTOR_MAP_PATH
     if not p.exists():
@@ -152,35 +170,35 @@ def load_sector_map(path: Optional[Path] = None) -> dict[str, str]:
     return {k: v for k, v in raw.items() if not k.startswith("_")}
 
 
-# ── Cross-Sectional Normalization ─────────────────────────────────────────────
+# ── Normalisierung ────────────────────────────────────────────────────────────
 
 def cross_sectional_zscore(
     panel: pd.DataFrame,
     min_assets: int = 5,
 ) -> pd.DataFrame:
-    """
-    Normalisiert Features täglich über ALLE Assets (klassischer CS z-Score).
+    """Klassische Cross-Sectional Z-Score Normalisierung (Referenz-Modus).
 
-    Input:  MultiIndex DataFrame  (date, asset) × Features
-    Output: Gleiche Struktur, aber pro Tag z-Score normalisiert.
+    Normalisiert jeden Feature-Wert täglich über **alle** Assets im Universum.
+    Dient als Vergleichsbasis zur sektor-neutralen Variante.
 
-    Nachteil: Mega-Caps mit extremen Momentum-Werten dominieren den z-Score –
-    das Modell lernt hauptsächlich, wer am stärksten im GESAMTEN Markt ist.
+    Args:
+        panel:      MultiIndex-DataFrame ``(date, asset) × FEATURE_COLS``.
+        min_assets: Mindest-Anzahl Assets pro Tag (Tage mit weniger werden
+                    übersprungen und behalten ihre Rohwerte).
+
+    Returns:
+        MultiIndex-DataFrame gleicher Struktur, z-Score normalisiert und
+        auf ±4 Standardabweichungen gecappt.
     """
     result = panel.copy()
-
     for date, group in panel.groupby(level="date"):
         if len(group) < min_assets:
             continue
         mu    = group.mean()
-        sigma = group.std().replace(0, 1)   # Division durch 0 verhindern
+        sigma = group.std().replace(0, 1)
         result.loc[date] = (group - mu) / sigma
+    return result.clip(-4, 4)
 
-    result = result.clip(-4, 4)
-    return result
-
-
-# ── Sector-Neutral Normalization (neu) ────────────────────────────────────────
 
 def sector_neutral_zscore(
     panel:               pd.DataFrame,
@@ -188,63 +206,60 @@ def sector_neutral_zscore(
     min_per_sector:      int = 3,
     fallback_min_assets: int = 5,
 ) -> pd.DataFrame:
-    """
-    Sektor-neutrale Z-Score Normalisierung: pro Tag UND pro GICS-Sektor.
+    """Sektor-neutrale Z-Score Normalisierung (Produktions-Modus).
 
-    Idee:
-      +1.5 beim RSI bedeutet nicht mehr "höchster RSI im gesamten Markt",
-      sondern "höchster RSI innerhalb des Tech-Sektors".  Damit werden
-      Äpfel (Energy-Stocks) nicht mehr mit Birnen (IT-Wachstumstitel) verglichen.
+    Normalisiert jeden Feature-Wert täglich **innerhalb des eigenen GICS-Sektors**.
+    Ein RSI-Score von +1.5 bedeutet damit "höchster RSI im Tech-Sektor" statt
+    "höchster RSI im gesamten Markt".  Das Modell lernt relative Stärke zwischen
+    vergleichbaren Unternehmen, nicht Sektor-Momentum.
 
-    Fallback:
-      Wenn ein Sektor < min_per_sector Assets hat (z.B. kleiner Nischen-Sektor
-      oder unbekannter Ticker → 'Unknown'), wird der globale Tages-z-Score
-      als Fallback verwendet.  Das verhindert instabile Einticker-Normalisierungen.
+    Fallback-Logik:
+        Wenn ein Sektor weniger als ``min_per_sector`` Assets aufweist
+        (z.B. sehr kleine Sektoren oder unbekannte Ticker → Kategorie ``Unknown``),
+        wird der globale Tages-z-Score als Fallback verwendet, um instabile
+        Normalisierungen bei kleinen Stichproben zu vermeiden.
 
-    Target (Forward Return) bleibt UNVERÄNDERT – nur die Inputs werden normalisiert.
+    Args:
+        panel:               MultiIndex-DataFrame ``(date, asset) × FEATURE_COLS``.
+        sector_map:          Dict ``{ticker → GICS-Sektor}`` aus ``load_sector_map()``.
+        min_per_sector:      Mindest-Assets pro (Datum, Sektor) für Sektor-Normalisierung.
+        fallback_min_assets: Mindest-Assets pro Tag für globalen Fallback.
 
-    Parameters
-    ----------
-    panel          : MultiIndex DataFrame (date, asset) × FEATURE_COLS
-    sector_map     : dict {ticker → GICS-Sektor}  (aus load_sector_map())
-    min_per_sector : Mindest-Assets pro Sektor für Sektor-Normalisierung
-    fallback_min_assets : Mindest-Assets pro Tag für globalen Fallback
+    Returns:
+        MultiIndex-DataFrame gleicher Struktur, sektor-neutral z-Score normalisiert
+        und auf ±4 Standardabweichungen gecappt.
 
-    Returns
-    -------
-    MultiIndex DataFrame (date, asset) × FEATURE_COLS, sektor-neutral z-Score,
-    gecappt auf ±4 Std-Abw.
+    Note:
+        Der Forward Return (Target) wird in diesem Schritt **nicht** verändert –
+        das Modell lernt weiterhin über den Rank-Loss gegen das gesamte Universum.
     """
     feat_cols = list(panel.columns)
 
-    # ── Flatten: MultiIndex → flaches DataFrame mit integer Index ────────────
-    flat = panel.reset_index()           # Spalten: date, asset, feat1, feat2, ...
+    # MultiIndex auflösen → flaches DataFrame für vektorisierten groupby
+    flat = panel.reset_index()
     flat["_sector"] = flat["asset"].map(sector_map).fillna("Unknown")
 
-    # ── Per-(date, sector) Stats via vectorized groupby.transform ─────────────
+    # Sektor-Level: Mittelwert und Std pro (Datum, Sektor)
     grp_sec  = flat.groupby(["date", "_sector"])
     sec_mean = grp_sec[feat_cols].transform("mean")
     sec_std  = grp_sec[feat_cols].transform("std").fillna(0)
-    sec_std  = sec_std.where(sec_std > 0, 1.0)       # std=0 → 1 (kein Divide-by-0)
+    sec_std  = sec_std.where(sec_std > 0, 1.0)
     sec_cnt  = grp_sec[feat_cols[0]].transform("count")
 
-    # ── Per-date Stats als globaler Fallback ──────────────────────────────────
+    # Globales Tages-Level als Fallback
     grp_day   = flat.groupby("date")
     glob_mean = grp_day[feat_cols].transform("mean")
     glob_std  = grp_day[feat_cols].transform("std").fillna(0)
     glob_std  = glob_std.where(glob_std > 0, 1.0)
     day_cnt   = grp_day[feat_cols[0]].transform("count")
 
-    # ── Auswahl: Sektor wenn >= min_per_sector, sonst global ─────────────────
-    #    use_sec: (N,1) boolean → broadcast über alle Features
+    # Sektor-Normalisierung wenn Sektor groß genug, sonst global
     use_sec = ((sec_cnt >= min_per_sector) & (day_cnt >= fallback_min_assets)).values
-
     mu  = np.where(use_sec[:, None], sec_mean.values,  glob_mean.values)
     std = np.where(use_sec[:, None], sec_std.values,   glob_std.values)
 
     z_values = (flat[feat_cols].values - mu) / std
 
-    # ── MultiIndex wiederherstellen ───────────────────────────────────────────
     result = pd.DataFrame(z_values, columns=feat_cols, index=panel.index)
     return result.clip(-4, 4)
 
@@ -252,33 +267,39 @@ def sector_neutral_zscore(
 # ── Haupt-Pipeline ────────────────────────────────────────────────────────────
 
 def build_panel(
-    timeframe:       str   = "1d",
-    horizon:         int   = 11,
-    min_rows:        int   = 300,
+    timeframe:       str            = "1d",
+    horizon:         int            = 11,
+    min_rows:        int            = 300,
     asset_list:      Optional[list] = None,
-    sector_neutral:  bool  = False,
+    sector_neutral:  bool           = True,
     sector_map_path: Optional[str]  = None,
 ) -> tuple[pd.DataFrame, pd.Series]:
-    """
-    Baut den kompletten Panel-Datensatz:
-      1. Lädt alle Parquet-Dateien
-      2. Berechnet technische Indikatoren pro Asset (zeitreihen-intern)
-      3. Z-Score Normalisierung (cross-sectional ODER sektor-neutral)
-      4. Forward Returns als Target (immer cross-sectional Rank-Loss)
+    """Baut den vollständigen Feature-Panel-Datensatz für das Training.
 
-    Parameters
-    ----------
-    sector_neutral : bool (default False)
-        False → klassischer Cross-Sectional z-Score über alle Assets pro Tag.
-        True  → Sektor-neutraler z-Score (pro Tag AND pro GICS-Sektor).
-                Erfordert features/sector_map.json.
-    sector_map_path : str, optional
-        Pfad zur sector_map.json.  Standard: features/sector_map.json.
+    Pipeline:
+        1. Lädt alle Parquet-Dateien aus ``RAW_DIR``.
+        2. Berechnet technische Indikatoren pro Asset (zeitreihen-intern,
+           kein Look-Ahead zwischen Assets).
+        3. Z-Score Normalisierung: sektor-neutral (Standard) oder cross-sectional.
+        4. Forward Return als Target (immer cross-sectional Rank-Loss).
 
-    Returns
-    -------
-    features : MultiIndex DataFrame (date, asset) × FEATURE_COLS
-    targets  : MultiIndex Series    (date, asset) → forward_return
+    Args:
+        timeframe:       Parquet-Datei-Suffix, z.B. ``"1d"`` für Tagesdaten.
+        horizon:         Vorhersage-Horizont in Handelstagen für den Forward Return.
+        min_rows:        Mindest-Datenpunkte pro Asset (kürzere werden übersprungen).
+        asset_list:      Optionale Whitelist von Tickern.  ``None`` = alle.
+        sector_neutral:  ``True`` (Standard) = sektor-neutrale Z-Score Normalisierung.
+                         ``False`` = klassischer Cross-Sectional z-Score (Referenz).
+        sector_map_path: Optionaler Pfad zu ``sector_map.json``.  Wenn nicht angegeben,
+                         wird ``features/sector_map.json`` neben dieser Datei verwendet.
+
+    Returns:
+        Tuple ``(features, targets)``:
+            - ``features``: MultiIndex-DataFrame ``(date, asset) × FEATURE_COLS``
+            - ``targets``:  MultiIndex-Series ``(date, asset) → forward_return``
+
+    Raises:
+        FileNotFoundError: Wenn keine Parquet-Dateien in ``RAW_DIR`` gefunden werden.
     """
     from loguru import logger
 
@@ -296,7 +317,7 @@ def build_panel(
             continue
 
         df = pd.read_parquet(fpath)
-        df.index = pd.to_datetime(df.index)
+        df.index   = pd.to_datetime(df.index)
         df.columns = [c.lower() for c in df.columns]
 
         if len(df) < min_rows:
@@ -306,7 +327,6 @@ def build_panel(
         try:
             feats  = compute_indicators(df)
             target = compute_forward_return(df, horizon)
-
             valid  = feats.notna().all(axis=1) & target.notna()
             feats  = feats[valid]
             target = target[valid]
@@ -319,31 +339,26 @@ def build_panel(
             all_targets[ticker]  = target
 
         except Exception as e:
-            logger.warning(f"  {ticker}: Fehler — {e}")
+            logger.warning(f"  {ticker}: übersprungen – {e}")
             skipped.append(ticker)
-            continue
 
     if skipped:
         logger.warning(f"Übersprungen ({len(skipped)}): {', '.join(skipped[:10])}")
 
     logger.info(f"Assets geladen: {len(all_features)}")
 
-    # ── MultiIndex Panel aufbauen ─────────────────────────────────────────────
-    features_panel = pd.concat(all_features, names=["asset", "date"])
-    features_panel = features_panel.swaplevel().sort_index()
-
-    targets_panel  = pd.concat(all_targets,  names=["asset", "date"])
-    targets_panel  = targets_panel.swaplevel().sort_index()
+    # MultiIndex Panel aufbauen: (date, asset) × Features
+    features_panel = pd.concat(all_features, names=["asset", "date"]).swaplevel().sort_index()
+    targets_panel  = pd.concat(all_targets,  names=["asset", "date"]).swaplevel().sort_index()
     targets_panel.name = "forward_return"
 
-    # ── Z-Score Normalisierung ────────────────────────────────────────────────
+    # Z-Score Normalisierung
     if sector_neutral:
         sector_map = load_sector_map(sector_map_path)
         if not sector_map:
             logger.warning(
                 "sector_map.json nicht gefunden – Fallback auf Cross-Sectional z-Score."
             )
-            logger.info("Cross-Sectional z-Score Normalisierung...")
             features_panel = cross_sectional_zscore(features_panel)
         else:
             n_mapped   = sum(1 for t in all_features if t in sector_map)
@@ -357,8 +372,9 @@ def build_panel(
         logger.info("Cross-Sectional z-Score Normalisierung...")
         features_panel = cross_sectional_zscore(features_panel)
 
-    logger.info(f"Panel: {len(features_panel)} Zeilen  "
-                f"{features_panel.index.get_level_values('date').nunique()} Tage  "
-                f"{features_panel.index.get_level_values('asset').nunique()} Assets")
-
+    logger.info(
+        f"Panel: {len(features_panel)} Zeilen  "
+        f"{features_panel.index.get_level_values('date').nunique()} Tage  "
+        f"{features_panel.index.get_level_values('asset').nunique()} Assets"
+    )
     return features_panel, targets_panel

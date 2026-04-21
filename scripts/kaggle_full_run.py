@@ -1,25 +1,29 @@
 """
 scripts/kaggle_full_run.py
 ───────────────────────────
-Vollstaendige Trading-Bot Pipeline fuer Kaggle GPU:
-  1. Repo klonen
-  2. Abhaengigkeiten installieren
-  3. Parquet-Daten kopieren (aus Dataset trading-raw-data)
-  4. build_panel() - Features + Targets
-  5. train_walk_forward() - 12 Folds, ~2-3h GPU
-  6. Checkpoints + Asset-Map speichern
-  7. run_backtest() - Long-Only + Long-Short
-  8. Ergebnisse als JSON + PNG speichern
-  9. Alles in kaggle_artifacts.tar.gz packen
- 10. Ergebnisse in permanentes Kaggle Dataset hochladen (busersteven/trading-results)
+Vollständige Training- und Backtest-Pipeline für Kaggle GPU.
 
-Erwartet:
-  /kaggle/input/trading-raw-data/*.parquet  (260 S&P-500 Parquet-Dateien)
+Produktions-Konfiguration (Sieger Apr 2025):
+  Normalisierung   : Sektor-Neutral Z-Score  (PROD_SECTOR_NEUTRAL = True)
+  Horizont         : 7 Handelstage
+  n_max=5, rotation_buffer=2, hard_stop=20 %, A3-Policy (IC_roll_40 < 0)
 
-Output nach /kaggle/working/:
-  best_model.pt, fold_*_best.pt, asset_map.json,
-  walk_forward_results.json, backtest_results_*.json,
-  equity_curve.png, kaggle_artifacts.tar.gz
+Pipeline-Schritte:
+  1.  Repo klonen  (github.com/stevenlangeshops/trading, --depth=1)
+  1b. CUDA Health-Check (T4/A100 → GPU-Modus, P100/kein CUDA → CPU-Modus)
+  2.  Abhängigkeiten installieren
+  3.  Parquet-Daten kopieren  (aus Dataset trading-raw-data)
+  4.  build_panel()  – Features + Targets  (sektor-neutral Z-Score)
+  5.  Asset-Map aufbauen
+  6.  train_walk_forward()  – 12 Folds, ~2-3h GPU
+  7.  Backtest
+  8.  Ergebnisse als JSON + PNG speichern
+  9.  Alles in kaggle_artifacts.tar.gz packen
+  10. Ergebnisse in permanentes Kaggle Dataset hochladen
+
+Eingang:  /kaggle/input/trading-raw-data/*.parquet  (260 S&P-500 Parquet-Dateien)
+Ausgang:  /kaggle/working/  → fold_*_best.pt, asset_map.json, *_backtest.json,
+          *_equity.png, run_manifest.json, kaggle_artifacts.tar.gz
 """
 
 from __future__ import annotations
@@ -39,11 +43,23 @@ from typing import Any
 # Muss gesetzt sein, bevor irgendwo `import torch` laeuft (z.B. train_*).
 os.environ.setdefault("TORCHDYNAMO_DISABLE", "1")
 
+# ══════════════════════════════════════════════════════════════════════════════
+# Produktions-Konstanten  (Ergebnis der Backtesting-Phase Apr 2025)
+# Alle nachgelagerten Schritte lesen ihre Defaults aus diesem Block.
+# ══════════════════════════════════════════════════════════════════════════════
+
+PROD_SECTOR_NEUTRAL:   bool  = True   # Sektor-Neutral Z-Score (Sieger vs. Cross-Sectional)
+PROD_HORIZON:          int   = 7      # Vorhersage-Horizont in Handelstagen
+PROD_N_MAX:            int   = 5      # Max. gleichzeitige Positionen
+PROD_ROTATION_BUFFER:  int   = 2      # Rotation-Buffer
+PROD_HARD_STOP_PCT:    float = 0.20   # Hard-Stop-Loss Schwelle
+PROD_POLICY:           str   = "IC40" # A3: n_max→3 wenn ic_roll_40 < 0
+
+# ──────────────────────────────────────────────────────────────────────────────
+
 WORKING  = Path("/kaggle/working")
 REPO_DIR = WORKING / "repo"
 # Kaggle-Dataset-Pfade — probiert alle bekannten Varianten.
-# raw.zip enthaelt: raw/AAPL_1d.parquet, raw/SPY_1d.parquet, ...
-# Daher: sowohl /kaggle/input/trading-raw-data/ als auch .../raw/ pruefen.
 INPUT_DIRS = [
     Path("/kaggle/input/datasets/busersteven/trading-raw-data/raw"),  # Notebook-Modus (web UI)
     Path("/kaggle/input/trading-raw-data/raw"),   # API-Modus (kernels push)
@@ -355,7 +371,19 @@ def step_copy_data():
 
 # ── Schritt 4: Features bauen ────────────────────────────────────────────────
 
-def step_build_panel(sector_neutral: bool = False):
+def step_build_panel(sector_neutral: bool = PROD_SECTOR_NEUTRAL):
+    """Baut den Feature-Panel-Datensatz für alle Tagesbar-Parquet-Dateien.
+
+    Ruft ``features.engineer.build_panel()`` auf.  Der Parameter ``sector_neutral``
+    bestimmt die Normalisierungsvariante:
+
+    Args:
+        sector_neutral: ``True`` (Produktions-Default) → Sektor-neutraler Z-Score.
+                        ``False`` → klassischer Cross-Sectional Z-Score (Referenz).
+
+    Returns:
+        Tuple ``(features, targets)`` als MultiIndex-DataFrames.
+    """
     mode = "sektor-neutral" if sector_neutral else "cross-sectional"
     log_write(f"\n{'='*60}\nSCHRITT 4: build_panel() [{elapsed()}]  Modus={mode}\n{'='*60}")
     sys.path.insert(0, str(REPO_DIR))
@@ -363,7 +391,7 @@ def step_build_panel(sector_neutral: bool = False):
 
     from features.engineer import build_panel
     features, targets = build_panel(
-        timeframe="1d", horizon=11, min_rows=300,
+        timeframe="1d", horizon=PROD_HORIZON, min_rows=300,
         sector_neutral=sector_neutral,
     )
     log_write(f"  features: {features.shape}")
@@ -1230,7 +1258,20 @@ def step_backtest_v2(features, targets_multi, asset_map, v2_fold_results, cfg, v
 # ── v2 Single-Horizon Pipeline Steps ─────────────────────────────────────────
 
 def step_train_single_horizons(features, asset_map, horizons=None):
-    """Schritt 20: Training Single-Horizon Modelle fuer ausgewaehlte Horizonte."""
+    """Trainiert Single-Horizon LSTM-Modelle mit Walk-Forward Cross-Validation.
+
+    Ruft ``train_v2_single_horizon.train_all_horizons()`` auf.  Je Horizont
+    werden 12 Folds mit expandierendem Trainingsfenster (3 Jahre → 8.5 Jahre)
+    trainiert.  Ergebnisse werden als ``v2_{h}d_walk_forward.json`` gespeichert.
+
+    Args:
+        features:  MultiIndex-DataFrame ``(date, asset) × FEATURE_COLS``.
+        asset_map: Dict ``{ticker → id}``.
+        horizons:  Liste der Vorhersage-Horizonte.  Standard: ``[4, 7, 11, 15]``.
+
+    Returns:
+        Dict ``{horizon → train_result}`` mit ``fold_results``, ``mean_ic``, etc.
+    """
     if horizons is None:
         horizons = [4, 7, 11, 15]
     log_write(f"\n{'='*60}\nSCHRITT 20: Single-Horizon Training {horizons} [{elapsed()}]\n{'='*60}")
@@ -1260,7 +1301,22 @@ def step_train_single_horizons(features, asset_map, horizons=None):
 
 
 def step_backtest_single_horizons(features, asset_map, all_train_results, v1_result_a):
-    """Schritt 21: Backtest + Benchmark-Report fuer alle Horizonte."""
+    """Führt Backtests für alle trainierten Horizonte durch.
+
+    Lädt Fold-Checkpoints, berechnet Score-Caches und führt die
+    Portfolio-Simulation inkl. Rolling-IC-Analyse durch.  Speichert
+    je Horizont: ``v2_{h}d_backtest.json``, ``v2_{h}d_trade_log.json``,
+    ``v2_{h}d_equity.png`` und ``rolling_ic_v2_{h}d.json/.csv``.
+
+    Args:
+        features:          MultiIndex-DataFrame ``(date, asset) × FEATURE_COLS``.
+        asset_map:         Dict ``{ticker → id}``.
+        all_train_results: Rückgabe von ``step_train_single_horizons()``.
+        v1_result_a:       v1-Backtest-Ergebnis für Vergleichschart (oder ``{}``).
+
+    Returns:
+        Dict ``{horizon → backtest_result}`` mit Metriken + Equity.
+    """
     log_write(f"\n{'='*60}\nSCHRITT 21: Single-Horizon Backtests [{elapsed()}]\n{'='*60}")
 
     for _mod in list(sys.modules.keys()):
@@ -1393,11 +1449,11 @@ def main() -> int:
     RUN_V2_MULTI   = False
     V2_MAX_ASSETS  = 0    # 0 = alle Assets (260 S&P 500)
 
-    # ── Sektor-Neutrale Normalisierung ───────────────────────────────
-    # False = Cross-Sectional z-Score über alle Assets (bisheriger Standard)
-    # True  = z-Score pro Tag UND pro GICS-Sektor (neues Training)
-    # Im Kaggle-Notebook: os.environ["KAGGLE_SECTOR_NEUTRAL"] = "1" setzen.
-    SECTOR_NEUTRAL = os.environ.get("KAGGLE_SECTOR_NEUTRAL", "").strip() == "1"
+    # Sektor-Neutrale Normalisierung (Produktions-Default: True).
+    # Überschreiben via Env-Var: os.environ["KAGGLE_SECTOR_NEUTRAL"] = "0"
+    # für einen CS-Vergleichslauf.
+    _sn_env = os.environ.get("KAGGLE_SECTOR_NEUTRAL", "").strip()
+    SECTOR_NEUTRAL = (PROD_SECTOR_NEUTRAL if _sn_env == "" else _sn_env == "1")
 
     # ── Smoke-Test-Modus (KAGGLE_SMOKE_TEST=1) ────────────────────────
     # Schneller End-to-End-Test: 15 Assets, 3 Epochen, ~2 Folds.

@@ -3,33 +3,27 @@ run_sensitivity.py
 ══════════════════════════════════════════════════════════════════════════════
 Systematische Sensitivitätsanalyse des Portfolio-Layers.
 
-Prinzip (Zero Signal-Contamination):
-  Phase 1 – Score-Cache (einmalig):
-      Lädt die gespeicherten Fold-Checkpoints und berechnet für jeden
-      Handelstag im Out-of-Sample-Zeitraum die LSTM-Scores einmalig.
-      → score_cache: Dict[pd.Timestamp, pd.Series[asset, score]]
+Sieger-Konfiguration (Forschungsphase Apr 2025):
+  Normalisierung   : Sektor-Neutral Z-Score
+  n_max=5, rotation_buffer=2, hard_stop=20 %, fees=0.1 %
+  Policy           : A3 – IC40 (n_max → 3 wenn ic_roll_40 < 0)
 
-  Phase 2 – Grid Search (N_combinations × schnell):
-      Führt die Portfolio-Simulation mit verschiedenen Parametern durch,
-      ohne das Modell neu zu laden. Nur Execution-Logik variiert.
+Phasen:
+  1 – Score-Cache:     Fold-Checkpoints → tägliche Cross-Section-Scores
+  2 – Grid Search:     Portfolio-Simulation über Parameter-Kombinationen
+  3 – Rolling Rank-IC: IC-Zeitreihe + Rolling Windows
+  4 – Policy-Vergleich: Baseline vs. A1 / A2 / A3 (IC-basierte n_max-Reduktion)
+  5 – Universum-Robustheit: Vergleich mit/ohne Mega-Cap Blacklist
+  6 – Normalisierungs-Vergleich: CS-Normalisierung vs. Sektor-Neutral
 
-Grid (81 Kombinationen):
-  n_max          [5, 7, 9]
-  rotation_buffer [2, 3, 4]
-  hard_stop_pct  [0.20, 0.25, 0.30]
-  fees           [0.001, 0.0015, 0.002]
-
-Verwendung:
-  Lokal (nach Download des Archivs):
-      python run_sensitivity.py \\
-          --ckpt-dir  path/to/extracted/kaggle_artifacts \\
-          --walk-json path/to/v2_7d_walk_forward.json \\
-          --asset-map path/to/asset_map.json \\
-          --data-dir  path/to/data/raw \\
-          --output    sensitivity_results.csv
-
-  In Kaggle (nach dem Training, in kaggle_full_run.py aufrufen):
-      step_sensitivity(features, asset_map, all_train_results, price_cache)
+Verwendung (lokal, nach Download des Archivs):
+    python run_sensitivity.py \\
+        --ckpt-dir  path/to/kaggle_artifacts \\
+        --walk-json path/to/v2_7d_walk_forward.json \\
+        --asset-map path/to/asset_map.json \\
+        --data-dir  path/to/data/raw \\
+        --output    sensitivity_results.csv \\
+        --sector-neutral --policy-compare
 """
 
 from __future__ import annotations
@@ -56,14 +50,22 @@ from loguru import logger
 
 MEGA_CAP_7 = ['AAPL', 'MSFT', 'NVDA', 'AMZN', 'GOOGL', 'META', 'TSLA']
 
+# ── Produktions-Konfiguration (Sieger aus Grid Search + Policy-Vergleich) ─────
+PROD_N_MAX:           int   = 5
+PROD_ROTATION_BUFFER: int   = 2
+PROD_HARD_STOP_PCT:   float = 0.20
+PROD_FEES:            float = 0.001
+PROD_POLICY:          str   = "IC40"    # A3: n_max → 3 wenn ic_roll_40 < 0
+PROD_POLICY_N:        int   = 3         # n_max während A3-Phase
+
 
 @dataclass
 class PortfolioParams:
-    """Alle variablen Portfolio-Parameter für eine Grid-Search-Zelle."""
-    n_max:           int   = 7
-    n_mid:           int   = 3       # fix: Bull/Bear-Skalierung relativ zu n_max
-    n_min:           int   = 1       # fix
-    rotation_buffer: int   = 3
+    """Alle variablen Portfolio-Parameter für eine Grid-Search-Zelle oder den Backtest."""
+    n_max:           int   = PROD_N_MAX
+    n_mid:           int   = 2       # Positionen im Neutral-Regime (SMA50 ≈ SMA200)
+    n_min:           int   = 1       # Positionen im Bear-Regime (SPY < SMA200)
+    rotation_buffer: int   = PROD_ROTATION_BUFFER
     hard_stop_pct:   float = 0.20
     fees:            float = 0.001
     init_cash:       float = 10_000.0
@@ -250,7 +252,7 @@ def _adaptive_n(regime: str, n_max: int, n_mid: int, n_min: int) -> int:
 # Policy-Engine: IC- und SPY-basierte n_max-Reduktion
 # ══════════════════════════════════════════════════════════════════════════════
 
-POLICIES = ("IC20", "IC30", "IC40", "SPY200", "C_Budget")
+POLICIES = ("IC20", "IC30", "IC40")
 
 def _strip_tz_index(idx: pd.Index) -> pd.Index:
     """Entfernt Timezone-Info aus einem DatetimeIndex (tz-aware → tz-naive)."""
@@ -279,99 +281,41 @@ def get_effective_n_max(
     base_n_max: int,
     policy:     Optional[str],
     ic_df:      Optional[pd.DataFrame],
-    spy_sma200: Optional[pd.Series],
-    spy_prices: Optional[pd.Series],
-    reduced_n:  int = 3,
+    reduced_n:  int = PROD_POLICY_N,
 ) -> tuple[int, bool]:
-    """
-    Berechnet den effektiven n_max für einen Handelstag gemäß Policy.
+    """Berechnet den effektiven n_max für einen Handelstag gemäß IC-Policy.
 
-    Parameters
-    ----------
-    date        : Handelstag
-    base_n_max  : Standard n_max aus PortfolioParams (z.B. 7)
-    policy      : None | "IC20" | "IC30" | "IC40" | "SPY200"
-    ic_df       : DataFrame mit Spalten ic_roll_20, ic_roll_30, ic_roll_40
-    spy_sma200  : pd.Series mit vorberechneter 200-Tage-SMA auf SPY
-    spy_prices  : pd.Series mit SPY-Schlusskursen
-    reduced_n   : n_max wenn Trigger aktiv (Default 3)
+    Unterstützte Policies:
+        ``None``  → kein Filter, ``base_n_max`` unverändert.
+        ``IC20``  → n_max → ``reduced_n`` wenn ``ic_roll_20 < 0``.
+        ``IC30``  → n_max → ``reduced_n`` wenn ``ic_roll_30 < 0``.
+        ``IC40``  → n_max → ``reduced_n`` wenn ``ic_roll_40 < 0``  (A3, Produktion).
 
-    Returns
-    -------
-    (n_max_eff, trigger_active)
+    Args:
+        date:       Handelstag.
+        base_n_max: Standard-n_max aus ``PortfolioParams``.
+        policy:     Policy-Bezeichner oder ``None``.
+        ic_df:      DataFrame mit Spalten ``ic_roll_20``, ``ic_roll_30``, ``ic_roll_40``.
+        reduced_n:  n_max im Defensiv-Modus (Standard: ``PROD_POLICY_N = 3``).
+
+    Returns:
+        Tuple ``(n_max_eff, trigger_active)``.
     """
-    if policy is None:
+    if policy is None or ic_df is None:
         return base_n_max, False
 
-    if policy in ("IC20", "IC30", "IC40"):
-        if ic_df is None:
-            return base_n_max, False
-        col_map = {"IC20": "ic_roll_20", "IC30": "ic_roll_30", "IC40": "ic_roll_40"}
-        col = col_map[policy]
-        if col not in ic_df.columns:
-            return base_n_max, False
-        val = _ic_df_lookup(ic_df, date, col)
-        if np.isnan(val):
-            return base_n_max, False
-        triggered = val < 0
-        return (reduced_n if triggered else base_n_max), triggered
+    col_map = {"IC20": "ic_roll_20", "IC30": "ic_roll_30", "IC40": "ic_roll_40"}
+    col = col_map.get(policy)
+    if col is None or col not in ic_df.columns:
+        return base_n_max, False
 
-    if policy == "SPY200":
-        if spy_prices is None or spy_sma200 is None:
-            return base_n_max, False
-        ts = date.tz_localize(None) if (hasattr(date, 'tzinfo') and date.tzinfo) else date
-        # spy_prices und spy_sma200 sind bereits tz-naive (normalisiert in run_portfolio)
-        past_spy = spy_prices[spy_prices.index <= ts]
-        if past_spy.empty:
-            return base_n_max, False
-        spy_close = float(past_spy.iloc[-1])
-        past_sma  = spy_sma200[spy_sma200.index <= ts]
-        if past_sma.empty or np.isnan(past_sma.iloc[-1]):
-            return base_n_max, False
-        sma_val   = float(past_sma.iloc[-1])
-        triggered = spy_close < sma_val
-        return (reduced_n if triggered else base_n_max), triggered
+    val = _ic_df_lookup(ic_df, date, col)
+    if np.isnan(val):
+        return base_n_max, False
 
-    return base_n_max, False
+    triggered = val < 0
+    return (reduced_n if triggered else base_n_max), triggered
 
-
-def get_budget_factor(
-    date:   pd.Timestamp,
-    policy: Optional[str],
-    ic_df:  Optional[pd.DataFrame],
-    step:   float = 0.30,
-) -> tuple[float, bool]:
-    """
-    Gestaffelter Budget-Multiplikator für Policy "C_Budget".
-
-    Für jedes negative Rolling-IC-Fenster (IC20, IC30, IC40) wird der
-    investierbare Anteil um ``step`` (30 %) reduziert, kumulativ:
-
-        Keine Stufe aktiv  → 1.00  (100 % investiert)
-        IC20 < 0           → 0.70  ( 70 %)
-        IC20 + IC30 < 0    → 0.49  ( 49 %)
-        IC20+IC30+IC40 < 0 → 0.343 ( ~34 %)
-
-    Nur aktiv wenn policy == "C_Budget", sonst stets (1.0, False).
-
-    Returns
-    -------
-    (budget_factor, any_reduction_active)
-    """
-    if policy != "C_Budget" or ic_df is None:
-        return 1.0, False
-
-    factor    = 1.0
-    triggered = False
-    for col in ("ic_roll_20", "ic_roll_30", "ic_roll_40"):
-        if col not in ic_df.columns:
-            continue
-        val = _ic_df_lookup(ic_df, date, col)
-        if not np.isnan(val) and val < 0:
-            factor   *= (1.0 - step)
-            triggered = True
-
-    return factor, triggered
 
 
 def build_ic_df(daily_ic: pd.Series, rolling_map: dict) -> pd.DataFrame:
@@ -399,29 +343,26 @@ def run_portfolio(
     policy:      Optional[str]           = None,
     ic_df:       Optional[pd.DataFrame]  = None,
 ) -> dict:
+    """Führt die Portfolio-Simulation auf dem Score-Cache durch.
+
+    Reine Execution-Logik – keine Modell-Operationen.
+    Strategie: Long-Only, Rotation, Hard-Stop, SMA50/SMA200-Regime-Filter.
+
+    Args:
+        score_cache: Vorberechnete LSTM-Scores ``{date → Series[asset, score]}``.
+        price_cache: Schlusskurs-Series je Asset ``{ticker → Series}``.
+        params:      Portfolio-Parameter (n_max, rotation_buffer, hard_stop, fees).
+        policy:      IC-Policy oder ``None`` (Produktions-Default: ``"IC40"`` / A3).
+                     ``None``  → kein Defensiv-Filter.
+                     ``IC20``  → n_max→3 wenn ic_roll_20 < 0.
+                     ``IC30``  → n_max→3 wenn ic_roll_30 < 0.
+                     ``IC40``  → n_max→3 wenn ic_roll_40 < 0  (A3-Policy, Produktion).
+        ic_df:       DataFrame mit ``ic_roll_20/30/40`` Spalten (für IC-Policies).
+
+    Returns:
+        Dict mit Backtest-Metriken, ``equity``, ``equity_dates`` und ``trade_log``.
     """
-    Führt die Portfolio-Simulation auf dem Score-Cache durch.
-
-    Keine Modell-Operationen – reine Execution-Logik.
-    Identisch zur Run-G-Strategie: Long-Only, Rotation, Hard-Stop.
-
-    Parameters
-    ----------
-    policy : None | "IC20" | "IC30" | "IC40" | "SPY200"
-        Steuert ob und wie n_max täglich angepasst wird.
-    ic_df  : DataFrame mit Spalten ic_roll_20/30/40 (für IC*-Policies)
-
-    Returns
-    -------
-    dict mit Backtest-Metriken + equity/equity_dates + days_n_max_reduced.
-    """
-    spy_prices = price_cache.get('SPY')   # bereits tz-naive (aus build_price_cache_local)
-
-    # SPY 200-Tage-SMA einmalig vorberechnen (für SPY200-Policy)
-    spy_sma200: Optional[pd.Series] = None
-    if policy == "SPY200" and spy_prices is not None:
-        spy_clean  = spy_prices[~spy_prices.index.duplicated(keep='last')].sort_index()
-        spy_sma200 = spy_clean.rolling(200, min_periods=100).mean()
+    spy_prices = price_cache.get('SPY')
 
     cash      = params.init_cash
     positions: dict = {}
@@ -467,27 +408,21 @@ def run_portfolio(
 
         regime = _get_regime(spy_prices, date)
 
-        # Policy: n_max ggf. reduzieren (A-Policies, SPY)  oder  Budget skalieren (C_Budget)
-        budget_factor = 1.0
-        if policy == "C_Budget":
-            budget_factor, triggered = get_budget_factor(
-                date=date, policy=policy, ic_df=ic_df)
-            n_max_eff = params.n_max
-        else:
-            n_max_eff, triggered = get_effective_n_max(
-                date=date, base_n_max=params.n_max, policy=policy,
-                ic_df=ic_df, spy_sma200=spy_sma200, spy_prices=spy_prices,
-            )
+        # A3-Policy: n_max täglich anpassen basierend auf Rolling-IC-Signal
+        n_max_eff, triggered = get_effective_n_max(
+            date=date, base_n_max=params.n_max, policy=policy, ic_df=ic_df,
+        )
         if triggered:
             days_n_max_reduced += 1
-        # n_mid / n_min proportional skalieren wenn n_max-Policy aktiv
-        if triggered and policy != "C_Budget" and n_max_eff < params.n_max:
+        # n_mid / n_min proportional skalieren wenn Policy aktiv
+        if triggered and n_max_eff < params.n_max:
             scale  = n_max_eff / params.n_max
             n_mid_ = max(1, round(params.n_mid * scale))
             n_min_ = max(1, round(params.n_min * scale))
         else:
             n_mid_ = params.n_mid
             n_min_ = params.n_min
+        budget_factor = 1.0   # Budget-Skalierung nicht aktiv
 
         n_long = _adaptive_n(regime, n_max_eff, n_mid_, n_min_)
 
@@ -1197,21 +1132,24 @@ def policy_comparison(
     base_params:  Optional[PortfolioParams] = None,
     save_path:    Optional[str] = None,
 ) -> pd.DataFrame:
-    """
-    Führt 5 Backtests durch (Baseline + A1 + A2 + A3 + B) und vergleicht.
+    """Führt 4 Backtests durch (Baseline + A1/A2/A3) und vergleicht Policies.
 
-    Policies
-    --------
-    Baseline  : Kein IC/SPY-Filter
-    A1 IC20   : n_max → 3 wenn ic_roll_20 < 0
-    A2 IC30   : n_max → 3 wenn ic_roll_30 < 0
-    A3 IC40   : n_max → 3 wenn ic_roll_40 < 0
-    B  SPY200 : n_max → 3 wenn SPY-Close < SMA200
-    C  Budget : Budget -30 % je negativem IC-Fenster (IC20/30/40 kumulativ)
+    Policies:
+        Baseline : Kein IC-Filter, volle n_max konstant.
+        A1 IC20  : n_max → 3 wenn ``ic_roll_20 < 0``.
+        A2 IC30  : n_max → 3 wenn ``ic_roll_30 < 0``.
+        A3 IC40  : n_max → 3 wenn ``ic_roll_40 < 0``  (**Produktion**).
 
-    Returns
-    -------
-    pd.DataFrame mit allen Metriken inkl. Subperioden 2022/2025
+    Args:
+        score_cache: Vorberechnete LSTM-Scores.
+        price_cache: Schlusskurs-Series je Asset.
+        daily_ic:    Tägliche IC-Zeitreihe (aus ``compute_daily_ic()``).
+        rolling_map: Rolling-IC-Fenster (aus ``rolling_ic_report()``).
+        base_params: Portfolio-Parameter für alle Runs.  Standard: Produktions-Defaults.
+        save_path:   Optionaler CSV-Ausgabepfad.
+
+    Returns:
+        DataFrame mit Metriken und Subperioden 2022/2025, Spalten je Run.
     """
     if base_params is None:
         base_params = PortfolioParams()
@@ -1219,20 +1157,18 @@ def policy_comparison(
     ic_df = build_ic_df(daily_ic, rolling_map)
 
     runs = [
-        ("Baseline",  None),
-        ("A1_IC20",   "IC20"),
-        ("A2_IC30",   "IC30"),
-        ("A3_IC40",   "IC40"),
-        ("B_SPY200",  "SPY200"),
-        ("C_Budget",  "C_Budget"),
+        ("Baseline", None),
+        ("A1_IC20",  "IC20"),
+        ("A2_IC30",  "IC30"),
+        ("A3_IC40",  "IC40"),
     ]
 
     total_days = len(sorted(score_cache.keys()))
     rows = []
-    equity_map: dict = {}   # {run_name: (equity_list, equity_dates_list)}
+    equity_map: dict = {}
 
     logger.info("═" * 70)
-    logger.info("  Policy-Vergleich: Baseline vs. A1 / A2 / A3 / B / C_Budget")
+    logger.info("  Policy-Vergleich: Baseline vs. A1 / A2 / A3")
     logger.info(f"  base_params: n_max={base_params.n_max}  rb={base_params.rotation_buffer}"
                 f"  hs={base_params.hard_stop_pct:.0%}  fees={base_params.fees:.3%}")
     logger.info("═" * 70)
@@ -1268,11 +1204,10 @@ def policy_comparison(
             'dd_2025_%':         round(_subperiod_dd(eq, eqd, '2025-01-01', '2025-12-31'), 1),
         }
         rows.append(row)
-        trigger_label = ("budget_red" if policy == "C_Budget" else "n_max_red")
         logger.info(f"    Sharpe={row['sharpe']:.3f}  Return={row['total_return_%']:+.1f}%  "
                     f"MaxDD={row['max_drawdown_%']:.1f}%  "
                     f"DD-2022={row['dd_2022_%']:.1f}%  DD-2025={row['dd_2025_%']:.1f}%  "
-                    f"{trigger_label}={row['pct_days_reduced']:.1f}%")
+                    f"n_max_red={row['pct_days_reduced']:.1f}%")
 
     df = pd.DataFrame(rows).set_index('run')
 
@@ -1308,28 +1243,32 @@ def plot_policy_equity(
     all_dates:    list,
     save_path:    str = "policy_equity.png",
 ) -> None:
-    """
-    Equity-Kurven aller 5 Policy-Runs in einem Chart.
+    """Equity-Kurven aller Policy-Runs in einem Chart.
 
-    Nutzt vorberechnete equity_map aus policy_comparison() –
+    Nutzt die vorberechneten Equity-Kurven aus ``policy_comparison()`` –
     kein zweiter Backtest-Lauf nötig.
+
+    Args:
+        policy_df:  Metriken-DataFrame aus ``policy_comparison()``.
+        equity_map: ``{run_name → (equity_list, dates_list)}``.
+        all_dates:  Sortierte Liste aller Handelstage (für Jahrestrennlinien).
+        save_path:  Ausgabepfad für das PNG.
     """
     try:
         import matplotlib
         matplotlib.use('Agg')
         import matplotlib.pyplot as plt
-        import matplotlib.dates as mdates
 
         logger.info("plot_policy_equity: Chart wird erstellt ...")
 
-        run_order = ["Baseline", "A1_IC20", "A2_IC30", "A3_IC40", "B_SPY200", "C_Budget"]
-        colors  = ['#212121', '#1565C0', '#0288D1', '#00796B', '#E65100', '#7B1FA2']
-        lws     = [2.5, 1.6, 1.6, 1.6, 1.8, 2.0]
-        lstyles = ['-', '--', '--', '--', '-.', (0, (3, 1, 1, 1))]
+        run_order = ["Baseline", "A1_IC20", "A2_IC30", "A3_IC40"]
+        colors    = ['#212121', '#1565C0', '#0288D1', '#00796B']
+        lws       = [2.5, 1.6, 1.6, 2.0]
+        lstyles   = ['-', '--', '--', '-']
 
         fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 8),
                                         gridspec_kw={'height_ratios': [3, 1]})
-        fig.suptitle("Policy-Vergleich: Baseline vs. IC20 / IC30 / IC40 / SPY200 / C_Budget",
+        fig.suptitle("Policy-Vergleich: Baseline vs. A1-IC20 / A2-IC30 / A3-IC40",
                      fontsize=12, fontweight='bold')
 
         for run_name, color, lw, ls in zip(run_order, colors, lws, lstyles):
@@ -1606,30 +1545,30 @@ def normalization_compare(
     save_csv:        str   = 'normalization_comparison.csv',
     save_plot:       str   = 'normalization_comparison.png',
 ) -> pd.DataFrame:
+    """1:1-Vergleich: global Cross-Sectional Z-Score vs. Sektor-Neutral Z-Score.
+
+    Identische Portfolio-Parameter (n_max=7, rb=3, hs=20 %) für beide
+    Normalisierungsvarianten.  Je Variante: Baseline und A3-Policy.
+
+    Args:
+        cs_score_cache: Score-Cache des CS-Modells (global normalisiert).
+        sn_score_cache: Score-Cache des SN-Modells (sektor-neutral normalisiert).
+        price_cache:    Schlusskurs-Series je Asset.
+        horizon:        Vorhersage-Horizont für IC-Berechnung.
+        save_csv:       Ausgabepfad für Metriken-CSV.
+        save_plot:      Ausgabepfad für Equity-Chart.
+
+    Returns:
+        DataFrame mit einer Zeile pro Run (CS_Baseline, CS_A3, SN_Baseline, SN_A3).
     """
-    1:1-Vergleich: global cross-sectional Z-Score vs. sektor-neutral Z-Score.
-
-    Feste Portfolio-Parameter: n_max=5, rotation_buffer=4, hard_stop=20 %
-    Vier Runs: CS-Baseline, CS+A3, SN-Baseline, SN+A3
-    (A3 = IC_roll_40 < 0 → n_max auf 3 reduzieren)
-
-    Subperioden: 2020 (COVID), 2022 (Bärenmarkt), 2025 (Neuland)
-
-    Returns
-    -------
-    DataFrame mit einer Zeile pro Run + Kennzahlen.
-    """
-    # n_max=7 / rb=3 = gleiche Referenz wie Phase 4 → aktive Rotation,
-    # tägliche Rankings werden wirklich genutzt, Modellunterschiede sichtbar.
+    # n_max=7 / rb=3: hohe Rotation → Modellunterschiede deutlich sichtbar
     BASE_PARAMS = PortfolioParams(n_max=7, rotation_buffer=3, hard_stop_pct=0.20)
 
     RUNS = [
         ('CS_Baseline', cs_score_cache, None),
         ('CS_A3',       cs_score_cache, 'IC40'),
-        ('CS_Budget',   cs_score_cache, 'C_Budget'),
         ('SN_Baseline', sn_score_cache, None),
         ('SN_A3',       sn_score_cache, 'IC40'),
-        ('SN_Budget',   sn_score_cache, 'C_Budget'),
     ]
 
     SUBPERIODS = [
@@ -1640,7 +1579,7 @@ def normalization_compare(
 
     logger.info("═" * 68)
     logger.info("  Phase 6: Normalisierungs-Vergleich  CS vs. Sektor-Neutral")
-    logger.info(f"  Portfolio: n_max=7  rb=3  hs=20%  Policy: Baseline / A3 (IC40) / C_Budget")
+    logger.info("  Portfolio: n_max=7  rb=3  hs=20%  Policy: Baseline / A3 (IC40)")
     logger.info("═" * 68)
 
     rows       = []
@@ -1712,10 +1651,10 @@ def normalization_compare(
         import matplotlib.pyplot as plt
 
         fig, ax = plt.subplots(figsize=(13, 6), dpi=90)
-        colors  = {'CS_Baseline': '#888888', 'CS_A3': '#d62728',  'CS_Budget': '#e377c2',
-                   'SN_Baseline': '#1f77b4', 'SN_A3': '#2ca02c', 'SN_Budget': '#7B1FA2'}
-        styles  = {'CS_Baseline': '--', 'CS_A3': '-.', 'CS_Budget': ':',
-                   'SN_Baseline': '--', 'SN_A3': '-',  'SN_Budget': (0, (3, 1, 1, 1))}
+        colors = {'CS_Baseline': '#888888', 'CS_A3': '#d62728',
+                  'SN_Baseline': '#1f77b4', 'SN_A3': '#2ca02c'}
+        styles = {'CS_Baseline': '--', 'CS_A3': '-.',
+                  'SN_Baseline': '--', 'SN_A3': '-'}
 
         all_dates_sorted = sorted(
             {d for (eqd, _) in equity_map.values() for d in eqd})
@@ -1727,7 +1666,7 @@ def normalization_compare(
                     linestyle=styles[label], linewidth=1.8)
 
         ax.set_title('Normalisierungs-Vergleich: CS vs. Sektor-Neutral\n'
-                     'n_max=7  rb=3  hard_stop=20%  (Baseline / A3=IC40 / C_Budget)',
+                     'n_max=7  rb=3  hard_stop=20%  (Baseline / A3=IC40)',
                      fontsize=11)
         ax.set_ylabel('Kumulierter Return (%)')
         ax.axhline(0, color='black', linewidth=0.5)
@@ -1861,7 +1800,7 @@ def main() -> None:
     # ── Phase 4: Policy-Vergleich (optional) ─────────────────────────────────
     if args.policy_compare:
         logger.info("═" * 60)
-        logger.info("  Phase 4: Policy-Vergleich (Baseline / A1 / A2 / A3 / B)")
+        logger.info("  Phase 4: Policy-Vergleich (Baseline / A1-IC20 / A2-IC30 / A3-IC40)")
         logger.info("═" * 60)
         try:
             if daily_ic.empty:
