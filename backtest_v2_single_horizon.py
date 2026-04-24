@@ -96,9 +96,17 @@ def _build_ic_series(
     all_assets = sorted({a for _, s in score_log for a in s.index})
 
     # ── Preismatrix ───────────────────────────────────────────────────────────
-    # Vollständige Handelsdaten für alle Assets sammeln
+    # Vollständige Handelsdaten für alle Assets sammeln.
+    # Tz-Strip: price_cache kann gemischte tz-aware/tz-naive Timestamps enthalten
+    # (alte Parquets UTC-aware, neu heruntergeladene tz-naive).
+    def _strip_tz(idx: pd.Index) -> pd.Index:
+        if hasattr(idx, "tz") and idx.tz is not None:
+            return idx.tz_localize(None)
+        return idx
+
     all_price_dates = sorted({
-        d for ps in price_cache.values() if ps is not None
+        d.replace(tzinfo=None) if hasattr(d, "tzinfo") and d.tzinfo else d
+        for ps in price_cache.values() if ps is not None
         for d in ps.index
     })
     full_price_df = pd.DataFrame(index=all_price_dates, columns=all_assets, dtype=float)
@@ -106,6 +114,8 @@ def _build_ic_series(
         ps = price_cache.get(asset)
         if ps is None:
             continue
+        ps = ps.copy()
+        ps.index = _strip_tz(pd.to_datetime(ps.index))
         ps_clean = ps[~ps.index.duplicated(keep='last')].sort_index()
         full_price_df[asset] = ps_clean.reindex(all_price_dates, method='ffill')
 

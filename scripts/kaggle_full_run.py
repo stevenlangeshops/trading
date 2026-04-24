@@ -772,17 +772,19 @@ def step_pack_artifacts(result_a: dict, result_b: dict):
         "benchmarks":       {"spy_bh": "+60.6%", "ew_universe_bh": "+192.8%",
                               "ew_rebalanced": "+167.3%"},
     }
+    _SKIP_KEYS = {"equity", "trade_log", "equity_dates", "daily_signals", "ic_data",
+                  "score_log", "rankings"}
     summary = {
         "return_code":  0,
         "duration_min": round((time.time() - t0) / 60, 1),
-        "long_only":  {k: v for k, v in result_a.items()
-                       if k not in ("equity", "trade_log", "equity_dates", "daily_signals")},
-        "long_short": {k: v for k, v in result_b.items()
-                       if k not in ("equity", "trade_log", "equity_dates", "daily_signals")},
+        "long_only":  {k: v for k, v in result_a.items() if k not in _SKIP_KEYS},
+        "long_short": {k: v for k, v in result_b.items() if k not in _SKIP_KEYS},
         "horizon_results": horizon_summary,
         "run_references": run_refs,
     }
-    (WORKING / "kernel_summary.json").write_text(json.dumps(summary, indent=2))
+    (WORKING / "kernel_summary.json").write_text(
+        json.dumps(_to_jsonable(summary), indent=2)
+    )
     (WORKING / "kaggle_cmd_exit_code.txt").write_text("0")
 
     # Kurzfassung fuer stdout
@@ -1339,9 +1341,11 @@ def step_backtest_single_horizons(features, asset_map, all_train_results, v1_res
 
     all_bt = backtest_all_horizons(features, all_train_results, asset_map, price_cache)
 
+    _SLIM_SKIP_SH = {"equity", "trade_log", "equity_dates", "daily_signals",
+                     "ic_data", "score_log", "rankings"}
+
     def slim(r):
-        return {k: v for k, v in r.items()
-                if k not in ("equity", "trade_log", "equity_dates", "daily_signals")}
+        return {k: v for k, v in r.items() if k not in _SLIM_SKIP_SH}
 
     from backtest_v2_single_horizon import save_ic_artifacts
 
