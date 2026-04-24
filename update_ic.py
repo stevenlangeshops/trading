@@ -173,21 +173,24 @@ def get_pending_dates(
 # Preise laden & IC berechnen
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _fetch_closes(
+def _fetch_closes_batch(
     tickers:    list[str],
     start_date: pd.Timestamp,
     end_date:   pd.Timestamp,
 ) -> pd.DataFrame:
-    """Lädt tägliche Close-Preise für eine Ticker-Liste via yfinance.
+    """Lädt Close-Preise für alle Ticker in einem einzigen yfinance-Call.
+
+    Deckt den gesamten Zeitraum [start_date, end_date] in einer Anfrage ab.
+    Einzelne Dates werden nachträglich aus dem resultierenden DataFrame
+    herausgelesen.
 
     Args:
         tickers:    Liste von Ticker-Symbolen.
-        start_date: Erster benötigter Tag (einschließlich).
-        end_date:   Letzter benötigter Tag (einschließlich).
+        start_date: Erster benötigter Tag (einschließlich, mit Puffer).
+        end_date:   Letzter benötigter Tag (einschließlich, mit Puffer).
 
     Returns:
-        DataFrame ``(date × ticker)`` mit Close-Preisen.
-        Nicht gefundene Ticker fehlen als Spalten.
+        DataFrame ``(date × ticker)`` mit Close-Preisen, tz-naiv normalisiert.
     """
     try:
         import yfinance as yf
@@ -197,10 +200,10 @@ def _fetch_closes(
     import logging
     logging.getLogger("yfinance").setLevel(logging.CRITICAL)
 
-    # 1 Puffertag auf beiden Seiten damit start/end sicher enthalten sind
     dl_start = (start_date - pd.Timedelta(days=3)).strftime("%Y-%m-%d")
     dl_end   = (end_date   + pd.Timedelta(days=3)).strftime("%Y-%m-%d")
 
+    print(f"  yfinance Batch-Download: {dl_start} bis {dl_end} ({len(tickers)} Ticker) ...")
     raw = yf.download(
         tickers     = tickers,
         start       = dl_start,
@@ -211,111 +214,119 @@ def _fetch_closes(
     if raw.empty:
         return pd.DataFrame()
 
-    # Close-Preise extrahieren (MultiIndex oder flach)
     if isinstance(raw.columns, pd.MultiIndex):
         try:
             closes = raw.xs("Close", axis=1, level=0)
         except KeyError:
             closes = raw.xs("close", axis=1, level=0)
     else:
-        closes = raw[["Close"]].rename(columns={"Close": tickers[0]}) if "Close" in raw.columns else raw
+        col = "Close" if "Close" in raw.columns else raw.columns[0]
+        closes = raw[[col]].rename(columns={col: tickers[0]})
 
     closes.index = pd.to_datetime(closes.index).tz_localize(None).normalize()
     return closes
 
 
-def compute_ic_for_date(
-    pred_date:   pd.Timestamp,
-    predictions: pd.DataFrame,
-    horizon:     int,
-    today:       pd.Timestamp,
-) -> Optional[tuple[pd.Timestamp, float, int]]:
-    """Berechnet den Tages-IC für eine Vorhersage vom pred_date.
+def _nearest_available(index: pd.Index, ts: pd.Timestamp) -> Optional[pd.Timestamp]:
+    """Gibt den ersten Index-Eintrag >= ts zurück oder None."""
+    avail = index[index >= ts]
+    return avail[0] if len(avail) > 0 else None
 
-    Lädt Close-Preise für pred_date und pred_date+horizon via yfinance,
-    berechnet actual_return und Spearman-IC mit den gespeicherten Scores.
 
-    Args:
-        pred_date:   Datum der ursprünglichen Vorhersage.
-        predictions: Alle Predictions aus live_predictions_history.csv.
-        horizon:     Vorhersage-Horizont in Handelstagen.
-        today:       Heutiges Datum (= Obergrenze für den Actual-Return).
-
-    Returns:
-        Tuple ``(ic_date, daily_ic, n_assets)`` oder ``None`` bei Fehler.
-        ``ic_date`` = pred_date (so wie in rolling_ic_v2_7d.csv gespeichert).
-    """
-    from scipy.stats import spearmanr
-
-    # Vorhersagen für pred_date filtern
-    day_preds = predictions[predictions["date"].dt.normalize() == pred_date].copy()
-    if day_preds.empty:
-        print(f"  [WARN] Keine Predictions für {pred_date.date()}")
-        return None
-
-    tickers = day_preds["ticker"].tolist()
-
-    # Actual-Return-Datum: erster Handelstag >= pred_date + horizon
-    target_end = pred_date
+def _horizon_end(pred_date: pd.Timestamp, horizon: int) -> pd.Timestamp:
+    """Berechnet das Datum pred_date + horizon Handelstage."""
+    check   = pred_date + pd.Timedelta(days=1)
     counted = 0
-    check = pred_date + pd.Timedelta(days=1)
     while counted < horizon:
         if _is_trading_day(check):
             counted += 1
         if counted < horizon:
             check += pd.Timedelta(days=1)
-    target_end = check
-    # Sicherstellen dass target_end ein Handelstag und <= today
-    while not _is_trading_day(target_end):
-        target_end -= pd.Timedelta(days=1)
-    if target_end > today:
-        print(f"  [WARN] {pred_date.date()}: Horizont-Ende {target_end.date()} "
-              f"liegt in der Zukunft (heute={today.date()})")
-        return None
+    while not _is_trading_day(check):
+        check -= pd.Timedelta(days=1)
+    return check
 
-    # Preise laden (2 Daten benötigt: pred_date und target_end)
-    closes = _fetch_closes(tickers, pred_date, target_end)
+
+def compute_ic_batch(
+    pending_dates: list[pd.Timestamp],
+    predictions:   pd.DataFrame,
+    horizon:       int,
+    today:         pd.Timestamp,
+) -> list[tuple[pd.Timestamp, float, int]]:
+    """Berechnet IC für alle pending_dates in einem einzigen yfinance-Call.
+
+    Statt für jedes Datum einzeln Preise zu laden, wird der gesamte
+    benötigte Zeitraum in einem Batch heruntergeladen.
+
+    Args:
+        pending_dates: Vorhersage-Daten, für die IC berechnet werden soll.
+        predictions:   Alle Predictions aus live_predictions_history.csv.
+        horizon:       Vorhersage-Horizont in Handelstagen.
+        today:         Heutiges Datum.
+
+    Returns:
+        Liste von ``(pred_date, daily_ic, n_assets)``-Tuples.
+    """
+    from scipy.stats import spearmanr
+
+    # Gesamtheitlichen Datums-Bereich bestimmen
+    batch_start = min(pending_dates)
+    batch_end   = max(_horizon_end(d, horizon) for d in pending_dates)
+    if batch_end > today:
+        batch_end = today
+
+    # Alle Ticker aus den Predictions
+    all_tickers = predictions["ticker"].unique().tolist()
+
+    # Einmaliger Download für den gesamten Zeitraum
+    closes = _fetch_closes_batch(all_tickers, batch_start, batch_end)
     if closes.empty:
-        print(f"  [WARN] Keine Preise für {pred_date.date()} – {target_end.date()}")
-        return None
+        print("  [FEHLER] Keine Preis-Daten erhalten.")
+        return []
 
-    # Nächsten verfügbaren Handelstag für pred_date und target_end finden
-    def _nearest_date(index: pd.Index, ts: pd.Timestamp) -> Optional[pd.Timestamp]:
-        """Gibt den nächsten verfügbaren Index-Eintrag >= ts zurück."""
-        avail = index[index >= ts]
-        return avail[0] if len(avail) > 0 else None
+    print(f"  Preise: {len(closes)} Tage, {closes.shape[1]} Ticker")
 
-    close_start_date = _nearest_date(closes.index, pred_date)
-    close_end_date   = _nearest_date(closes.index, target_end)
+    results = []
+    for pred_date in sorted(pending_dates):
+        target_end = _horizon_end(pred_date, horizon)
+        if target_end > today:
+            print(f"  [SKIP] {pred_date.date()}: Horizont-Ende {target_end.date()} "
+                  f"in der Zukunft")
+            continue
 
-    if close_start_date is None or close_end_date is None:
-        print(f"  [WARN] {pred_date.date()}: pred_date oder target_end nicht in Preis-Index")
-        return None
-    if close_start_date == close_end_date:
-        print(f"  [WARN] {pred_date.date()}: Start- und End-Datum identisch – kein Return berechenbar")
-        return None
+        day_preds = predictions[predictions["date"].dt.normalize() == pred_date].copy()
+        if day_preds.empty:
+            continue
 
-    close_start = closes.loc[close_start_date]
-    close_end   = closes.loc[close_end_date]
+        # Nächsten verfügbaren Handelstag im Preis-Index finden
+        start_idx = _nearest_available(closes.index, pred_date)
+        end_idx   = _nearest_available(closes.index, target_end)
+        if start_idx is None or end_idx is None or start_idx == end_idx:
+            print(f"  [WARN] {pred_date.date()}: Preis-Daten unvollständig")
+            continue
 
-    # Actual Return pro Ticker
-    actual_returns = (close_end / close_start - 1).dropna()
+        close_start = closes.loc[start_idx]
+        close_end   = closes.loc[end_idx]
+        actual_ret  = (close_end / close_start - 1).dropna()
 
-    # Scores und Returns auf gemeinsame Ticker beschränken
-    common = list(set(day_preds["ticker"]) & set(actual_returns.index))
-    if len(common) < 10:
-        print(f"  [WARN] {pred_date.date()}: Nur {len(common)} gemeinsame Ticker – IC übersprungen")
-        return None
+        common = list(set(day_preds["ticker"]) & set(actual_ret.index))
+        if len(common) < 10:
+            print(f"  [WARN] {pred_date.date()}: Nur {len(common)} Ticker – übersprungen")
+            continue
 
-    scores_aligned  = day_preds.set_index("ticker").loc[common, "score"]
-    returns_aligned = actual_returns.loc[common]
+        scores_aln  = day_preds.set_index("ticker").loc[common, "score"]
+        returns_aln = actual_ret.loc[common]
+        ic_val, _   = spearmanr(scores_aln.values, returns_aln.values)
 
-    ic_val, pvalue = spearmanr(scores_aligned.values, returns_aligned.values)
-    if np.isnan(ic_val):
-        print(f"  [WARN] {pred_date.date()}: IC ist NaN")
-        return None
+        if np.isnan(ic_val):
+            print(f"  [WARN] {pred_date.date()}: IC ist NaN")
+            continue
 
-    return pred_date, float(ic_val), len(common)
+        sign = "+" if ic_val >= 0 else ""
+        print(f"  {pred_date.date()}  IC={sign}{ic_val:.4f}  ({len(common)} Assets)")
+        results.append((pred_date, float(ic_val), len(common)))
+
+    return results
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -441,17 +452,9 @@ def main() -> int:
     for d in pending:
         print(f"    {d.date()}")
 
-    # ── 3. IC pro Datum berechnen ─────────────────────────────────────────────
-    print(f"\n[3/4] IC berechnen ...")
-    new_rows: list[tuple[pd.Timestamp, float, int]] = []
-    for pred_date in pending:
-        result = compute_ic_for_date(pred_date, predictions, horizon, today)
-        if result is not None:
-            ic_date, ic_val, n_assets = result
-            sign = "+" if ic_val >= 0 else ""
-            print(f"  {ic_date.date()}  IC={sign}{ic_val:.4f}  "
-                  f"({n_assets} Assets)")
-            new_rows.append(result)
+    # ── 3. IC berechnen (Batch-Download) ─────────────────────────────────────
+    print(f"\n[3/4] IC berechnen (ein yfinance-Download für alle {len(pending)} Daten) ...")
+    new_rows = compute_ic_batch(pending, predictions, horizon, today)
 
     if not new_rows:
         print("  Kein gültiger IC berechnet.")
