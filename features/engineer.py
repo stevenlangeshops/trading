@@ -237,6 +237,13 @@ def sector_neutral_zscore(
 
     # MultiIndex auflösen → flaches DataFrame für vektorisierten groupby
     flat = panel.reset_index()
+
+    # Tz-Strip: sicherstellen dass `date`-Spalte tz-naiv ist (Parquet-Mix-Schutz)
+    if pd.api.types.is_datetime64tz_dtype(flat["date"]):
+        flat["date"] = flat["date"].dt.tz_localize(None)
+    else:
+        flat["date"] = pd.to_datetime(flat["date"]).dt.tz_localize(None)
+
     flat["_sector"] = flat["asset"].map(sector_map).fillna("Unknown")
 
     # Sektor-Level: Mittelwert und Std pro (Datum, Sektor)
@@ -318,6 +325,9 @@ def build_panel(
 
         df = pd.read_parquet(fpath)
         df.index   = pd.to_datetime(df.index)
+        # Tz-Strip: alte Parquets (UTC-aware) und neue (tz-naive) vereinheitlichen
+        if df.index.tz is not None:
+            df.index = df.index.tz_localize(None)
         df.columns = [c.lower() for c in df.columns]
 
         if len(df) < min_rows:
