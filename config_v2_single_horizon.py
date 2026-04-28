@@ -72,6 +72,9 @@ class SingleHorizonConfig:
     patience:     int   = 7    # Early-Stopping nach n Epochen ohne Verbesserung
     batch_size:   int   = 512
     grad_clip:    float = 1.0
+    # Reproduzierbarer Seed: pro Fold wird seed + fold_id gesetzt.
+    # Verschiedene Seeds per CLI (KAGGLE_SEED=42) testen, besten Lauf behalten.
+    seed:         int   = 42
 
     # ── Walk-Forward Splits ────────────────────────────────────────────────────
     train_years:  float = 3.0  # Trainingsfenster (expandierend)
@@ -128,5 +131,10 @@ def get_config(horizon: int) -> SingleHorizonConfig:
         cfg.patience    = 99   # kein Early-Stopping im Smoke-Test
         cfg.train_years = 8.0  # bei ~9 Jahren Daten → ca. 2 Folds
         cfg.batch_size  = 512
+
+    # Seed per Umgebungsvariable überschreibbar: KAGGLE_SEED=123
+    seed_env = os.environ.get("KAGGLE_SEED", "").strip()
+    if seed_env.isdigit():
+        cfg.seed = int(seed_env)
 
     return cfg

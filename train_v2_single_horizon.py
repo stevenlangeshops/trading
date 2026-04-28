@@ -188,6 +188,17 @@ def train_single_horizon(
         logger.info("─" * 60)
         logger.info(f"[{tag}] FOLD {fold.fold_id}")
 
+        # Reproduzierbarer Seed pro Fold: Basis-Seed + fold_id vermeidet
+        # identische Initialisierungen bei allen Folds, sichert aber Reproduzierbarkeit.
+        fold_seed = cfg.seed + fold.fold_id
+        import random
+        random.seed(fold_seed)
+        np.random.seed(fold_seed)
+        torch.manual_seed(fold_seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(fold_seed)
+        logger.info(f"[{tag}]   Seed={fold_seed}")
+
         train_ld, val_ld = make_dataloaders_sh(
             features, targets, fold, asset_map, cfg.seq_len, cfg.batch_size,
         )
