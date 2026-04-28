@@ -87,6 +87,7 @@ def download_batch(
     end:        str,
     retries:    int = 3,
     retry_wait: int = 15,
+    min_rows:   int = 50,
 ) -> dict[str, pd.DataFrame]:
     """Lädt alle Ticker in einem einzigen yfinance-Batch-Call.
 
@@ -139,7 +140,7 @@ def download_batch(
         df = df[~df.index.duplicated(keep="last")]
         df = df.dropna(subset=["close"])
 
-        if len(df) > 50:
+        if len(df) >= min_rows:
             result[tkr] = df
 
     return result
@@ -202,6 +203,9 @@ def run_update(tickers: list[str], today: date) -> None:
         else:
             df_ex = pd.read_parquet(fname)
             last  = pd.to_datetime(df_ex.index).normalize().max()
+            # Tz-Strip: alte Parquets haben UTC-aware Index → tz-naiv machen
+            if getattr(last, "tzinfo", None) is not None:
+                last = last.tz_localize(None)
             if last < today_ts - pd.Timedelta(days=1):
                 need_delta[tkr] = last
             else:
@@ -230,7 +234,8 @@ def run_update(tickers: list[str], today: date) -> None:
 
         print(f"\n  {len(need_delta)} Ticker benötigen Delta ab ~{earliest_last.date()} ...")
         delta_tickers = list(need_delta.keys())
-        new_data = download_batch(delta_tickers, delta_start, delta_end)
+        # min_rows=1: Delta-Zeitraum hat nur wenige Wochen, also kein 50-Zeilen-Filter
+        new_data = download_batch(delta_tickers, delta_start, delta_end, min_rows=1)
 
         ok, skip, fail = 0, 0, 0
         for tkr in delta_tickers:
