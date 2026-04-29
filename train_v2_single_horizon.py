@@ -526,17 +526,24 @@ def train_all_horizons(
         result = train_single_horizon(features, targets_h, asset_map, cfg)
         all_results[h] = result
 
-    # Zusammenfassung
+    # Zusammenfassung – Produktionsmodus hat andere Keys als Walk-Forward
     logger.success("\n" + "═" * 70)
     logger.success("HORIZONT-VERGLEICH (Training)")
     logger.success("═" * 70)
-    logger.success(f"{'Horizont':>10}  {'Ø IC':>8}  {'Ø Loss':>8}  {'Ø MAE':>8}  {'Folds':>6}")
-    logger.success("─" * 70)
     for h in horizons:
         r = all_results[h]
-        logger.success(f"{r['tag']:>10}  {r['mean_ic']:8.4f}  "
-                       f"{r['mean_loss']:8.5f}  {r['mean_mae']:8.5f}  "
-                       f"{len(r['fold_results']):6d}")
+        if r.get("mode") == "production_ensemble":
+            logger.success(
+                f"{r['tag']:>10}  [PRODUKTIONSMODUS]  "
+                f"{len(r.get('ensemble_seeds', []))} Ensemble-Modelle  "
+                f"TrainEnd={r.get('train_end', '?')}"
+            )
+        else:
+            logger.success(
+                f"{r['tag']:>10}  IC={r['mean_ic']:6.4f}  "
+                f"Loss={r['mean_loss']:7.5f}  MAE={r['mean_mae']:7.5f}  "
+                f"Folds={len(r['fold_results'])}"
+            )
     logger.success("═" * 70)
 
     return all_results

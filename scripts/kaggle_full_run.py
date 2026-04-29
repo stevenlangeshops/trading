@@ -737,6 +737,10 @@ def step_pack_artifacts(result_a: dict, result_b: dict):
         ckpt_sh = REPO_DIR / "checkpoints" / f"v2_{_h}d"
         if ckpt_sh.is_dir():
             collect += list(ckpt_sh.glob("*.pt"))
+    # Produktions-Ensemble-Checkpoints
+    ckpt_prod = REPO_DIR / "checkpoints" / "production"
+    if ckpt_prod.is_dir():
+        collect += list(ckpt_prod.glob("prod_model_seed*.pt"))
 
     tar_path = WORKING / "kaggle_artifacts.tar.gz"
     with tarfile.open(str(tar_path), "w:gz") as tf:
