@@ -76,8 +76,11 @@ class LiveConfig:
         tickers:          Vollständige Ticker-Liste. ``None`` → aus asset_map laden.
     """
 
+    # Walk-Forward-Checkpoints (Fallback wenn kein Prod-Ensemble vorhanden)
     ckpt_dir:          Path    = Path("checkpoints/v2_7d")
     walk_json:         Path    = Path("checkpoints/v2_7d/v2_7d_walk_forward.json")
+    # Produktions-Ensemble-Checkpoints (prod_model_seed*.pt)
+    prod_ckpt_dir:     Path    = Path("checkpoints/production")
     asset_map_json:    Path    = Path("asset_map.json")
     ic_history_csv:    Path    = Path("rolling_ic_v2_7d.csv")
     sector_map_json:   Path    = Path("features/sector_map.json")
@@ -492,6 +495,115 @@ def score_universe(
         )
 
     return scores
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Schritt 3b: Produktions-Ensemble laden und gemittelte Scores berechnen
+# ══════════════════════════════════════════════════════════════════════════════
+
+def load_ensemble_checkpoints(
+    prod_ckpt_dir: Path,
+    device:        str,
+) -> list:
+    """Lädt alle Produktions-Ensemble-Modelle aus ``prod_ckpt_dir``.
+
+    Durchsucht das Verzeichnis nach Dateien die dem Muster
+    ``prod_model_seed*.pt`` entsprechen und lädt jedes Modell.
+    Sucht auch in bekannten Archiv- und Unterverzeichnissen.
+
+    Args:
+        prod_ckpt_dir: Pfad zum Produktions-Checkpoint-Ordner.
+        device:        Torch-Device (``"cpu"`` oder ``"cuda"``).
+
+    Returns:
+        Liste von ``(model, ckpt_meta)``-Tupeln.  Leer wenn keine
+        Ensemble-Dateien gefunden wurden.
+    """
+    from backtest_v2_single_horizon import load_fold_model
+
+    # Suchpfade: konfigurierter Pfad + Archiv-Unterverzeichnisse
+    search_dirs = [prod_ckpt_dir, _REPO_ROOT / prod_ckpt_dir]
+    for arch in _archive_dirs():
+        search_dirs.append(arch / "production")
+        search_dirs.append(arch / "checkpoints" / "production")
+
+    found_dir = None
+    for d in search_dirs:
+        pts = sorted(d.glob("prod_model_seed*.pt")) if d.is_dir() else []
+        if pts:
+            found_dir = d
+            break
+
+    if found_dir is None:
+        return []
+
+    pt_files = sorted(found_dir.glob("prod_model_seed*.pt"))
+    models   = []
+    for pt in pt_files:
+        try:
+            model, meta = load_fold_model(str(pt), device)
+            models.append((model, meta))
+        except Exception as exc:
+            print(f"  [WARN] {pt.name} nicht geladen: {exc}")
+
+    return models
+
+
+def score_universe_ensemble(
+    models:         list,
+    features_panel: pd.DataFrame,
+    asset_map:      dict[str, int],
+    target_date:    pd.Timestamp,
+    seq_len:        int,
+    device:         str,
+) -> pd.Series:
+    """Berechnet Ensemble-Scores durch ungewichtetes Mitteln aller Modelle.
+
+    Jedes Modell aus ``models`` wird auf den heutigen Features ausgeführt.
+    Die resultierenden Scores werden pro Ticker gemittelt (Mean-Ensemble).
+    Ticker die von weniger als der Hälfte der Modelle gescort wurden werden
+    verworfen, um Datenlücken nicht zu maskieren.
+
+    Args:
+        models:         Liste von ``(model, ckpt_meta)``-Tupeln.
+        features_panel: MultiIndex-DataFrame ``(date, asset) × FEATURE_COLS``.
+        asset_map:      Dict ``{ticker → Modell-ID}``.
+        target_date:    Handelstag für den Signale berechnet werden.
+        seq_len:        LSTM-Lookback-Fenster.
+        device:         Torch-Device.
+
+    Returns:
+        ``pd.Series`` mit gemittelten Scores, absteigend sortiert.
+        Enthält nur Ticker die von mindestens 50 % der Modelle gescort wurden.
+    """
+    all_scores: list[pd.Series] = []
+
+    for i, (model, _) in enumerate(models, 1):
+        s = score_universe(
+            model=model,
+            features_panel=features_panel,
+            asset_map=asset_map,
+            target_date=target_date,
+            seq_len=seq_len,
+            device=device,
+        )
+        if not s.empty:
+            all_scores.append(s)
+
+    if not all_scores:
+        return pd.Series(dtype=float)
+
+    # Zu DataFrame zusammenführen: Zeilen = Ticker, Spalten = Modell-Index
+    score_df  = pd.concat(all_scores, axis=1)
+    min_votes = max(1, len(all_scores) // 2)   # mind. 50 % der Modelle
+    valid     = score_df.notna().sum(axis=1) >= min_votes
+    mean_scores = score_df.loc[valid].mean(axis=1).sort_values(ascending=False)
+
+    n_models = len(all_scores)
+    print(f"  Ensemble aus {n_models} Modellen erfolgreich geladen und gemittelt.")
+    print(f"  {len(mean_scores)} Assets mit gueltigen Ensemble-Scores")
+
+    return mean_scores
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -972,28 +1084,42 @@ def run_live_inference(cfg: LiveConfig, target_date: Optional[pd.Timestamp] = No
 
     print(f"  {len(valid_tickers)} Assets mit gültigen Features")
 
-    # ── Schritt 3: Modell laden und Scores berechnen ──────────────────────────
-    print("\n[4/5] Modell laden und Scores berechnen ...")
-    model, ckpt_meta, fold_info = load_latest_checkpoint(
-        ckpt_dir=cfg.ckpt_dir,
-        walk_json=cfg.walk_json,
-        device=device,
-    )
+    # ── Schritt 3: Ensemble laden (Prio) oder Einzel-Checkpoint (Fallback) ────
+    print("\n[4/5] Modell(e) laden und Scores berechnen ...")
 
-    if model is None:
-        print("[ABBRUCH] Kein Checkpoint geladen.")
-        return {"target_date": target_date, "scores": pd.Series(dtype=float),
-                "top_tickers": [], "a3_active": False, "n_eff": 0, "ic_roll_40": None}
+    ensemble = load_ensemble_checkpoints(cfg.prod_ckpt_dir, device)
 
-    scores = score_universe(
-        model=model,
-        features_panel=features_panel,
-        asset_map=asset_map,
-        target_date=target_date,
-        seq_len=cfg.seq_len,
-        device=device,
-    )
-    print(f"  {len(scores)} Assets gescort")
+    if ensemble:
+        # Produktions-Ensemble: alle prod_model_seed*.pt mitteln
+        scores = score_universe_ensemble(
+            models=ensemble,
+            features_panel=features_panel,
+            asset_map=asset_map,
+            target_date=target_date,
+            seq_len=cfg.seq_len,
+            device=device,
+        )
+    else:
+        # Fallback: neuester Walk-Forward-Fold-Checkpoint
+        print("  [INFO] Kein Prod-Ensemble gefunden – Fallback auf Walk-Forward-Checkpoint")
+        model, ckpt_meta, fold_info = load_latest_checkpoint(
+            ckpt_dir=cfg.ckpt_dir,
+            walk_json=cfg.walk_json,
+            device=device,
+        )
+        if model is None:
+            print("[ABBRUCH] Kein Checkpoint geladen.")
+            return {"target_date": target_date, "scores": pd.Series(dtype=float),
+                    "top_tickers": [], "a3_active": False, "n_eff": 0, "ic_roll_40": None}
+        scores = score_universe(
+            model=model,
+            features_panel=features_panel,
+            asset_map=asset_map,
+            target_date=target_date,
+            seq_len=cfg.seq_len,
+            device=device,
+        )
+        print(f"  {len(scores)} Assets gescort (Einzel-Checkpoint)")
 
     if scores.empty:
         print("[ABBRUCH] Keine Scores berechnet – zu wenig Features für seq_len?")
