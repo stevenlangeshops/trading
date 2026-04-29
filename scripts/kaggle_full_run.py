@@ -1292,12 +1292,18 @@ def step_train_single_horizons(features, asset_map, horizons=None):
         wf_path = WORKING / f"v2_{h}d_walk_forward.json"
         with open(wf_path, "w") as f:
             safe = {k: v for k, v in res.items() if k != "fold_results"}
-            safe["fold_summary"] = [
-                {k: v for k, v in fr.items()}
-                for fr in res["fold_results"]
-            ]
-            json.dump(safe, f, indent=2, default=str)
-        log_write(f"  {wf_path.name} gespeichert (IC={res['mean_ic']:.4f})")
+            if res.get("mode") == "production_ensemble":
+                # Produktionsmodus: keine Fold-Ergebnisse, nur Ensemble-Info
+                json.dump(safe, f, indent=2, default=str)
+                log_write(f"  {wf_path.name} gespeichert (Produktionsmodus, "
+                          f"{len(res.get('ensemble_seeds', []))} Modelle)")
+            else:
+                safe["fold_summary"] = [
+                    {k: v for k, v in fr.items()}
+                    for fr in res["fold_results"]
+                ]
+                json.dump(safe, f, indent=2, default=str)
+                log_write(f"  {wf_path.name} gespeichert (IC={res['mean_ic']:.4f})")
 
     return all_results
 
@@ -1310,6 +1316,9 @@ def step_backtest_single_horizons(features, asset_map, all_train_results, v1_res
     je Horizont: ``v2_{h}d_backtest.json``, ``v2_{h}d_trade_log.json``,
     ``v2_{h}d_equity.png`` und ``rolling_ic_v2_{h}d.json/.csv``.
 
+    Im Produktionsmodus (``mode="production_ensemble"``) wird der Backtest
+    übersprungen, da alle Daten zum Training verwendet wurden.
+
     Args:
         features:          MultiIndex-DataFrame ``(date, asset) × FEATURE_COLS``.
         asset_map:         Dict ``{ticker → id}``.
@@ -1320,6 +1329,27 @@ def step_backtest_single_horizons(features, asset_map, all_train_results, v1_res
         Dict ``{horizon → backtest_result}`` mit Metriken + Equity.
     """
     log_write(f"\n{'='*60}\nSCHRITT 21: Single-Horizon Backtests [{elapsed()}]\n{'='*60}")
+
+    # Produktionsmodus: kein Backtest möglich (alle Daten im Training)
+    prod_horizons = [
+        h for h, r in all_train_results.items()
+        if r.get("mode") == "production_ensemble"
+    ]
+    if prod_horizons:
+        log_write(f"  [PROD] Horizonte {prod_horizons}: Backtest übersprungen "
+                  f"(Ensemble auf allen Daten trainiert)")
+        for h in prod_horizons:
+            r = all_train_results[h]
+            log_write(f"  [PROD] Gespeicherte Modelle:")
+            for p in r.get("saved_paths", []):
+                log_write(f"    {p}")
+        # Nur Horizonte mit Walk-Forward-Ergebnissen backtesten
+        all_train_results = {
+            h: r for h, r in all_train_results.items()
+            if r.get("mode") != "production_ensemble"
+        }
+        if not all_train_results:
+            return {}  # nichts zu backtesten
 
     for _mod in list(sys.modules.keys()):
         if _mod.startswith(("config_v2_single", "models_v2_single", "train_v2_single",

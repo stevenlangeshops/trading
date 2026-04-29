@@ -203,6 +203,145 @@ def eval_epoch(model, loader, criterion, device):
     return loss, ic, mae
 
 
+# ── Produktionsmodus: Ensemble auf allen Daten ───────────────────────────────
+
+def train_production_ensemble(
+    features:  pd.DataFrame,
+    targets:   pd.Series,
+    asset_map: dict[str, int],
+    cfg:       SingleHorizonConfig,
+) -> dict:
+    """Trainiert ein Ensemble von Produktionsmodellen auf dem gesamten Datensatz.
+
+    Im Gegensatz zum Walk-Forward-Modus gibt es keinen Train/Val-Split.  Jedes
+    Ensemble-Mitglied wird auf allen verfügbaren Daten trainiert (Tag 0 bis heute)
+    und unter ``checkpoints/production/prod_model_seed{seed}.pt`` gespeichert.
+
+    Das Ergebnis-Dict enthält kein ``fold_results`` – der Backtest-Schritt wird
+    in diesem Modus automatisch übersprungen.
+
+    Args:
+        features:  Feature-Panel (MultiIndex date × asset).
+        targets:   Forward-Return-Targets (MultiIndex date × asset).
+        asset_map: {ticker → modell_id}-Mapping.
+        cfg:       Konfiguration; ``cfg.ensemble_seeds`` bestimmt die Seeds,
+                   ``cfg.epochs`` die Trainings-Epochen pro Modell.
+
+    Returns:
+        Dict mit ``mode="production_ensemble"``, ``saved_paths`` und
+        ``train_end`` (letztes Datum im Datensatz).
+    """
+    device     = "cuda" if torch.cuda.is_available() else "cpu"
+    n_features = len(features.columns)
+    n_assets   = max(asset_map.values()) + 1
+    tag        = cfg.tag
+
+    all_dates  = features.index.get_level_values("date").unique().sort_values()
+    train_end  = all_dates.max()
+
+    logger.info("═" * 60)
+    logger.info(f"[{tag}] PRODUKTIONSMODUS – Ensemble Training")
+    logger.info(f"[{tag}]   Device   : {device}")
+    logger.info(f"[{tag}]   Assets   : {n_assets}  Features: {n_features}")
+    logger.info(f"[{tag}]   Daten    : {all_dates.min().date()} bis {train_end.date()}")
+    logger.info(f"[{tag}]   Seeds    : {cfg.ensemble_seeds}")
+    logger.info(f"[{tag}]   Epochen  : {cfg.epochs}  (kein Early-Stopping)")
+    logger.info("═" * 60)
+
+    # Ausgabe-Verzeichnis
+    prod_dir = cfg.checkpoint_dir.parent / "production"
+    prod_dir.mkdir(parents=True, exist_ok=True)
+
+    # Feature/Target-Alignment (einmalig)
+    common_idx   = features.index.intersection(targets.index)
+    feat_aligned = features.loc[common_idx]
+    tgt_aligned  = targets.loc[common_idx]
+
+    saved_paths: list[Path] = []
+
+    for seed in cfg.ensemble_seeds:
+        logger.info("─" * 60)
+        logger.info(f"[{tag}] Ensemble-Mitglied  Seed={seed}")
+        seed_everything(seed)
+
+        # DataLoader mit deterministischem Generator über alle Daten
+        g = torch.Generator()
+        g.manual_seed(seed)
+        ds = CrossSectionalDataset(
+            feat_aligned, tgt_aligned, asset_map, cfg.seq_len,
+            start_date=all_dates.min(), end_date=train_end,
+        )
+        if len(ds) < 100:
+            logger.warning(f"[{tag}]   Zu wenig Daten ({len(ds)}) – übersprungen")
+            continue
+
+        loader = DataLoader(
+            ds, batch_size=cfg.batch_size, shuffle=True, drop_last=True,
+            pin_memory=torch.cuda.is_available(), generator=g,
+        )
+        logger.info(f"[{tag}]   Samples: {len(ds):,}  Batches/Epoche: {len(loader)}")
+
+        # Modell, Optimizer, Scheduler – neu initialisiert pro Seed
+        model = SingleHorizonRankModel(
+            n_features=n_features, n_assets=n_assets,
+            embed_dim=cfg.embed_dim, hidden_dim=cfg.hidden_dim,
+            num_layers=cfg.num_layers, dropout=cfg.dropout,
+            seq_len=cfg.seq_len,
+        ).to(device)
+
+        criterion = CombinedRankLoss(rank_weight=cfg.rank_weight, margin=cfg.rank_margin)
+        optimizer = torch.optim.AdamW(
+            model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay,
+        )
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=cfg.epochs, eta_min=cfg.lr / 100,
+        )
+
+        logger.info(f"[{tag}]   {'Ep':>3}  {'TrLoss':>9}  {'LR':>11}")
+
+        # Training über alle Epochen – kein Early-Stopping (kein Val-Set)
+        for epoch in range(1, cfg.epochs + 1):
+            tr_loss = train_epoch(
+                model, loader, optimizer, criterion, device, cfg.grad_clip,
+            )
+            scheduler.step()
+            lr = optimizer.param_groups[0]["lr"]
+            logger.info(f"[{tag}]   {epoch:3d}  {tr_loss:9.5f}  {lr:11.7f}")
+
+        # Finales Modell speichern
+        ckpt_path = prod_dir / f"prod_model_seed{seed}.pt"
+        torch.save({
+            "seed":        seed,
+            "model_state": model.state_dict(),
+            "horizon":     cfg.horizon,
+            "train_end":   str(train_end.date()),
+            "config": {
+                "n_features": n_features, "n_assets": n_assets,
+                "embed_dim":  cfg.embed_dim, "hidden_dim": cfg.hidden_dim,
+                "num_layers": cfg.num_layers, "seq_len":   cfg.seq_len,
+                "horizon":    cfg.horizon,
+            },
+        }, ckpt_path)
+        logger.success(f"[{tag}]   Gespeichert: {ckpt_path}")
+        saved_paths.append(ckpt_path)
+
+    logger.success("═" * 60)
+    logger.success(f"[{tag}] Ensemble fertig: {len(saved_paths)} Modelle")
+    for p in saved_paths:
+        logger.success(f"[{tag}]   {p.name}")
+    logger.success("═" * 60)
+
+    return {
+        "horizon":        cfg.horizon,
+        "tag":            tag,
+        "mode":           "production_ensemble",
+        "ensemble_seeds": cfg.ensemble_seeds,
+        "saved_paths":    [str(p) for p in saved_paths],
+        "train_end":      str(train_end.date()),
+        "fold_results":   [],   # kein Walk-Forward → Backtest-Schritt überspringt
+    }
+
+
 # ── Walk-Forward fuer einen Horizont ──────────────────────────────────────────
 
 def train_single_horizon(
@@ -226,6 +365,10 @@ def train_single_horizon(
     Returns:
         Dict mit ``fold_results``, ``mean_ic``, ``mean_loss``, ``mean_mae``.
     """
+    # Produktionsmodus: direkt zum Ensemble-Training weiterleiten
+    if cfg.production_mode:
+        return train_production_ensemble(features, targets, asset_map, cfg)
+
     device     = "cuda" if torch.cuda.is_available() else "cpu"
     n_features = len(features.columns)
     n_assets   = max(asset_map.values()) + 1

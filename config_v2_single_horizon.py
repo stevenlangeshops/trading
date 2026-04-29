@@ -14,7 +14,7 @@ Smoke-Test-Modus (KAGGLE_SMOKE_TEST=1):
 """
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -76,6 +76,12 @@ class SingleHorizonConfig:
     # Verschiedene Seeds per CLI (KAGGLE_SEED=42) testen, besten Lauf behalten.
     seed:         int   = 42
 
+    # ── Produktionsmodus ───────────────────────────────────────────────────────
+    # Wenn True: Walk-Forward überspringen, stattdessen Ensemble auf ALLEN Daten.
+    # Aktivierbar per Notebook-Schalter PROD_MODE=True oder KAGGLE_PROD_MODE=1.
+    production_mode: bool = False
+    ensemble_seeds:  list = field(default_factory=lambda: [42, 43, 44, 45, 46])
+
     # ── Walk-Forward Splits ────────────────────────────────────────────────────
     train_years:  float = 3.0  # Trainingsfenster (expandierend)
     val_months:   float = 6.0  # Validierungsfenster je Fold
@@ -136,5 +142,9 @@ def get_config(horizon: int) -> SingleHorizonConfig:
     seed_env = os.environ.get("KAGGLE_SEED", "").strip()
     if seed_env.isdigit():
         cfg.seed = int(seed_env)
+
+    # Produktionsmodus: KAGGLE_PROD_MODE=1
+    if os.environ.get("KAGGLE_PROD_MODE", "").strip() == "1":
+        cfg.production_mode = True
 
     return cfg
