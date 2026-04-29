@@ -18,6 +18,7 @@ Nutzung:
 from __future__ import annotations
 
 import os
+import random
 from pathlib import Path
 from typing import Optional
 
@@ -43,6 +44,32 @@ from models.dataset import (
     create_walk_forward_folds,
     CrossSectionalDataset,
 )
+
+
+# ── Determinismus ─────────────────────────────────────────────────────────────
+
+def seed_everything(seed: int = 42) -> None:
+    """Setzt alle relevanten Random-Seeds für vollständig reproduzierbares Training.
+
+    Deckt Python, NumPy, PyTorch (CPU + GPU) sowie cuDNN ab.  Muss **vor**
+    jeder Modell-Initialisierung und DataLoader-Erstellung aufgerufen werden.
+
+    Hinweis: ``cudnn.deterministic = True`` deaktiviert nicht-deterministische
+    cuDNN-Kernel und kann das Training auf GPU leicht verlangsamen (~5–15 %).
+    Für Produktionsläufe ist dieser Trade-off akzeptabel.
+
+    Args:
+        seed: Integer-Seed.  Default 42.  Pro Fold wird ``seed + fold_id``
+              übergeben, damit jeder Fold unterschiedlich, aber reproduzierbar
+              initialisiert wird.
+    """
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)          # wirkt auch bei Single-GPU
+    torch.backends.cudnn.deterministic = True  # keine nicht-det. cuDNN-Kernel
+    torch.backends.cudnn.benchmark     = False  # kein Auto-Tuning (würde Seed brechen)
 
 
 # ── Target-Berechnung ────────────────────────────────────────────────────────
@@ -91,17 +118,30 @@ def build_single_horizon_targets(
 # ── DataLoader Factory ────────────────────────────────────────────────────────
 
 def make_dataloaders_sh(
-    features: pd.DataFrame,
-    targets:  pd.Series,
-    fold:     WalkForwardFold,
-    asset_map: dict[str, int],
-    seq_len:  int = 64,
+    features:   pd.DataFrame,
+    targets:    pd.Series,
+    fold:       WalkForwardFold,
+    asset_map:  dict[str, int],
+    seq_len:    int = 64,
     batch_size: int = 512,
+    seed:       int = 42,
 ) -> tuple[DataLoader, DataLoader]:
-    """Wrapper um CrossSectionalDataset (v1) mit Index-Alignment."""
-    common_idx = features.index.intersection(targets.index)
+    """Wrapper um CrossSectionalDataset (v1) mit Index-Alignment.
+
+    Args:
+        features:   Feature-Panel (MultiIndex date × asset).
+        targets:    Target-Series (MultiIndex date × asset).
+        fold:       Walk-Forward-Fold mit Train-/Val-Grenzen.
+        asset_map:  {ticker → modell_id}-Mapping.
+        seq_len:    LSTM-Lookback-Fenster.
+        batch_size: Mini-Batch-Größe für den Training-DataLoader.
+        seed:       Seed für den DataLoader-Generator – stellt deterministisches
+                    Batch-Shuffling sicher (wichtig für Reproduzierbarkeit).
+    """
+    common_idx   = features.index.intersection(targets.index)
     feat_aligned = features.loc[common_idx]
     tgt_aligned  = targets.loc[common_idx]
+
     train_ds = CrossSectionalDataset(
         feat_aligned, tgt_aligned, asset_map, seq_len,
         start_date=fold.train_start, end_date=fold.train_end,
@@ -110,10 +150,20 @@ def make_dataloaders_sh(
         feat_aligned, tgt_aligned, asset_map, seq_len,
         start_date=fold.val_start, end_date=fold.val_end,
     )
-    train_ld = DataLoader(train_ds, batch_size=batch_size, shuffle=True,
-                          drop_last=True, pin_memory=torch.cuda.is_available())
-    val_ld   = DataLoader(val_ds, batch_size=batch_size * 2, shuffle=False,
-                          pin_memory=torch.cuda.is_available())
+
+    # Expliziter Generator: deterministisches Shuffling unabhängig vom globalen
+    # RNG-Zustand, der zwischen den Epochen weiterwandert.
+    g = torch.Generator()
+    g.manual_seed(seed)
+
+    train_ld = DataLoader(
+        train_ds, batch_size=batch_size, shuffle=True, drop_last=True,
+        pin_memory=torch.cuda.is_available(), generator=g,
+    )
+    val_ld = DataLoader(
+        val_ds, batch_size=batch_size * 2, shuffle=False,
+        pin_memory=torch.cuda.is_available(),
+    )
     return train_ld, val_ld
 
 
@@ -161,9 +211,20 @@ def train_single_horizon(
     asset_map: dict[str, int],
     cfg:       SingleHorizonConfig,
 ) -> dict:
-    """
-    Walk-Forward Training fuer einen einzelnen Horizont.
-    Identisch zu v1 train_walk_forward, nur mit generischem Modell.
+    """Walk-Forward Training für einen einzelnen Horizont.
+
+    Für jeden Fold wird ``seed_everything(cfg.seed + fold_id)`` aufgerufen,
+    sodass alle 12 Folds unterschiedliche, aber deterministisch reproduzierbare
+    Gewichts-Initialisierungen erhalten.
+
+    Args:
+        features:  Feature-Panel (MultiIndex date × asset).
+        targets:   Forward-Return-Targets (MultiIndex date × asset).
+        asset_map: {ticker → modell_id}-Mapping.
+        cfg:       Vollständige Trainings-Konfiguration inkl. ``cfg.seed``.
+
+    Returns:
+        Dict mit ``fold_results``, ``mean_ic``, ``mean_loss``, ``mean_mae``.
     """
     device     = "cuda" if torch.cuda.is_available() else "cpu"
     n_features = len(features.columns)
@@ -173,7 +234,7 @@ def train_single_horizon(
     logger.info(f"[{tag}] Walk-Forward Training: Device={device}")
     logger.info(f"[{tag}]   Assets={n_assets}  Features={n_features}  "
                 f"Horizon={cfg.horizon}d  seq_len={cfg.seq_len}")
-    logger.info(f"[{tag}]   Loss: MSE + {cfg.rank_weight} * RankLoss")
+    logger.info(f"[{tag}]   Loss: MSE + {cfg.rank_weight} * RankLoss  Seed={cfg.seed}")
 
     all_dates = features.index.get_level_values("date").unique()
     folds = create_walk_forward_folds(all_dates, cfg.train_years, cfg.val_months, cfg.step_months)
@@ -188,19 +249,15 @@ def train_single_horizon(
         logger.info("─" * 60)
         logger.info(f"[{tag}] FOLD {fold.fold_id}")
 
-        # Reproduzierbarer Seed pro Fold: Basis-Seed + fold_id vermeidet
-        # identische Initialisierungen bei allen Folds, sichert aber Reproduzierbarkeit.
+        # Deterministischer Fold-Seed: Basis + fold_id → jeder Fold einzigartig,
+        # aber bei gleichem cfg.seed immer identisch reproduzierbar.
         fold_seed = cfg.seed + fold.fold_id
-        import random
-        random.seed(fold_seed)
-        np.random.seed(fold_seed)
-        torch.manual_seed(fold_seed)
-        if torch.cuda.is_available():
-            torch.cuda.manual_seed_all(fold_seed)
-        logger.info(f"[{tag}]   Seed={fold_seed}")
+        seed_everything(fold_seed)
+        logger.info(f"[{tag}]   Seed={fold_seed}  (basis={cfg.seed} + fold={fold.fold_id})")
 
         train_ld, val_ld = make_dataloaders_sh(
             features, targets, fold, asset_map, cfg.seq_len, cfg.batch_size,
+            seed=fold_seed,
         )
         if len(train_ld.dataset) < 100:
             logger.warning(f"[{tag}] Fold {fold.fold_id}: Zu wenig Daten")
@@ -248,6 +305,7 @@ def train_single_horizon(
                     "val_loss":    va_loss,
                     "val_ic":      va_ic,
                     "horizon":     cfg.horizon,
+                    "seed":        fold_seed,   # für spätere Reproduzierbarkeit
                     "config": {
                         "n_features": n_features, "n_assets": n_assets,
                         "embed_dim": cfg.embed_dim, "hidden_dim": cfg.hidden_dim,
