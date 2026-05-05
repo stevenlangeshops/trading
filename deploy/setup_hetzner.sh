@@ -30,7 +30,7 @@ TRADING_DIR="/opt/trading"
 VENV_DIR="${TRADING_DIR}/.venv"
 LOG_DIR="${TRADING_DIR}/logs"
 PYTHON_VERSION="3.12"
-CRON_TIME="45 13 * * 1-5"   # 13:45 UTC = 15:45 CET (Sommer) / 14:45 CET (Winter)
+CRON_TIME="45 15 * * 1-5"   # 15:45 CEST (Serverzeit Europe/Berlin) = 13:45 UTC = 09:45 ET
                                # Mo–Fr, 15 Minuten nach Marktöffnung (09:30 ET)
                                # Bewusst NICHT direkt bei Marktöffnung: Opening-Volatilität
                                # und breite Spreads in den ersten Minuten vermeiden.
@@ -241,7 +241,7 @@ ${CRON_ENTRY}
 EOF
 chmod 644 "${CRON_FILE}"
 service cron restart 2>/dev/null || systemctl restart cron 2>/dev/null || true
-info "Cron-Job aktiv: ${CRON_TIME} (Mo-Fr, UTC = 16:10 CET)"
+info "Cron-Job aktiv: ${CRON_TIME} Berliner Zeit (Mo-Fr, = 13:45 UTC = 09:45 ET)"
 
 # Log-Rotation
 cat > "/etc/logrotate.d/trading" << EOF

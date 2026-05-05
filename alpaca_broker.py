@@ -150,7 +150,8 @@ def _compute_gap_filter_data(
         )
         bars_resp = data_client.get_stock_bars(bars_req)
 
-        for sym, bar_list in bars_resp.items():
+        raw = bars_resp.data if hasattr(bars_resp, "data") else bars_resp
+        for sym, bar_list in raw.items():
             if not bar_list or len(bar_list) < 2:
                 result[sym] = {"prev_close": None, "atr14": None}
                 continue
@@ -332,7 +333,10 @@ def set_stop_losses(
 
     for pos in positions:
         symbol    = pos.symbol
-        qty       = int(float(pos.qty))
+        # qty_available berücksichtigt bereits für andere Orders reservierte Stücke
+        qty_total = int(float(pos.qty))
+        qty_avail = int(float(pos.qty_available)) if hasattr(pos, "qty_available") and pos.qty_available else qty_total
+        qty       = max(1, qty_avail)
         avg_entry = float(pos.avg_entry_price)
         curr_price = float(pos.current_price)
         stop_price = round(avg_entry * (1.0 - stop_pct), 2)
@@ -701,8 +705,8 @@ def execute_target_allocation(
     else:
         print(f"  Aktualisiere Stops fuer gehandelte Positionen: {sorted(traded_symbols)}")
         if not dry_run:
-            # Kurze Pause damit Kauf-Orders vollstaendig verarbeitet sind
-            time.sleep(sell_delay_s)
+            # Pause damit Kauf-Orders verarbeitet sind (vermeidet Wash-Trade-Fehler)
+            time.sleep(5)
         result["stop_losses"] = set_stop_losses(
             trading_client = trading_client,
             stop_pct       = stop_loss_pct,

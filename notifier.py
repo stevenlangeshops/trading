@@ -479,6 +479,10 @@ def send_portfolio_report(
     # Caption auf 1024 Zeichen kürzen (Telegram-Limit für Foto-Captions)
     if len(caption) > 1024:
         caption = caption[:1020] + "\n..."
+        # Unclosed <b>-Tags schließen – sonst lehnt Telegram die Nachricht ab
+        open_tags = caption.count("<b>") - caption.count("</b>")
+        if open_tags > 0:
+            caption += "</b>" * open_tags
 
     # ── Chart generieren ──────────────────────────────────────────────────────
     try:
