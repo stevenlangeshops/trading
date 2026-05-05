@@ -1,0 +1,44 @@
+# ══════════════════════════════════════════════════════════════════════════════
+# requirements_server.txt
+# Exakt gepinnte Abhängigkeiten für den Hetzner-Produktionsserver (Linux/CPU).
+# Python 3.11 | Kein GPU | Getestet am 2026-05-05
+#
+# Installation:
+#   pip install torch==2.10.0 --index-url https://download.pytorch.org/whl/cpu
+#   pip install -r requirements_server.txt
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ── Core Numerik ──────────────────────────────────────────────────────────────
+numpy==2.2.3
+pandas==2.2.3
+scipy==1.17.1
+pyarrow==23.0.1
+
+# ── Deep Learning (CPU-Only – GPU-Version NICHT verwenden) ───────────────────
+# torch wird VOR diesem File separat installiert:
+#   pip install torch==2.10.0 --index-url https://download.pytorch.org/whl/cpu
+
+# ── Marktdaten ────────────────────────────────────────────────────────────────
+yfinance==1.2.0
+ta==0.11.0
+
+# ── Alpaca Paper/Live Trading ─────────────────────────────────────────────────
+alpaca-py==0.43.4
+# Transitive Abhängigkeiten von alpaca-py (exakt gepinnt um Konflikte zu vermeiden)
+aiohttp==3.13.5
+msgpack==1.0.3
+sseclient-py==1.9.0
+
+# ── HTTP / Netzwerk ───────────────────────────────────────────────────────────
+requests==2.32.3
+urllib3==2.6.3
+websockets==16.0
+cryptography==47.0.0
+
+# ── Utilities ─────────────────────────────────────────────────────────────────
+python-dotenv==1.0.1
+loguru==0.7.3
+tqdm==4.67.1
+
+# ── Reporting / Charts ────────────────────────────────────────────────────────
+matplotlib>=3.8,<4

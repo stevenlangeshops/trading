@@ -1,0 +1,3 @@
+set APCA_API_KEY_ID=PKWY4S6A3YHDB7GOZUNOQSWZGB
+set APCA_API_SECRET_KEY=3vjWSWYFvRH7MvWfus36SmUgK733Jis93yXJnXydyzyh
+python live_inference.py --execute

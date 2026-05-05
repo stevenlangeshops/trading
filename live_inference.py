@@ -994,6 +994,22 @@ def parse_args() -> argparse.Namespace:
                    help="cuda oder cpu (auto wenn leer)")
     p.add_argument("--date",          default=None,
                    help="Inference-Datum YYYY-MM-DD (Standard: letzter Handelstag)")
+
+    # ── Execution-Flags ───────────────────────────────────────────────────────
+    exec_grp = p.add_argument_group("Alpaca Execution")
+    exec_grp.add_argument(
+        "--execute",
+        action="store_true",
+        default=False,
+        help="Trades nach der Inference an Alpaca senden (Paper-Trading).",
+    )
+    exec_grp.add_argument(
+        "--dry-run",
+        action="store_true",
+        default=False,
+        help="Simuliert die Orders ohne sie zu senden (impliziert --execute).",
+    )
+
     return p.parse_args()
 
 
@@ -1151,6 +1167,7 @@ def run_live_inference(cfg: LiveConfig, target_date: Optional[pd.Timestamp] = No
     print(output)
 
     top_tickers = list(scores.head(n_eff).index)
+
     return {
         "target_date": target_date,
         "scores":      scores,
@@ -1181,7 +1198,81 @@ def main() -> int:
         pd.Timestamp(args.date) if args.date else None
     )
 
-    run_live_inference(cfg, target_date=target_date)
+    try:
+        result = run_live_inference(cfg, target_date=target_date)
+    except Exception as exc:
+        err_msg = f"<b>Trading-Bot FEHLER | {(target_date or pd.Timestamp.today()).date()}</b>\n<code>{exc}</code>"
+        try:
+            from notifier import send_telegram_message
+            send_telegram_message(err_msg)
+        except Exception:
+            pass
+        raise
+
+    # ── Alpaca Execution-Layer ────────────────────────────────────────────────
+    if args.execute or args.dry_run:
+        top_tickers = result.get("top_tickers", [])
+
+        if not top_tickers:
+            print("\n[EXECUTION] Keine Ziel-Ticker vorhanden – keine Orders gesendet.")
+            return 0
+
+        if result.get("a3_active") and not top_tickers:
+            print("\n[EXECUTION] A3-Policy aktiv und n_eff=0 – alle Positionen halten.")
+            return 0
+
+        try:
+            from alpaca_broker import execute_target_allocation
+        except ImportError as exc:
+            print(f"\n[FEHLER] alpaca_broker konnte nicht importiert werden: {exc}")
+            return 1
+
+        execution_result = None
+        try:
+            execution_result = execute_target_allocation(
+                target_tickers = top_tickers,
+                dry_run        = args.dry_run,
+            )
+        except RuntimeError as exc:
+            # Markt geschlossen
+            print(f"\n[EXECUTION ABGEBROCHEN] {exc}")
+        except EnvironmentError as exc:
+            # Fehlende Credentials
+            print(f"\n[CONFIGURATION FEHLER] {exc}")
+
+        # ── Telegram Portfolio-Report ──────────────────────────────────────────
+        try:
+            from notifier import send_portfolio_report
+            send_portfolio_report(
+                top_tickers      = result.get("top_tickers", []),
+                scores           = result.get("scores", pd.Series(dtype=float)),
+                n_eff            = result.get("n_eff", 0),
+                a3_active        = result.get("a3_active", False),
+                ic_roll_40       = result.get("ic_roll_40"),
+                target_date      = result.get("target_date", pd.Timestamp.today()),
+                execution_result = execution_result,
+                dry_run          = args.dry_run,
+            )
+        except Exception as _tg_exc:
+            print(f"  [WARN] Telegram-Report fehlgeschlagen: {_tg_exc}")
+
+    elif not (args.execute or args.dry_run):
+        # Auch ohne Execution einen einfachen Report senden
+        try:
+            from notifier import send_portfolio_report
+            send_portfolio_report(
+                top_tickers      = result.get("top_tickers", []),
+                scores           = result.get("scores", pd.Series(dtype=float)),
+                n_eff            = result.get("n_eff", 0),
+                a3_active        = result.get("a3_active", False),
+                ic_roll_40       = result.get("ic_roll_40"),
+                target_date      = result.get("target_date", pd.Timestamp.today()),
+                execution_result = None,
+                dry_run          = False,
+            )
+        except Exception as _tg_exc:
+            print(f"  [WARN] Telegram-Report fehlgeschlagen: {_tg_exc}")
+
     return 0
 
 
