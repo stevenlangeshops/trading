@@ -983,12 +983,27 @@ def step_persist_results():
         upload_files.append(f"v2_{_h}d_backtest.json")
         upload_files.append(f"v2_{_h}d_walk_forward.json")
         upload_files.append(f"v2_{_h}d_equity.png")
+
+    # Walk-Forward Fold-Checkpoints direkt hochladen (nötig für EXEC_COMPARE_ONLY-Modus)
+    # Produktion-Ensemble-Modelle werden ebenfalls direkt hochgeladen.
+    _ckpt_sh_dir = REPO_DIR / "checkpoints"
+    for _h in [4, 7, 11, 15]:
+        _ckpt_sh = _ckpt_sh_dir / f"v2_{_h}d"
+        if _ckpt_sh.is_dir():
+            for _pt in sorted(_ckpt_sh.glob("fold_*_best.pt")):
+                upload_files.append(str(_pt))
+    _ckpt_prod = _ckpt_sh_dir / "production"
+    if _ckpt_prod.is_dir():
+        for _pt in sorted(_ckpt_prod.glob("prod_model_seed*.pt")):
+            upload_files.append(str(_pt))
+
     copied = []
     for fname in upload_files:
-        src = WORKING / fname
+        # Absolute Pfade (z.B. für .pt-Dateien aus checkpoints/) direkt verwenden
+        src = Path(fname) if Path(fname).is_absolute() else WORKING / fname
         if src.exists():
-            shutil.copy(src, upload_dir / fname)
-            copied.append(fname)
+            shutil.copy(src, upload_dir / src.name)
+            copied.append(src.name)
 
     if not copied:
         log_write("  [SKIP] Keine Dateien zum Hochladen gefunden.")
@@ -1293,11 +1308,14 @@ def step_load_sh_checkpoints(asset_map, horizons=None):
     log_write(f"\n{'='*60}\nSCHRITT 20b: Single-Horizon Checkpoints laden [{elapsed()}]\n{'='*60}")
 
     # Alle möglichen Quell-Verzeichnisse für Checkpoints (trading-results Dataset)
+    # Nach dem Fix liegen fold_*_best.pt direkt im Dataset-Root (flach).
     results_dirs = [
         Path("/kaggle/input/trading-results"),
         Path("/kaggle/input/trading-results/checkpoints"),
+        Path("/kaggle/input/trading-results/kaggle_artifacts"),
         Path("/kaggle/input/datasets/busersteven/trading-results"),
         Path("/kaggle/input/datasets/busersteven/trading-results/checkpoints"),
+        Path("/kaggle/input/datasets/busersteven/trading-results/kaggle_artifacts"),
     ]
 
     all_results: dict = {}
