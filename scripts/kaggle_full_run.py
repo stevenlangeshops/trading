@@ -973,6 +973,9 @@ def step_persist_results():
         # Single-Horizon Ergebnisse
         "benchmark_horizon_comparison.json",
         "horizon_comparison_equity.png",
+        # Execution-Mode-Vergleich
+        "exec_comparison.json",
+        "exec_comparison_equity.png",
         # Reproduktions-Manifest und Einzelcharts
         "run_manifest.json",
     ]
@@ -1467,6 +1470,101 @@ def step_backtest_single_horizons(features, asset_map, all_train_results, v1_res
     return all_bt
 
 
+def step_exec_comparison(features, asset_map, all_train_results):
+    """Schritt 22: Execution-Mode-Vergleich (Classic vs. Composition-Change).
+
+    Läuft nur für den Produktions-Horizont 7d und nur wenn Walk-Forward-
+    Checkpoints vorhanden sind (kein Produktions-Ensemble).
+
+    Args:
+        features:          Feature-Panel (date × asset).
+        asset_map:         {ticker → asset_id}.
+        all_train_results: Rückgabe von step_train_single_horizons().
+
+    Returns:
+        Dict mit Vergleichs-Ergebnissen oder ``{}``.
+    """
+    log_write(f"\n{'='*60}\nSCHRITT 22: Execution-Mode-Vergleich [{elapsed()}]\n{'='*60}")
+
+    COMPARE_HORIZON = 7
+    if COMPARE_HORIZON not in all_train_results:
+        log_write(f"  [SKIP] Horizont {COMPARE_HORIZON}d nicht trainiert.")
+        return {}
+
+    train_res = all_train_results[COMPARE_HORIZON]
+    if train_res.get("mode") == "production_ensemble":
+        log_write(
+            f"  [SKIP] Produktions-Ensemble – alle Daten im Training verwendet,\n"
+            f"         kein OOS-Backtest für Vergleich möglich."
+        )
+        return {}
+
+    fold_results = train_res.get("fold_results", [])
+    if not fold_results:
+        log_write(f"  [SKIP] Keine fold_results für Horizont {COMPARE_HORIZON}d.")
+        return {}
+
+    # Modul-Cache leeren
+    for _mod in list(sys.modules.keys()):
+        if _mod.startswith(
+            ("config_v2_single", "models_v2_single", "backtest_v2_single",
+             "backtest_exec_comparison")
+        ):
+            del sys.modules[_mod]
+
+    try:
+        from config_v2_single_horizon import get_config
+        from backtest_exec_comparison import compare_exec_modes, plot_exec_comparison
+        from strategy.backtest import build_price_cache
+    except ImportError as exc:
+        log_write(f"  [ERROR] Import fehlgeschlagen: {exc}")
+        return {}
+
+    cfg = get_config(COMPARE_HORIZON)
+
+    raw_dir    = REPO_DIR / "data" / "raw"
+    all_assets = list(asset_map.keys())
+    if "SPY" not in all_assets:
+        all_assets.append("SPY")
+    price_cache = build_price_cache(all_assets, raw_dir=raw_dir)
+
+    try:
+        comparison = compare_exec_modes(
+            features     = features,
+            fold_results = fold_results,
+            asset_map    = asset_map,
+            cfg          = cfg,
+            price_cache  = price_cache,
+            atr_gap_mult = 1.5,
+        )
+    except Exception as exc:
+        import traceback
+        log_write(f"  [ERROR] compare_exec_modes: {traceback.format_exc()}")
+        return {}
+
+    # Slim-JSON speichern (ohne große Listen)
+    _SKIP = {"equity", "trade_log", "equity_dates", "daily_signals", "ic_data"}
+    slim  = {
+        mode: {k: v for k, v in res.items() if k not in _SKIP}
+        for mode, res in comparison.items()
+    }
+    out_json = WORKING / "exec_comparison.json"
+    with open(out_json, "w") as f:
+        json.dump(_to_jsonable(slim), f, indent=2)
+    log_write(f"  exec_comparison.json gespeichert")
+
+    # Equity-Chart
+    try:
+        plot_exec_comparison(
+            results   = comparison,
+            save_path = str(WORKING / "exec_comparison_equity.png"),
+        )
+    except Exception as exc:
+        log_write(f"  [WARN] plot_exec_comparison: {exc}")
+
+    return comparison
+
+
 def main() -> int:
     _init_log()
     log_write(f"Trading Bot Full Pipeline | {time.strftime('%Y-%m-%d %H:%M:%S UTC')}")
@@ -1567,6 +1665,12 @@ def main() -> int:
                 sh_bt = step_backtest_single_horizons(
                     features, asset_map, all_train_res, result_a,
                 )
+                # Execution-Mode-Vergleich (Classic vs. Composition-Change)
+                try:
+                    step_exec_comparison(features, asset_map, all_train_res)
+                except Exception as ec_exc:
+                    import traceback
+                    log_write(f"\n[EXEC-COMPARISON WARN]\n{traceback.format_exc()}")
             except Exception as sh_exc:
                 import traceback
                 log_write(f"\n[SINGLE-HORIZON ERROR]\n{traceback.format_exc()}")
