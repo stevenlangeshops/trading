@@ -1266,6 +1266,139 @@ def step_backtest_v2(features, targets_multi, asset_map, v2_fold_results, cfg, v
 
 # ── v2 Single-Horizon Pipeline Steps ─────────────────────────────────────────
 
+def step_load_sh_checkpoints(asset_map, horizons=None):
+    """Lädt bestehende Single-Horizon Walk-Forward-Checkpoints aus dem Dataset.
+
+    Sucht ``v2_{h}d_walk_forward.json`` und die zugehörigen ``fold_*_best.pt``
+    Dateien in allen bekannten Dataset-Pfaden.  Kopiert die ``.pt``-Dateien in
+    das Working-Verzeichnis und passt die ``ckpt_path``-Einträge an.
+
+    Gibt ``None`` zurück wenn keine vollständigen Checkpoints gefunden werden
+    (→ Fallback auf Training).
+
+    Args:
+        asset_map: {ticker → id} – für Kompatibilitäts-Check.
+        horizons:  Welche Horizonte geladen werden sollen (Standard: [7]).
+
+    Returns:
+        Dict ``{horizon → train_result}`` kompatibel mit
+        ``step_train_single_horizons()``-Rückgabe, oder ``None``.
+    """
+    import json as _json
+    import torch as _torch
+
+    if horizons is None:
+        horizons = [7]
+
+    log_write(f"\n{'='*60}\nSCHRITT 20b: Single-Horizon Checkpoints laden [{elapsed()}]\n{'='*60}")
+
+    # Alle möglichen Quell-Verzeichnisse für Checkpoints (trading-results Dataset)
+    results_dirs = [
+        Path("/kaggle/input/trading-results"),
+        Path("/kaggle/input/trading-results/checkpoints"),
+        Path("/kaggle/input/datasets/busersteven/trading-results"),
+        Path("/kaggle/input/datasets/busersteven/trading-results/checkpoints"),
+    ]
+
+    all_results: dict = {}
+
+    for h in horizons:
+        tag = f"v2_{h}d"
+        ckpt_subdir = f"v2_{h}d"
+
+        # walk_forward JSON suchen
+        wf_json_path = None
+        for d in results_dirs:
+            for candidate in [
+                d / f"{tag}_walk_forward.json",
+                d.parent / f"{tag}_walk_forward.json",
+            ]:
+                if candidate.exists():
+                    wf_json_path = candidate
+                    break
+            if wf_json_path:
+                break
+
+        if wf_json_path is None:
+            log_write(f"  [{tag}] walk_forward JSON nicht gefunden – Training erforderlich.")
+            return None
+
+        wf_data = _json.loads(wf_json_path.read_text())
+        fold_summary = wf_data.get("fold_summary", [])
+        if not fold_summary:
+            log_write(f"  [{tag}] Keine fold_summary in JSON – Training erforderlich.")
+            return None
+
+        # Checkpoint-Dateien suchen
+        ckpt_dst_dir = WORKING / "checkpoints" / ckpt_subdir
+        ckpt_dst_dir.mkdir(parents=True, exist_ok=True)
+
+        updated_folds = []
+        n_assets_current = len(asset_map) + 1
+
+        for fold in fold_summary:
+            fold_id = fold.get("fold_id", fold.get("fold", "?"))
+            pt_name = f"fold_{fold_id}_best.pt"
+
+            # Datei in Dataset suchen
+            pt_src = None
+            for d in results_dirs:
+                for cand in [
+                    d / pt_name,
+                    d / ckpt_subdir / pt_name,
+                    d.parent / pt_name,
+                    d.parent / "checkpoints" / ckpt_subdir / pt_name,
+                ]:
+                    if cand.exists():
+                        pt_src = cand
+                        break
+                if pt_src:
+                    break
+
+            if pt_src is None:
+                log_write(f"  [{tag}] Fold {fold_id}: {pt_name} nicht gefunden.")
+                return None
+
+            # Kompatibilitäts-Check
+            try:
+                meta = _torch.load(str(pt_src), map_location="cpu", weights_only=False)
+                n_saved = meta.get("config", {}).get("n_assets", None)
+                if n_saved is not None and n_saved != n_assets_current:
+                    log_write(
+                        f"  [{tag}] Fold {fold_id}: n_assets mismatch "
+                        f"(gespeichert={n_saved}, aktuell={n_assets_current}) "
+                        f"→ Training erforderlich."
+                    )
+                    return None
+            except Exception as exc:
+                log_write(f"  [{tag}] Fold {fold_id}: Lade-Check fehlgeschlagen: {exc}")
+                return None
+
+            # In Working-Dir kopieren
+            pt_dst = ckpt_dst_dir / pt_name
+            if not pt_dst.exists():
+                shutil.copy(pt_src, pt_dst)
+
+            fold_entry = dict(fold)
+            fold_entry["ckpt_path"] = str(pt_dst)
+            updated_folds.append(fold_entry)
+
+        log_write(
+            f"  [{tag}] {len(updated_folds)} Checkpoints geladen aus "
+            f"{wf_json_path.parent}"
+        )
+
+        all_results[h] = {
+            "mode":         "walk_forward",
+            "fold_results": updated_folds,
+            "mean_ic":      wf_data.get("mean_ic", 0.0),
+            "mean_loss":    wf_data.get("mean_loss", 0.0),
+            "mean_mae":     wf_data.get("mean_mae",  0.0),
+        }
+
+    return all_results if all_results else None
+
+
 def step_train_single_horizons(features, asset_map, horizons=None):
     """Trainiert Single-Horizon LSTM-Modelle mit Walk-Forward Cross-Validation.
 
@@ -1597,6 +1730,12 @@ def main() -> int:
     SMOKE_TEST = os.environ.get("KAGGLE_SMOKE_TEST", "").strip() == "1"
     if SMOKE_TEST:
         V2_MAX_ASSETS = 15
+
+    # ── Exec-Compare-Only-Modus (EXEC_COMPARE_ONLY=1) ─────────────────
+    # Überspringt Training komplett. Lädt bestehende Walk-Forward-
+    # Checkpoints aus trading-results Dataset und führt NUR den
+    # Execution-Mode-Vergleich (Schritt 22) aus. Kein GPU nötig.
+    EXEC_COMPARE_ONLY = os.environ.get("EXEC_COMPARE_ONLY", "").strip() == "1"
     # ──────────────────────────────────────────────────────────────────
 
     if SMOKE_TEST:
@@ -1661,16 +1800,36 @@ def main() -> int:
         all_train_res = {}
         if SINGLE_HORIZON:
             try:
-                all_train_res = step_train_single_horizons(features, asset_map, SH_HORIZONS)
-                sh_bt = step_backtest_single_horizons(
-                    features, asset_map, all_train_res, result_a,
-                )
-                # Execution-Mode-Vergleich (Classic vs. Composition-Change)
-                try:
+                if EXEC_COMPARE_ONLY:
+                    # ── Nur Exec-Vergleich: Checkpoints laden, kein Training ───
+                    log_write(
+                        "\n" + "=" * 60 +
+                        "\n  *** EXEC-COMPARE-ONLY MODUS ***" +
+                        "\n  Training wird uebersprungen." +
+                        "\n  Lade Walk-Forward-Checkpoints aus trading-results Dataset." +
+                        "\n" + "=" * 60
+                    )
+                    all_train_res = step_load_sh_checkpoints(asset_map, SH_HORIZONS)
+                    if all_train_res is None:
+                        log_write(
+                            "  [FEHLER] Keine Checkpoints gefunden.\n"
+                            "  Stelle sicher dass das Dataset 'trading-results' eingebunden ist\n"
+                            "  und fold_*_best.pt + v2_7d_walk_forward.json enthaelt."
+                        )
+                        return 1
+                    log_write(f"  Checkpoints geladen fuer Horizonte: {list(all_train_res.keys())}")
                     step_exec_comparison(features, asset_map, all_train_res)
-                except Exception as ec_exc:
-                    import traceback
-                    log_write(f"\n[EXEC-COMPARISON WARN]\n{traceback.format_exc()}")
+                else:
+                    # ── Normaler Lauf: Training + Backtest + Exec-Vergleich ───
+                    all_train_res = step_train_single_horizons(features, asset_map, SH_HORIZONS)
+                    sh_bt = step_backtest_single_horizons(
+                        features, asset_map, all_train_res, result_a,
+                    )
+                    try:
+                        step_exec_comparison(features, asset_map, all_train_res)
+                    except Exception as ec_exc:
+                        import traceback
+                        log_write(f"\n[EXEC-COMPARISON WARN]\n{traceback.format_exc()}")
             except Exception as sh_exc:
                 import traceback
                 log_write(f"\n[SINGLE-HORIZON ERROR]\n{traceback.format_exc()}")
